@@ -12,7 +12,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
-from .models import QurtobaCustomer, _sync_customer_accounts, qurtoba_customer_sync_context
+from .models import QurtobaCustomer, QurtobaRecord, _sync_customer_accounts, qurtoba_customer_sync_context
 from .serializers import QurtobaCustomerSerializer, QurtobaRecordSerializer
 
 logger = logging.getLogger(__name__)
@@ -325,6 +325,155 @@ class DelayedCustomersAPIView(APIView):
         if error:
             return Response({'error': error}, status=status.HTTP_502_BAD_GATEWAY)
         return Response(data)
+
+
+# ---------------------------------------------------------------------------
+# Account-tasks (فورى / أمان) — operator todo page
+#
+# فورى/أمان transfers have no Cash-SYS automation, so an operator works them
+# off a focused queue: pull the not-yet-done items, do the transfer by hand,
+# then mark each completed/canceled. State lives in
+# QurtobaRecord.account_task_state (Genie-local — never synced out).
+# ---------------------------------------------------------------------------
+
+_ACCOUNT_TASK_PAGE_SIZE = 50
+_ACCOUNT_TASK_MAX_PAGE_SIZE = 100
+
+
+@login_required
+def account_tasks_view(request):
+    """فورى / أمان — operator todo page shell. React pulls the data via the API."""
+    return inertia_render(request, 'qurtoba::AccountTasks/index', {
+        'account_types': QurtobaRecord.ACCOUNT_TASK_TYPES,
+    })
+
+
+class AccountTasksAPIView(APIView):
+    """
+    GET /qurtoba/api/account-tasks/
+    Paginated, filtered list of فورى/أمان transfers for the operator todo page.
+
+    Query params:
+      state        : pending (default) | completed | canceled | all
+      account_type : فورى | أمان | '' (both)
+      search       : matches account_number / customer name / notes (+ exact value)
+      page         : 1-based page number
+      page_size    : default 50, capped at 100
+    """
+
+    def get(self, request):
+        from django.core.paginator import Paginator, EmptyPage
+        from django.db.models import Q
+
+        state        = (request.GET.get('state') or 'pending').strip()
+        account_type = (request.GET.get('account_type') or '').strip()
+        search       = (request.GET.get('search') or '').strip()
+
+        try:
+            page = max(1, int(request.GET.get('page') or 1))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int(request.GET.get('page_size') or _ACCOUNT_TASK_PAGE_SIZE)
+        except (TypeError, ValueError):
+            page_size = _ACCOUNT_TASK_PAGE_SIZE
+        page_size = max(1, min(page_size, _ACCOUNT_TASK_MAX_PAGE_SIZE))
+
+        # Base queryset — only the manual-fulfilment types. The composite index
+        # (account_task_state, type) keeps the default "pending" view fast.
+        qs = (
+            QurtobaRecord.objects
+            .filter(type__in=QurtobaRecord.ACCOUNT_TASK_TYPES)
+            .select_related('customer')
+        )
+        if account_type in QurtobaRecord.ACCOUNT_TASK_TYPES:
+            qs = qs.filter(type=account_type)
+        if state in ('pending', 'completed', 'canceled'):
+            qs = qs.filter(account_task_state=state)
+        # state == 'all' → no state filter
+
+        if search:
+            cond = (
+                Q(account_number__icontains=search)
+                | Q(customer__name__icontains=search)
+                | Q(notes__icontains=search)
+            )
+            digits = ''.join(ch for ch in search if ch.isdigit())
+            if digits:
+                try:
+                    cond |= Q(value=float(digits))
+                except ValueError:
+                    pass
+            qs = qs.filter(cond)
+
+        qs = qs.only(
+            'id', 'type', 'account_number', 'value', 'notes',
+            'date', 'time', 'account_task_state', 'customer',
+        ).order_by('-date', '-time', '-id')
+
+        paginator = Paginator(qs, page_size)
+        try:
+            page_obj = paginator.page(page)
+        except EmptyPage:
+            page_obj = paginator.page(paginator.num_pages) if paginator.num_pages else None
+
+        results = []
+        if page_obj is not None:
+            for r in page_obj.object_list:
+                results.append({
+                    'id': r.id,
+                    'type': r.type,
+                    'account_number': r.account_number or '',
+                    'value': r.value or 0,
+                    'notes': r.notes or '',
+                    'customer_id': r.customer_id,
+                    'customer_name': r.customer.name if r.customer_id else '—',
+                    'state': r.account_task_state,
+                    'date': r.date.isoformat() if r.date else None,
+                    'time': r.time.strftime('%H:%M') if r.time else None,
+                })
+
+        return Response({
+            'results': results,
+            'page': page if page_obj is None else page_obj.number,
+            'num_pages': paginator.num_pages,
+            'total': paginator.count,
+            'page_size': page_size,
+            'has_next': bool(page_obj and page_obj.has_next()),
+            'has_prev': bool(page_obj and page_obj.has_previous()),
+        })
+
+
+class AccountTaskActionView(APIView):
+    """
+    POST /qurtoba/api/account-tasks/<int:pk>/<action>/
+    action ∈ complete | cancel — flips the operator fulfilment state.
+    Uses .update() to skip QurtobaRecord.save() balance side-effects; nothing
+    is pushed to Qurtoba/Cash-SYS.
+    """
+
+    _ACTION_STATE = {'complete': 'completed', 'cancel': 'canceled'}
+
+    def post(self, request, pk, action):
+        from django.utils import timezone
+
+        new_state = self._ACTION_STATE.get(action)
+        if new_state is None:
+            return Response({'error': 'Unknown action'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user if request.user.is_authenticated else None
+        updated = (
+            QurtobaRecord.objects
+            .filter(pk=pk, type__in=QurtobaRecord.ACCOUNT_TASK_TYPES)
+            .update(
+                account_task_state=new_state,
+                account_task_done_at=timezone.now(),
+                account_task_done_by=user,
+            )
+        )
+        if not updated:
+            return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'status': True, 'id': pk, 'state': new_state})
 
 
 # ---------------------------------------------------------------------------

@@ -595,6 +595,11 @@ class QurtobaRecord(BaseModel):
         verbose_name = 'Qurtoba Record'
         verbose_name_plural = 'Qurtoba Records'
         ordering = ['-date', '-time']
+        indexes = [
+            # Fast path for the operator todo page: filter by فورى/أمان type
+            # + fulfilment state without scanning the whole table.
+            models.Index(fields=['account_task_state', 'type'], name='qr_acct_task_state_idx'),
+        ]
 
     # ---- Relation to local customer (the smart link) ----
     customer = models.ForeignKey(
@@ -644,6 +649,20 @@ class QurtobaRecord(BaseModel):
         ('مندوب', 'مندوب'),  # collector settles with office
     ]
     TYPE_CHOICES = DEBT_TYPES + COLLECTION_TYPES + SETTLEMENT_TYPES
+
+    # Account-transfer types fulfilled MANUALLY by an operator (no Cash-SYS
+    # automation): فورى / أمان. These drive the operator "todo" page.
+    ACCOUNT_TASK_TYPES = ['فورى', 'أمان']
+
+    # Operator-side fulfilment state for فورى/أمان transfers. This is a
+    # Genie-local workflow flag ONLY — it is NEVER synced to Qurtoba/Cash-SYS,
+    # and is deliberately SEPARATE from `is_done` (which means "money collected"
+    # in the existing dues/collection flow, not "transfer executed").
+    ACCOUNT_TASK_STATE_CHOICES = [
+        ('pending',   'قيد التنفيذ'),
+        ('completed', 'تم'),
+        ('canceled',  'ملغي'),
+    ]
 
     # ---- Transaction data ----
     type           = models.CharField(max_length=50, choices=TYPE_CHOICES, verbose_name='Type')
@@ -708,6 +727,19 @@ class QurtobaRecord(BaseModel):
     root_external_ref       = models.CharField(max_length=64, null=True, blank=True, db_index=True, verbose_name='Root External Ref')
     # Idempotency: the auto service-fee (مصاريف خدمه) records for this order were already created.
     cash_sys_service_fee_done = models.BooleanField(default=False, verbose_name='Service Fee Processed')
+
+    # ---- Operator account-task state (فورى / أمان manual fulfilment) ----
+    # Genie-local only — NOT synced to Qurtoba/Cash-SYS. Drives the operator
+    # todo page. Independent of `is_done` (money-collection flag).
+    account_task_state   = models.CharField(
+        max_length=20, choices=ACCOUNT_TASK_STATE_CHOICES, default='pending',
+        db_index=True, verbose_name='Account Task State',
+    )
+    account_task_done_at = models.DateTimeField(null=True, blank=True, verbose_name='Account Task Done At')
+    account_task_done_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+', verbose_name='Account Task Done By',
+    )
 
     # ---- Qurtoba sync status (for records created in Genie) ----
     qurtoba_record_id  = models.IntegerField(null=True, blank=True, verbose_name='Qurtoba Record ID')

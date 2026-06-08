@@ -82,6 +82,13 @@ menu_dict = {
                         "view_types": "list,form",
                         "sequence": 3,
                     },
+                    "qurtoba_menu_account_tasks": {
+                        "name": "فورى / أمان",
+                        "icon": "ListTodo",
+                        "module": "qurtoba",
+                        "url": "/qurtoba/account-tasks/",
+                        "sequence": 4,
+                    },
                 }
             },
 

@@ -10,6 +10,7 @@ from .views import (
     seller_dues_view,
     accountant_report_view,
     delayed_customers_view,
+    account_tasks_view,
     # API proxy endpoints (React → Genie → Qurtoba)
     CustomerDuesAPIView,
     SellerDuesAPIView,
@@ -17,6 +18,9 @@ from .views import (
     SellerSettleAPIView,
     AccountantReportAPIView,
     DelayedCustomersAPIView,
+    # Account-tasks (فورى / أمان operator todo)
+    AccountTasksAPIView,
+    AccountTaskActionView,
     # Cash-SYS webhook
     CashSysWebhookView,
 )
@@ -36,6 +40,7 @@ urlpatterns = [
     path('qurtoba/seller-dues/', seller_dues_view, name='qurtoba_seller_dues'),
     path('qurtoba/accountant-report/', accountant_report_view, name='qurtoba_accountant_report'),
     path('qurtoba/delayed/', delayed_customers_view, name='qurtoba_delayed'),
+    path('qurtoba/account-tasks/', account_tasks_view, name='qurtoba_account_tasks'),
 
     # ------------------------------------------------------------------
     # API proxy endpoints — called by React after page load
@@ -46,6 +51,10 @@ urlpatterns = [
     path('qurtoba/api/seller-settle/', SellerSettleAPIView.as_view()),
     path('qurtoba/api/accountant-report/', AccountantReportAPIView.as_view()),
     path('qurtoba/api/delayed/', DelayedCustomersAPIView.as_view()),
+
+    # Account-tasks (فورى / أمان operator todo) — React pulls + mutates here
+    path('qurtoba/api/account-tasks/', AccountTasksAPIView.as_view()),
+    path('qurtoba/api/account-tasks/<int:pk>/<str:action>/', AccountTaskActionView.as_view()),
 
     # Cash-SYS fires this when an integration order is done
     path('qurtoba/cash-sys/webhook/', CashSysWebhookView.as_view(), name='qurtoba_cash_sys_webhook'),
