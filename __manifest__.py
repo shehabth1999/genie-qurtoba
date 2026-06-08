@@ -10,5 +10,5 @@
     'application': True,
     'installable': True,
     'auto_install': False,
-    'depends': ['base'],
+    'depends': ['base', 'contacts', 'whatsapp'],
 }
