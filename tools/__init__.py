@@ -17,6 +17,9 @@ from .conversation import (
 from .reports import (
     qurtoba_get_customer_daily_transactions,
 )
+from .static_reply import (
+    qurtoba_send_static_message,
+)
 
 __all__ = [
     "cash_sys_create_and_activate",
@@ -26,4 +29,5 @@ __all__ = [
     "qurtoba_check_transaction_status",
     "qurtoba_send_customer_balance_to_chat",
     "qurtoba_get_customer_daily_transactions",
+    "qurtoba_send_static_message",
 ]
