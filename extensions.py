@@ -210,6 +210,14 @@ class WhatsAppAccountQurtobaExtension(ModelExtension):
     _inherit = 'whatsapp.whatsappaccount'
     _depends = ['base']
 
+    # Manual master switch for the AI agent on this account. Toggled by hand
+    # (enable/disable); the AI flow is wired to this by the integrator.
+    ai_agent_enabled = models.BooleanField(
+        default=True,
+        verbose_name=_('تفعيل الرد الآلي (AI)'),
+        help_text=_('تشغيل/إيقاف رد الوكيل الذكي يدويًا لهذا الحساب.'),
+    )
+
     qurtoba_allow_cash = models.BooleanField(
         default=True,
         verbose_name=_('السماح بـ كاش'),

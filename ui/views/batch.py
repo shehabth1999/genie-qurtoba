@@ -23,6 +23,22 @@ whatsapp_account_form_qurtoba_batch = {
                 "title": _("إعدادات قرطبة"),
                 "sections": [
                     {
+                        "title": _("التحكم في الوكيل الذكي"),
+                        "groups": [
+                            {
+                                "fullWidth": True,
+                                "fields": [
+                                    {
+                                        "name": "ai_agent_enabled",
+                                        "string": _("تفعيل الرد الآلي (AI)"),
+                                        "widget": "switch",
+                                        "help": _("تشغيل/إيقاف رد الوكيل الذكي يدويًا لهذا الحساب."),
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    {
                         "title": _("الخدمات المتاحة للوكيل الذكي"),
                         "groups": [
                             {
