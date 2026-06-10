@@ -177,6 +177,10 @@ class PartnerQurtobaExtension(ModelExtension):
         verbose_name=_('Qurtoba Customer'),
     )
 
+    @property
+    def has_qurtoba_customer(self) -> bool:
+        """True when this partner is linked to a Qurtoba customer."""
+        return self.qurtoba_customer_id is not None
 
 # ---------------------------------------------------------------------------
 # WhatsAppAccountQurtobaExtension — per-account toggles for which Qurtoba
