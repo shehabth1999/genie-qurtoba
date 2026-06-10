@@ -88,7 +88,20 @@ MODEL_PERMISSIONS = [
         'group': 'qurtoba.admins',
         'permissions': [1, 1, 1, 1],  # full access
     },
-    
+
+    # Qurtobasyncproblem (failed-push dead-letter queue)
+    # Rows are produced by the system; users can view + retry (change), not delete.
+    {
+        'model': 'qurtoba.qurtobasyncproblem',
+        'group': 'qurtoba.users',
+        'permissions': [1, 0, 1, 0],  # view, no add, change (retry), no delete
+    },
+    {
+        'model': 'qurtoba.qurtobasyncproblem',
+        'group': 'qurtoba.admins',
+        'permissions': [1, 1, 1, 1],  # full access
+    },
+
 ]
 
 # Permission patterns for convenience

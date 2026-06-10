@@ -4,6 +4,8 @@ import threading
 from contextlib import contextmanager
 import requests
 from django.conf import settings
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.utils.translation import gettext as _
 import re
@@ -1469,3 +1471,169 @@ def _relink_orphaned_records():
             relinked += 1
     if relinked:
         logger.info('Re-linked %d orphaned records to customers.', relinked)
+
+
+# ---------------------------------------------------------------------------
+# QurtobaSyncProblem — failed-push dead-letter queue
+#
+# When a push to the Qurtoba canonical server exhausts its Celery retries, a row
+# is created here (generic link to the source record), all admins are notified,
+# and an operator can retry it from the UI in the FOREGROUND (single or bulk),
+# seeing the real server response. Resolved rows flip to status='done' and are
+# filtered out of the list view.
+# ---------------------------------------------------------------------------
+
+class QurtobaSyncProblem(BaseModel):
+    """A qurtoba push that failed after all retries — actionable from the UI."""
+
+    class Meta:
+        verbose_name = 'Qurtoba Sync Problem'
+        verbose_name_plural = 'Qurtoba Sync Problems'
+        ordering = ['-created_at']
+
+    OPERATION_CHOICES = [
+        ('push_record', 'Push Record'),
+    ]
+    STATUS_CHOICES = [
+        ('failed', 'فشل'),
+        ('done',   'تم'),
+    ]
+
+    # Generic link to the source record (QurtobaRecord today; any pushable model later)
+    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE, null=True, blank=True)
+    object_id    = models.CharField(max_length=64, null=True, blank=True)
+    target       = GenericForeignKey('content_type', 'object_id')
+    # Denormalized "app.model" so the list renders without a join.
+    model_label  = models.CharField(max_length=120, null=True, blank=True, verbose_name='Model')
+
+    operation    = models.CharField(max_length=40, choices=OPERATION_CHOICES, default='push_record', verbose_name='Operation')
+    status       = models.CharField(max_length=12, choices=STATUS_CHOICES, default='failed', db_index=True, verbose_name='Status')
+    error        = models.TextField(null=True, blank=True, verbose_name='Last Error')
+    attempts     = models.IntegerField(default=0, verbose_name='Attempts')
+    payload      = models.JSONField(null=True, blank=True, verbose_name='Payload')
+
+    last_attempt_at = models.DateTimeField(null=True, blank=True, verbose_name='Last Attempt')
+    resolved_at     = models.DateTimeField(null=True, blank=True, verbose_name='Resolved At')
+    resolved_by     = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+', verbose_name='Resolved By',
+    )
+    notified     = models.BooleanField(default=False, verbose_name='Notified')
+
+    def __str__(self):
+        return f'SyncProblem #{self.pk} {self.model_label}#{self.object_id} [{self.status}]'
+
+    # ---- producer ----------------------------------------------------------
+    @classmethod
+    def record(cls, target, operation, error, payload=None):
+        """
+        Upsert an OPEN (status='failed') problem row for target+operation and
+        notify admins on first creation. Idempotent across retries.
+        """
+        from django.utils import timezone
+        ct = ContentType.objects.get_for_model(type(target))
+        model_label = f'{ct.app_label}.{ct.model}'
+        problem, _created = cls.objects.update_or_create(
+            content_type=ct,
+            object_id=str(target.pk),
+            operation=operation,
+            status='failed',
+            defaults={
+                'error': error or '',
+                'payload': payload,
+                'model_label': model_label,
+                'last_attempt_at': timezone.now(),
+            },
+        )
+        cls.objects.filter(pk=problem.pk).update(attempts=models.F('attempts') + 1)
+        problem.refresh_from_db(fields=['attempts', 'notified'])
+
+        if not problem.notified:
+            try:
+                problem._notify_admins()
+            except Exception as exc:
+                logger.warning('QurtobaSyncProblem notify failed for %s: %s', problem.pk, exc)
+            # mark notified regardless so a flaky notifier never spams on every retry
+            cls.objects.filter(pk=problem.pk).update(notified=True)
+            problem.notified = True
+        return problem
+
+    def _notify_admins(self):
+        """Inbox + web-push notification to every active superuser."""
+        from modules.notifications.services import post_notification
+        from modules.base.models import User
+        partner_ids = list(
+            User.objects
+            .filter(is_superuser=True, is_active=True, partner__isnull=False)
+            .values_list('partner_id', flat=True)
+        )
+        if not partner_ids:
+            return
+        post_notification(
+            partner_ids=partner_ids,
+            subject='فشل مزامنة قرطبة',
+            body=f'فشل دفع {self.model_label} #{self.object_id} إلى قرطبة: {(self.error or "")[:160]}',
+            notification_type='inbox',
+            is_push=True,
+            record=self,
+        )
+
+    # ---- foreground retry --------------------------------------------------
+    def _retry_one(self):
+        """
+        Re-run the push synchronously. Returns (ok: bool, message: str).
+        On success → status='done'; on failure → store the fresh error.
+        """
+        from django.utils import timezone
+        self.attempts = (self.attempts or 0) + 1
+        self.last_attempt_at = timezone.now()
+
+        if self.operation == 'push_record':
+            from qurtoba.utils_sync import push_record_to_qurtoba
+            try:
+                err = push_record_to_qurtoba(int(self.object_id))
+            except Exception as exc:
+                err = str(exc)
+        else:
+            err = f'Unknown operation: {self.operation}'
+
+        if err is None:
+            user = getattr(getattr(self, 'env', None), 'user', None)
+            if user is not None and not getattr(user, 'is_authenticated', False):
+                user = None
+            self.status = 'done'
+            self.resolved_at = timezone.now()
+            self.resolved_by = user
+            self.save(update_fields=['status', 'attempts', 'last_attempt_at', 'resolved_at', 'resolved_by'])
+            return True, ''
+
+        self.error = err
+        self.save(update_fields=['error', 'attempts', 'last_attempt_at'])
+        return False, err
+
+    @action
+    def action_retry_sync(queryset):
+        """Retry selected sync problems in the foreground (single or bulk)."""
+        done = 0
+        failed = 0
+        errors = []
+        for prob in queryset:
+            if prob.status == 'done':
+                continue
+            ok, msg = prob._retry_one()
+            if ok:
+                done += 1
+            else:
+                failed += 1
+                if len(errors) < 3 and msg:
+                    errors.append(f'#{prob.object_id}: {msg[:120]}')
+        parts = [f'تم: {done} — فشل: {failed}']
+        if errors:
+            parts.append('\n'.join(errors))
+        return {
+            'status': True,
+            'open_mode': 'message',
+            'message': '\n'.join(parts),
+            'data': {},
+            'on_success': {'type': 'refresh'},
+        }

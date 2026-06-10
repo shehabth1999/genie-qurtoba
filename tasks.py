@@ -656,3 +656,21 @@ def push_record_to_qurtoba_task(self, record_pk: int):
             raise self.retry(exc=Exception(error), countdown=countdown)
         except self.MaxRetriesExceededError:
             _mark_error(record_pk, error)
+            # Retries exhausted → log a sync-problem row + notify admins so the
+            # failed push is visible and retryable from the UI (not silently lost).
+            try:
+                from qurtoba.models import QurtobaRecord, QurtobaSyncProblem
+                rec = QurtobaRecord.objects.filter(pk=record_pk).first()
+                if rec:
+                    QurtobaSyncProblem.record(
+                        rec, 'push_record', error,
+                        payload={
+                            'type': rec.type,
+                            'value': rec.value,
+                            'account_number': rec.account_number,
+                            'is_down': rec.is_down,
+                            'customer_id': rec.customer_id,
+                        },
+                    )
+            except Exception as exc:
+                logger.error('Failed to record QurtobaSyncProblem for record %s: %s', record_pk, exc)

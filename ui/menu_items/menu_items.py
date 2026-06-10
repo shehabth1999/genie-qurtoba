@@ -133,6 +133,23 @@ menu_dict = {
                             }
                         },
                     },
+                    "qurtoba_menu_sync_problems": {
+                        "name": "مشاكل مزامنة قرطبة",
+                        "icon": "AlertTriangle",
+                        "module": "qurtoba",
+                        "model": "qurtoba.qurtobasyncproblem",
+                        "view_types": "list,form",
+                        "sequence": 3,
+                        # Hide resolved rows — done problems never reappear.
+                        "domain": {
+                            "filters": {
+                                "operator": "and",
+                                "filters": [
+                                    {"field": "status", "operator": "ne", "value": "done"},
+                                ]
+                            }
+                        },
+                    },
                 }
             },
 

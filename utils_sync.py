@@ -41,6 +41,20 @@ def push_record_to_qurtoba(record_pk: int) -> str | None:
             body = resp.json()
             if body.get('status'):
                 qurtoba_id = (body.get('data') or {}).get('id')
+                # Qurtoba can return status:True with data:None when it did NOT
+                # actually create the record — e.g. record registration is
+                # disabled by the accountant ("تسجيل التحويلات موقوفه"). Marking
+                # such a record as synced is silent data loss: the payment never
+                # hits the ledger, the customer's Rest never updates, and the
+                # balance stays wrong (this is the 100K سداد → balance 0 bug).
+                # Treat a missing id as a retryable failure so it never silently
+                # vanishes.
+                if not qurtoba_id:
+                    return (
+                        'Qurtoba returned status=True but no record id '
+                        '(record not created — registration disabled?): '
+                        f'{body.get("message", "")}'
+                    )
                 _mark_success(record_pk, qurtoba_id)
                 # Pull authoritative balance from Qurtoba (recalculated synchronously).
                 _sync_customer_balance(base, token, customer)
