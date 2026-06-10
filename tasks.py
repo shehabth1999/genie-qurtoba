@@ -365,6 +365,33 @@ def _send_done_receipts(record):
     record.cash_sys_transactions = briefs
 
 
+def send_text_reply_for_record(record, text):
+    """
+    Send a plain-text reply to the chat that originated `record`, quoting the
+    record's origin message when available. Synchronous; safe no-op when the
+    record has no notifiable chat context. Returns True on send.
+    """
+    ctx = _notify_context(record)
+    if not ctx:
+        return False
+    try:
+        ctx['svc'].send_and_broadcast(
+            partner=ctx['conv'].social_partner,
+            content={'text': text},
+            message_type='text',
+            conversation=ctx['conv'],
+            system_partner=ctx['system_partner'],
+            reply_to_message_id=ctx['reply_wamid'],
+            reply_to_id=ctx['reply_local_id'],
+            websocket=True,
+        )
+        return True
+    except Exception as exc:
+        logger.warning('send_text_reply_for_record failed record=%s: %s',
+                       getattr(record, 'pk', None), exc)
+        return False
+
+
 def _send_reroute_ask(record, fulfilled, reroute_amount):
     """
     Tell the customer their recipient number is over its receive limit and we

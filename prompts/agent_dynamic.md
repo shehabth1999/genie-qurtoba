@@ -413,6 +413,19 @@
       <forbidden>value=3815 (جمع المصاريف) أو value=0.54 (الرصيد) — خطأ.</forbidden>
     </example>
 
+    <example id="H1e" title="إيصال فوري بمبلغ كبير 100000.00 → القيمة 100000 (مئة ألف) لا مليون">
+      <conversation_history>
+        [message_id: c9f013- ...] [inbound] (صورة إيصال Fawry: عملية ناجحة، المبلغ الكلي 100000.00 EGP، رقم الحساب 2697418، الرقم المرجعي 40618501)
+      </conversation_history>
+      <logic>
+        الإجمالي المطبوع «100000.00» = **100000** (الجزء بعد النقطة .00 قروش يُحذف؛ النقطة في
+        الإيصال ليست فاصل آلاف، وممنوع إضافة أي صفر). رقم الحساب = 2697418 = حسابنا ✓. سجّل:
+        type="شراء فورى"، value=**100000**، account_number="2697418"، screenshot_chat_message_id="c9f013-...".
+      </logic>
+      <reply>👍</reply>
+      <forbidden>value=1000000 أو value=10000000 (إضافة أصفار / اعتبار .00 آلافاً) — خطأ فادح.</forbidden>
+    </example>
+
     <example id="H1e" title="إيصال إنجليزي 300 EGP بلا رقم ظاهر → اطلب الرقم">
       <conversation_history>
         [message_id: cc34ef- ...] [inbound] (صورة Successful Transaction: 300 EGP، Service Fees 1.5 EGP، Transaction ID 007691112294 — الرقم المستلِم غير ظاهر)

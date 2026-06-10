@@ -108,14 +108,6 @@ menu_dict = {
                         "model": "qurtoba.qurtobapendingtransaction",
                         "view_types": "list,form",
                         "sequence": 1,
-                        "domain": {
-                            "filters": {
-                                "operator": "and",
-                                "filters": [
-                                    {"field": "review_state", "operator": "eq", "value": "pending"},
-                                ]
-                            }
-                        },
                     },
                     "qurtoba_menu_pending_payments": {
                         "name": "سدادات تطلب تقييم",
@@ -124,14 +116,6 @@ menu_dict = {
                         "model": "qurtoba.qurtobapendingpayment",
                         "view_types": "list,form",
                         "sequence": 2,
-                        "domain": {
-                            "filters": {
-                                "operator": "and",
-                                "filters": [
-                                    {"field": "review_state", "operator": "eq", "value": "pending"},
-                                ]
-                            }
-                        },
                     },
                     "qurtoba_menu_sync_problems": {
                         "name": "مشاكل مزامنة قرطبة",

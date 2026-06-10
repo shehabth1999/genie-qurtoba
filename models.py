@@ -996,7 +996,10 @@ class QurtobaRecord(BaseModel):
                 pass
 
         projected = current + float(self.value)
-        over      = max(0.0, projected - limit) if limit > 0 else 0
+        # Overflow over the credit ceiling — applies even when the ceiling is 0
+        # (grade 0/null): a customer with no allowance overflows as soon as the
+        # projected balance goes positive.
+        over      = max(0.0, projected - limit)
 
         result = {
             'value': {
@@ -1255,6 +1258,20 @@ class QurtobaPendingTransaction(BaseModel):
     def __str__(self):
         return f'PendingTxn #{self.pk} — {self.type} {self.value} ({self.customer.name})'
 
+    @property
+    def customer_grade(self):
+        """Customer credit grade — raw value as stored (NOT × 1000); 0 when unset."""
+        if self.customer_id:
+            return self.customer.grade or 0
+        return 0
+
+    @property
+    def customer_balance(self):
+        """Customer current outstanding balance (مديونيات / rest)."""
+        if self.customer_id:
+            return self.customer.balance or 0
+        return 0
+
     @action
     def action_approve_pending_transaction(queryset):
         """Approve selected pending transactions: create real records with grade-limit override."""
@@ -1350,6 +1367,10 @@ class QurtobaPendingPayment(BaseModel):
         verbose_name='Chat Partner',
     )
     conversation_uuid = models.CharField(max_length=64, null=True, blank=True)
+    # The inbound chat message (UUID) that carried the receipt image. Lets the
+    # status tool answer "is this image's payment done?" and lets the approved
+    # record reply-quote the receipt message.
+    source_message_id = models.CharField(max_length=64, null=True, blank=True, verbose_name='Source Message')
 
     # Payload
     type                       = models.CharField(max_length=20, choices=PAYMENT_TYPE_CHOICES, verbose_name='Type')
@@ -1386,9 +1407,34 @@ class QurtobaPendingPayment(BaseModel):
     def __str__(self):
         return f'PendingPayment #{self.pk} — {self.type} {self.value} ({self.customer.name})'
 
+    @property
+    def customer_grade(self):
+        """Customer credit grade — raw value as stored (NOT × 1000); 0 when unset."""
+        if self.customer_id:
+            return self.customer.grade or 0
+        return 0
+
+    @property
+    def customer_balance(self):
+        """Customer current outstanding balance (مديونيات / rest)."""
+        if self.customer_id:
+            return self.customer.balance or 0
+        return 0
+
+    @staticmethod
+    def _confirm_message(value, customer_name, rest):
+        """
+        Python-generated approval line: '{value} | {customer} | {rest} باقى'.
+        When rest < 0 the merchant owes the customer → '... | {abs} ليك'.
+        """
+        v = int(round(float(value or 0)))
+        r = int(round(float(rest or 0)))
+        tail = f'{abs(r)} ليك' if r < 0 else f'{r} باقى'
+        return f'{v} | {customer_name} | {tail}'
+
     @action
     def action_approve_pending_payment(queryset):
-        """Approve pending payments: create real QurtobaRecord(is_down=True) and push to Qurtoba."""
+        """Approve pending payments: create real QurtobaRecord(is_down=True), push to Qurtoba, notify the chat."""
         from django.utils import timezone as _tz
         approved = 0
         skipped = 0
@@ -1402,6 +1448,9 @@ class QurtobaPendingPayment(BaseModel):
             )
             if pending.notes:
                 audit_note = f'{audit_note}\n{pending.notes}'
+            # Balance BEFORE the payment → the resulting "rest" is deterministic
+            # (balance_before - value) and immune to the async Qurtoba push timing.
+            balance_before = float(getattr(pending.customer, 'balance', 0) or 0)
             try:
                 record = QurtobaRecord.objects.create(
                     customer=pending.customer,
@@ -1417,11 +1466,28 @@ class QurtobaPendingPayment(BaseModel):
                 logger.warning('Failed to create QurtobaRecord from pending payment %s: %s', pending.pk, exc)
                 skipped += 1
                 continue
+            # Link the receipt image message so the confirmation reply-quotes it.
+            if pending.source_message_id:
+                try:
+                    record.set_origin_message_from_uuid(pending.source_message_id)
+                except Exception:
+                    pass
             pending.review_state = 'approved'
             pending.reviewed_at = _tz.now()
             pending.created_record = record
             pending.save(update_fields=['review_state', 'reviewed_at', 'created_record'])
             approved += 1
+
+            # Notify the chat directly (Python-generated, no AI): value | name | rest.
+            try:
+                rest = balance_before - float(pending.value or 0)
+                msg = QurtobaPendingPayment._confirm_message(
+                    pending.value, pending.customer.name, rest,
+                )
+                from qurtoba.tasks import send_text_reply_for_record
+                send_text_reply_for_record(record, msg)
+            except Exception as exc:
+                logger.warning('Payment approve chat notify failed for pending %s: %s', pending.pk, exc)
         return {
             'status': True,
             'open_mode': 'message',

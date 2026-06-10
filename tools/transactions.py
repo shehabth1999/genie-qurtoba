@@ -278,7 +278,14 @@ def _create_one_debt(
     grade_limit = (customer.grade or 0) * 1000
     projected = current_balance + amount
 
-    if grade_limit > 0 and projected > grade_limit and not override_grade_limit:
+    # Grade limit is the credit ceiling (grade × 1000). When grade is 0 or null
+    # the ceiling is 0 — the customer has NO credit allowance, so ANY transaction
+    # that leaves them owing (projected balance > 0) MUST go to review and is
+    # NEVER created directly. It is created directly only when existing credit
+    # already covers it (projected balance <= the ceiling).
+    #   e.g. limit 0, balance -50000 (credit), asks 60000 → projected 10000 > 0 → review.
+    #        limit 0, balance -50000 (credit), asks 30000 → projected -20000 <= 0 → create.
+    if projected > grade_limit and not override_grade_limit:
         # Grade-limit overflow → don't reject, queue it for admin review.
         # No QurtobaRecord is created here. An admin will approve or deny from
         # the pending-review form view; on approve, _create_one_debt is called
@@ -892,6 +899,7 @@ def qurtoba_register_customer_payment(
             customer=customer,
             partner=getattr(conv, 'social_partner', None),
             conversation_uuid=str(getattr(conv, 'id', '') or '') or None,
+            source_message_id=str(screenshot_chat_message_id).strip() or None,
             type=type,
             value=amount,
             account_number=final_account,
@@ -1062,4 +1070,111 @@ def qurtoba_check_transaction_status(
         'customer_name': customer.name,
         'records': rows,
         'pretty_ar': pretty_ar,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 5 — Check the review status of a سداد (payment receipt)
+# ---------------------------------------------------------------------------
+
+def _payment_status_line(p) -> str:
+    """One ready-to-send Arabic line for a single pending-payment row."""
+    val = _fmt0(p.value)
+    if p.review_state == 'pending':
+        return f'⏳ السداد قيد المراجعة — {val} ({p.type}). هيتم اعتماده بعد التحقق من الإيصال.'
+    if p.review_state == 'approved':
+        return f'✅ تم اعتماد السداد — {val} ({p.type}) وتسجيله على حسابك.'
+    if p.review_state == 'denied':
+        reason = (p.denial_reason or '').strip()
+        base = f'❌ تم رفض السداد — {val} ({p.type}).'
+        return f'{base}\nالسبب: {reason}' if reason else base
+    return f'السداد {val} ({p.type}) — الحالة: {p.review_state}.'
+
+
+@tool(
+    name='qurtoba_check_payment_status',
+    display_name='Check Customer Payment (سداد) Status',
+    description=(
+        'Use this tool when the customer asks whether a سداد (payment receipt they sent) '
+        'was accepted/registered yet — e.g. "الإيصال اتقبل؟"، "السداد اتسجّل؟"، "تمام السداد؟"، '
+        '"اعتمدتوا التحويل؟". It looks up the QurtobaPendingPayment created from their receipt '
+        'and reports its review state. '
+        'INPUT: '
+        '1) source_message_id (optional) — the chat message id (UUID) of the RECEIPT IMAGE '
+        'message, taken verbatim from its "[message_id: <uuid>]" marker (use the quoted/replied '
+        'message when the customer replies to their receipt). Omit it to report the customer\'s '
+        'most recent سداد. '
+        'OUTPUT: '
+        '- pretty_ar: a single ready-to-send Arabic line per payment — "⏳ قيد المراجعة" '
+        '(under review), "✅ تم اعتماد السداد" (approved/created), or "❌ تم رفض السداد" with the '
+        'denial reason appended. Send pretty_ar AS THE WHOLE REPLY in ONE message; do not invent '
+        'a status or add anything. '
+        '- Structured: payments[] with {pending_id, type, value, account_number, review_state, '
+        'denial_reason, created_record_id}. '
+        'This tool is READ-ONLY; it never creates, approves, or denies anything.'
+    ),
+    category='qurtoba',
+    requires_auth=True,
+    rate_limit=60,
+)
+def qurtoba_check_payment_status(
+    context,
+    source_message_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    conv, customer, err = _resolve_conversation_and_customer(context)
+    if err:
+        return err
+
+    from qurtoba.models import QurtobaPendingPayment
+
+    payments = []
+    scoped_to_message = False
+    if source_message_id:
+        scoped_to_message = True
+        payments = list(
+            QurtobaPendingPayment.objects
+            .filter(customer=customer, source_message_id=str(source_message_id).strip())
+            .order_by('-created_at')[:5]
+        )
+    if not payments:
+        # General ask (or the quoted message had no payment): latest سداد for this customer.
+        payments = list(
+            QurtobaPendingPayment.objects
+            .filter(customer=customer)
+            .order_by('-created_at')[:3]
+        )
+
+    if not payments:
+        line = 'مفيش سداد مسجّل باسمك. لو حوّلت، ابعت صورة الإيصال.'
+        return {
+            'success': True,
+            'found': False,
+            'customer_id': customer.pk,
+            'customer_name': customer.name,
+            'payments': [],
+            'pretty_ar': line,
+        }
+
+    rows = []
+    lines = []
+    for p in payments:
+        rows.append({
+            'pending_id': p.pk,
+            'type': p.type,
+            'value': float(p.value or 0),
+            'account_number': p.account_number,
+            'review_state': p.review_state,
+            'denial_reason': (p.denial_reason or '') if p.review_state == 'denied' else '',
+            'created_record_id': p.created_record_id,
+        })
+        lines.append(_payment_status_line(p))
+
+    return {
+        'success': True,
+        'found': True,
+        'scoped_to_message': scoped_to_message,
+        'customer_id': customer.pk,
+        'customer_name': customer.name,
+        'payments': rows,
+        'pretty_ar': '\n'.join(lines),
     }
