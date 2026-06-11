@@ -1274,16 +1274,19 @@ class QurtobaPendingTransaction(BaseModel):
 
     @action
     def action_approve_pending_transaction(queryset):
-        """Approve selected pending transactions: create real records with grade-limit override."""
+        """
+        Approve selected pending transactions: create the real records (with
+        grade-limit override) via _create_one_debt. The push to Qurtoba (and
+        Cash-SYS for cash types) happens through the SINGLE async path
+        (post_create → push_record_to_qurtoba_task); this action never pushes
+        directly and never creates a QurtobaSyncProblem.
+        """
         from django.utils import timezone as _tz
         from qurtoba.tools.transactions import _create_one_debt, CASH_TYPES
-        from qurtoba.utils_sync import push_record_to_qurtoba
         approved = 0
         skipped = 0
-        pushed_ok = 0
-        pushed_fail = 0
         for pending in queryset:
-            if pending.review_state != 'pending':
+            if pending.review_state != 'pending' or pending.created_record_id:
                 skipped += 1
                 continue
             is_cash = pending.type in CASH_TYPES
@@ -1305,55 +1308,15 @@ class QurtobaPendingTransaction(BaseModel):
             if outcome.get('success'):
                 pending.review_state = 'approved'
                 pending.reviewed_at = _tz.now()
-                if pending.created_by_id is None and outcome.get('record_id'):
-                    pass  # created_by stays as original creator
                 try:
                     pending.created_record = QurtobaRecord.objects.get(pk=outcome['record_id'])
                 except QurtobaRecord.DoesNotExist:
                     pending.created_record = None
                 pending.save(update_fields=['review_state', 'reviewed_at', 'created_record'])
                 approved += 1
-                # Push SYNCHRONOUSLY — don't rely on the fragile async enqueue for a
-                # deliberate approve. Idempotent, so post_create's enqueue no-ops.
-                if outcome.get('record_id'):
-                    try:
-                        push_err = push_record_to_qurtoba(outcome['record_id'])
-                    except Exception as exc:
-                        push_err = str(exc)
-                    if push_err:
-                        pushed_fail += 1
-                        logger.warning('Qurtoba push failed on txn approve pending=%s record=%s: %s',
-                                       pending.pk, outcome['record_id'], push_err)
-                        # Celery task (post_create) is the async safety net but if
-                        # the broker drops the message the failure becomes invisible.
-                        # Register in QurtobaSyncProblem NOW so retry UI catches it.
-                        try:
-                            _txn_rec = QurtobaRecord.objects.filter(pk=outcome['record_id']).first()
-                            if _txn_rec:
-                                from qurtoba.utils_sync import _mark_error
-                                _mark_error(_txn_rec.pk, push_err)
-                                QurtobaSyncProblem.record(
-                                    _txn_rec, 'push_record', push_err,
-                                    payload={
-                                        'type': _txn_rec.type,
-                                        'value': _txn_rec.value,
-                                        'account_number': _txn_rec.account_number,
-                                        'is_down': _txn_rec.is_down,
-                                        'customer_id': _txn_rec.customer_id,
-                                    },
-                                )
-                        except Exception as _sp_exc:
-                            logger.error('Failed to record QurtobaSyncProblem for record %s: %s',
-                                         outcome['record_id'], _sp_exc)
-                    else:
-                        pushed_ok += 1
             else:
                 skipped += 1
-        message = f'تمت الموافقة على {approved} معاملة'
-        message += f' (تم الدفع لقرطبة: {pushed_ok}'
-        message += f'، فشل الدفع: {pushed_fail})' if pushed_fail else ')'
-        if skipped:
-            message += f' وتعذّر {skipped}.'
+        message = f'تمت الموافقة على {approved} معاملة' + (f' وتعذّر {skipped}.' if skipped else '.')
         return {
             'status': True,
             'open_mode': 'message',
@@ -1476,14 +1439,23 @@ class QurtobaPendingPayment(BaseModel):
 
     @action
     def action_approve_pending_payment(queryset):
-        """Approve pending payments: create real QurtobaRecord(is_down=True), push to Qurtoba, notify the chat."""
+        """
+        Approve pending payments: create the real QurtobaRecord(is_down=True) and
+        notify the chat. The push to Qurtoba happens through the SINGLE async path
+        (QurtobaRecord.post_create → push_record_to_qurtoba_task); this action never
+        pushes directly (that caused a double transaction) and never creates a
+        QurtobaSyncProblem (only the Celery task does, on retry-exhaustion).
+        """
+        from django.db import transaction
         from django.utils import timezone as _tz
         approved = 0
         skipped = 0
-        pushed_ok = 0
-        pushed_fail = 0
         for pending in queryset:
             if pending.review_state != 'pending':
+                skipped += 1
+                continue
+            # Re-approve guard: a pending already linked to a record is done.
+            if pending.created_record_id:
                 skipped += 1
                 continue
             audit_note = f'سداد {pending.type} {int(pending.value or 0)}'[:100]
@@ -1491,67 +1463,39 @@ class QurtobaPendingPayment(BaseModel):
             # (balance_before - value) and immune to the async Qurtoba push timing.
             balance_before = float(getattr(pending.customer, 'balance', 0) or 0)
             try:
-                record = QurtobaRecord.objects.create(
-                    customer=pending.customer,
-                    type=pending.type,
-                    value=pending.value,
-                    account_number=pending.account_number,
-                    is_down=True,
-                    is_seller=False,
-                    partner=pending.partner,
-                    notes=audit_note,
-                )
+                # Create the record + mark the pending approved atomically, so a
+                # mid-flow failure can't leave an orphan record that a re-approve
+                # would duplicate. post_create's on_commit enqueues the push when
+                # this block commits.
+                with transaction.atomic():
+                    record = QurtobaRecord.objects.create(
+                        customer=pending.customer,
+                        type=pending.type,
+                        value=pending.value,
+                        account_number=pending.account_number,
+                        is_down=True,
+                        is_seller=False,
+                        partner=pending.partner,
+                        notes=audit_note,
+                    )
+                    # Link the receipt image message so the confirmation reply-quotes it.
+                    if pending.source_message_id:
+                        try:
+                            record.set_origin_message_from_uuid(pending.source_message_id)
+                        except Exception:
+                            pass
+                    pending.review_state = 'approved'
+                    pending.reviewed_at = _tz.now()
+                    pending.created_record = record
+                    pending.save(update_fields=['review_state', 'reviewed_at', 'created_record'])
             except Exception as exc:
-                logger.warning('Failed to create QurtobaRecord from pending payment %s: %s', pending.pk, exc)
+                logger.warning('Failed to approve pending payment %s: %s', pending.pk, exc)
                 skipped += 1
                 continue
-            # Link the receipt image message so the confirmation reply-quotes it.
-            if pending.source_message_id:
-                try:
-                    record.set_origin_message_from_uuid(pending.source_message_id)
-                except Exception:
-                    pass
-
-            # Push to Qurtoba SYNCHRONOUSLY — a deliberate approve must not depend
-            # on the fragile post_create→on_commit→Celery enqueue (which silently
-            # dropped سداد pushes). Idempotent: post_create's later enqueue no-ops.
-            try:
-                from qurtoba.utils_sync import push_record_to_qurtoba
-                push_err = push_record_to_qurtoba(record.pk)
-            except Exception as exc:
-                push_err = str(exc)
-            if push_err:
-                pushed_fail += 1
-                logger.warning('Qurtoba push failed on payment approve pending=%s record=%s: %s',
-                               pending.pk, record.pk, push_err)
-                # Celery task (post_create) is the async safety net, but if the broker
-                # drops the message the failure becomes invisible forever. Register it
-                # in QurtobaSyncProblem NOW so the retry UI always sees it.
-                from qurtoba.utils_sync import _mark_error
-                _mark_error(record.pk, push_err)
-                try:
-                    QurtobaSyncProblem.record(
-                        record, 'push_record', push_err,
-                        payload={
-                            'type': record.type,
-                            'value': record.value,
-                            'account_number': record.account_number,
-                            'is_down': record.is_down,
-                            'customer_id': record.customer_id,
-                        },
-                    )
-                except Exception as _sp_exc:
-                    logger.error('Failed to record QurtobaSyncProblem for record %s: %s', record.pk, _sp_exc)
-            else:
-                pushed_ok += 1
-
-            pending.review_state = 'approved'
-            pending.reviewed_at = _tz.now()
-            pending.created_record = record
-            pending.save(update_fields=['review_state', 'reviewed_at', 'created_record'])
             approved += 1
 
             # Notify the chat directly (Python-generated, no AI): value | name | rest.
+            # Done AFTER the atomic commit — an external send must not sit in a txn.
             try:
                 rest = balance_before - float(pending.value or 0)
                 msg = QurtobaPendingPayment._confirm_message(
@@ -1562,11 +1506,7 @@ class QurtobaPendingPayment(BaseModel):
             except Exception as exc:
                 logger.warning('Payment approve chat notify failed for pending %s: %s', pending.pk, exc)
 
-        message = f'تمت الموافقة على {approved} سداد'
-        message += f' (تم الدفع لقرطبة: {pushed_ok}'
-        message += f'، فشل الدفع: {pushed_fail})' if pushed_fail else ')'
-        if skipped:
-            message += f' وتعذّر {skipped}.'
+        message = f'تمت الموافقة على {approved} سداد' + (f' وتعذّر {skipped}.' if skipped else '.')
         return {
             'status': True,
             'open_mode': 'message',
@@ -1655,7 +1595,9 @@ class QurtobaSyncProblem(BaseModel):
     status       = models.CharField(max_length=12, choices=STATUS_CHOICES, default='failed', db_index=True, verbose_name='Status')
     error        = models.TextField(null=True, blank=True, verbose_name='Last Error')
     attempts     = models.IntegerField(default=0, verbose_name='Attempts')
-    payload      = models.JSONField(null=True, blank=True, verbose_name='Payload')
+    # Stored as a pretty JSON STRING (not a JSONField) so the form/list widgets
+    # render it as readable text instead of "[object Object]".
+    payload      = models.TextField(null=True, blank=True, verbose_name='Payload')
 
     last_attempt_at = models.DateTimeField(null=True, blank=True, verbose_name='Last Attempt')
     resolved_at     = models.DateTimeField(null=True, blank=True, verbose_name='Resolved At')
@@ -1676,8 +1618,17 @@ class QurtobaSyncProblem(BaseModel):
         notify admins on first creation. Idempotent across retries.
         """
         from django.utils import timezone
+        import json
         ct = ContentType.objects.get_for_model(type(target))
         model_label = f'{ct.app_label}.{ct.model}'
+        # Stringify the payload so it stores/renders as readable text, never a raw object.
+        if payload is None or isinstance(payload, str):
+            payload_str = payload
+        else:
+            try:
+                payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError):
+                payload_str = str(payload)
         problem, _created = cls.objects.update_or_create(
             content_type=ct,
             object_id=str(target.pk),
@@ -1685,7 +1636,7 @@ class QurtobaSyncProblem(BaseModel):
             status='failed',
             defaults={
                 'error': error or '',
-                'payload': payload,
+                'payload': payload_str,
                 'model_label': model_label,
                 'last_attempt_at': timezone.now(),
             },
@@ -1706,7 +1657,7 @@ class QurtobaSyncProblem(BaseModel):
     def _notify_admins(self):
         """Inbox + web-push notification to every active superuser."""
         from modules.notifications.services import post_notification
-        from modules.base.models import User
+        from modules.base.models import User, MenuItem
         partner_ids = list(
             User.objects
             .filter(is_superuser=True, is_active=True, partner__isnull=False)
@@ -1714,6 +1665,12 @@ class QurtobaSyncProblem(BaseModel):
         )
         if not partner_ids:
             return
+        # Build a form-view URL so clicking the notification opens THIS problem row
+        # (not the home screen). Same helper the pending-review notifications use.
+        try:
+            url = MenuItem.get_url_for_model(model=self, view_type='form', id=self.pk)
+        except Exception:
+            url = '/'
         post_notification(
             partner_ids=partner_ids,
             subject='فشل مزامنة قرطبة',
@@ -1721,6 +1678,7 @@ class QurtobaSyncProblem(BaseModel):
             notification_type='inbox',
             is_push=True,
             record=self,
+            url=url,
         )
 
     # ---- foreground retry --------------------------------------------------
