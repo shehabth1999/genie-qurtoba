@@ -90,7 +90,7 @@ def _build_payload(record, customer) -> dict:
         'date':          str(record.date or now.date()),
         'time':          str(record.time or now.time().replace(microsecond=0)),
         'datetime':      record.datetime_field.isoformat() if record.datetime_field else now.isoformat(),
-        'notes':         record.notes or '',
+        'notes':         (record.notes or '')[:150],
         'seller':        record.seller_qurtoba_id,
         'accountant':    record.accountant_qurtoba_id,
     }

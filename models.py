@@ -1294,7 +1294,7 @@ class QurtobaPendingTransaction(BaseModel):
                 amount=float(pending.value or 0),
                 final_account=pending.account_number,
                 is_cash=is_cash,
-                notes=pending.notes,
+                notes=(pending.notes or '')[:100] or None,
                 override_grade_limit=True,
                 conversation=None,
                 # Restore the chat message linkage captured when the transaction
@@ -1324,6 +1324,27 @@ class QurtobaPendingTransaction(BaseModel):
                         pushed_fail += 1
                         logger.warning('Qurtoba push failed on txn approve pending=%s record=%s: %s',
                                        pending.pk, outcome['record_id'], push_err)
+                        # Celery task (post_create) is the async safety net but if
+                        # the broker drops the message the failure becomes invisible.
+                        # Register in QurtobaSyncProblem NOW so retry UI catches it.
+                        try:
+                            _txn_rec = QurtobaRecord.objects.filter(pk=outcome['record_id']).first()
+                            if _txn_rec:
+                                from qurtoba.utils_sync import _mark_error
+                                _mark_error(_txn_rec.pk, push_err)
+                                QurtobaSyncProblem.record(
+                                    _txn_rec, 'push_record', push_err,
+                                    payload={
+                                        'type': _txn_rec.type,
+                                        'value': _txn_rec.value,
+                                        'account_number': _txn_rec.account_number,
+                                        'is_down': _txn_rec.is_down,
+                                        'customer_id': _txn_rec.customer_id,
+                                    },
+                                )
+                        except Exception as _sp_exc:
+                            logger.error('Failed to record QurtobaSyncProblem for record %s: %s',
+                                         outcome['record_id'], _sp_exc)
                     else:
                         pushed_ok += 1
             else:
@@ -1465,12 +1486,7 @@ class QurtobaPendingPayment(BaseModel):
             if pending.review_state != 'pending':
                 skipped += 1
                 continue
-            audit_note = (
-                f'[AI سداد - approved] confirmation: '
-                f'{(pending.customer_confirmation_text or "")[:240]}'
-            )
-            if pending.notes:
-                audit_note = f'{audit_note}\n{pending.notes}'
+            audit_note = f'سداد {pending.type} {int(pending.value or 0)}'[:100]
             # Balance BEFORE the payment → the resulting "rest" is deterministic
             # (balance_before - value) and immune to the async Qurtoba push timing.
             balance_before = float(getattr(pending.customer, 'balance', 0) or 0)
@@ -1508,6 +1524,24 @@ class QurtobaPendingPayment(BaseModel):
                 pushed_fail += 1
                 logger.warning('Qurtoba push failed on payment approve pending=%s record=%s: %s',
                                pending.pk, record.pk, push_err)
+                # Celery task (post_create) is the async safety net, but if the broker
+                # drops the message the failure becomes invisible forever. Register it
+                # in QurtobaSyncProblem NOW so the retry UI always sees it.
+                from qurtoba.utils_sync import _mark_error
+                _mark_error(record.pk, push_err)
+                try:
+                    QurtobaSyncProblem.record(
+                        record, 'push_record', push_err,
+                        payload={
+                            'type': record.type,
+                            'value': record.value,
+                            'account_number': record.account_number,
+                            'is_down': record.is_down,
+                            'customer_id': record.customer_id,
+                        },
+                    )
+                except Exception as _sp_exc:
+                    logger.error('Failed to record QurtobaSyncProblem for record %s: %s', record.pk, _sp_exc)
             else:
                 pushed_ok += 1
 

@@ -341,7 +341,7 @@ def _create_one_debt(
             is_down=False,
             is_seller=False,
             partner=social_partner,
-            notes=notes or None,
+            notes=(notes or '')[:100] or None,
         )
     except Exception as e:
         return {'success': False, 'error_type': 'create_failed', 'error': str(e)}
