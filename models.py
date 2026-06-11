@@ -1277,8 +1277,11 @@ class QurtobaPendingTransaction(BaseModel):
         """Approve selected pending transactions: create real records with grade-limit override."""
         from django.utils import timezone as _tz
         from qurtoba.tools.transactions import _create_one_debt, CASH_TYPES
+        from qurtoba.utils_sync import push_record_to_qurtoba
         approved = 0
         skipped = 0
+        pushed_ok = 0
+        pushed_fail = 0
         for pending in queryset:
             if pending.review_state != 'pending':
                 skipped += 1
@@ -1310,12 +1313,30 @@ class QurtobaPendingTransaction(BaseModel):
                     pending.created_record = None
                 pending.save(update_fields=['review_state', 'reviewed_at', 'created_record'])
                 approved += 1
+                # Push SYNCHRONOUSLY — don't rely on the fragile async enqueue for a
+                # deliberate approve. Idempotent, so post_create's enqueue no-ops.
+                if outcome.get('record_id'):
+                    try:
+                        push_err = push_record_to_qurtoba(outcome['record_id'])
+                    except Exception as exc:
+                        push_err = str(exc)
+                    if push_err:
+                        pushed_fail += 1
+                        logger.warning('Qurtoba push failed on txn approve pending=%s record=%s: %s',
+                                       pending.pk, outcome['record_id'], push_err)
+                    else:
+                        pushed_ok += 1
             else:
                 skipped += 1
+        message = f'تمت الموافقة على {approved} معاملة'
+        message += f' (تم الدفع لقرطبة: {pushed_ok}'
+        message += f'، فشل الدفع: {pushed_fail})' if pushed_fail else ')'
+        if skipped:
+            message += f' وتعذّر {skipped}.'
         return {
             'status': True,
             'open_mode': 'message',
-            'message': f'تمت الموافقة على {approved} معاملة' + (f' وتعذّر {skipped}.' if skipped else '.'),
+            'message': message,
             'data': {},
             'on_success': {'type': 'refresh'},
         }
@@ -1438,6 +1459,8 @@ class QurtobaPendingPayment(BaseModel):
         from django.utils import timezone as _tz
         approved = 0
         skipped = 0
+        pushed_ok = 0
+        pushed_fail = 0
         for pending in queryset:
             if pending.review_state != 'pending':
                 skipped += 1
@@ -1472,6 +1495,22 @@ class QurtobaPendingPayment(BaseModel):
                     record.set_origin_message_from_uuid(pending.source_message_id)
                 except Exception:
                     pass
+
+            # Push to Qurtoba SYNCHRONOUSLY — a deliberate approve must not depend
+            # on the fragile post_create→on_commit→Celery enqueue (which silently
+            # dropped سداد pushes). Idempotent: post_create's later enqueue no-ops.
+            try:
+                from qurtoba.utils_sync import push_record_to_qurtoba
+                push_err = push_record_to_qurtoba(record.pk)
+            except Exception as exc:
+                push_err = str(exc)
+            if push_err:
+                pushed_fail += 1
+                logger.warning('Qurtoba push failed on payment approve pending=%s record=%s: %s',
+                               pending.pk, record.pk, push_err)
+            else:
+                pushed_ok += 1
+
             pending.review_state = 'approved'
             pending.reviewed_at = _tz.now()
             pending.created_record = record
@@ -1488,10 +1527,16 @@ class QurtobaPendingPayment(BaseModel):
                 send_text_reply_for_record(record, msg)
             except Exception as exc:
                 logger.warning('Payment approve chat notify failed for pending %s: %s', pending.pk, exc)
+
+        message = f'تمت الموافقة على {approved} سداد'
+        message += f' (تم الدفع لقرطبة: {pushed_ok}'
+        message += f'، فشل الدفع: {pushed_fail})' if pushed_fail else ')'
+        if skipped:
+            message += f' وتعذّر {skipped}.'
         return {
             'status': True,
             'open_mode': 'message',
-            'message': f'تمت الموافقة على {approved} سداد' + (f' وتعذّر {skipped}.' if skipped else '.'),
+            'message': message,
             'data': {},
             'on_success': {'type': 'refresh'},
         }

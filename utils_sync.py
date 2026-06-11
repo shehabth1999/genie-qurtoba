@@ -25,6 +25,12 @@ def push_record_to_qurtoba(record_pk: int) -> str | None:
     except QurtobaRecord.DoesNotExist:
         return None  # deleted before task ran — nothing to do
 
+    # Idempotency: already pushed → never create a duplicate Qurtoba record.
+    # This makes it safe for BOTH the async post_create enqueue AND an explicit
+    # synchronous push (approve flow) to call us — whichever runs second no-ops.
+    if record.qurtoba_synced and record.qurtoba_record_id:
+        return None
+
     customer = record.customer
     if not customer or not getattr(customer, 'qurtoba_id', None):
         return 'Customer has no Qurtoba ID — cannot push'
