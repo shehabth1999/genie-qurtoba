@@ -90,7 +90,10 @@ def _build_payload(record, customer) -> dict:
         'date':          str(record.date or now.date()),
         'time':          str(record.time or now.time().replace(microsecond=0)),
         'datetime':      record.datetime_field.isoformat() if record.datetime_field else now.isoformat(),
-        'notes':         (record.notes or '')[:150],
+        # Never send notes to Qurtoba (for ANY type) — the full note stays on the
+        # Genie record; Qurtoba just doesn't need it (and its 150-char cap was
+        # rejecting سداد pushes).
+        'notes':         '',
         'seller':        record.seller_qurtoba_id,
         'accountant':    record.accountant_qurtoba_id,
     }
