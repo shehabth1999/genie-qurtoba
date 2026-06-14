@@ -1,0 +1,648 @@
+# Translation file - Auto-generated
+# Language: ar
+#
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: ar\n"
+"Plural-Forms: nplurals=6; plural=n==0 ? 0 : n==1 ? 1 : n==2 ? 2 : n%100>=3 && n%100<=10 ? 3 : n%100>=11 && n%100<=99 ? 4 : 5;\n"
+
+msgctxt "ui/views/pending.py"
+msgid "Account #"
+msgstr "رقم الحساب"
+
+msgctxt "ui/views/views.py"
+msgid "Account No"
+msgstr "رقم الحساب"
+
+msgctxt "ui/views/views.py"
+msgid "Account Number"
+msgstr "رقم الحساب"
+
+msgctxt "ui/views/views.py"
+msgid "Accounts"
+msgstr "الحسابات"
+
+msgctxt "ui/views/views.py"
+msgid "Accounts Data"
+msgstr "بيانات الحسابات"
+
+msgctxt "ui/views/views.py"
+msgid "Address"
+msgstr "العنوان"
+
+msgctxt "ui/views/pending.py"
+msgid "Amount"
+msgstr "المبلغ"
+
+msgctxt "ui/views/views.py"
+msgid "Amount"
+msgstr "المبلغ"
+
+msgctxt "ui/views/views.py"
+msgid "Area"
+msgstr "المنطقة"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Attempts"
+msgstr "المحاولات"
+
+msgctxt "ui/views/pending.py"
+msgid "Chat Partner"
+msgstr "جهة المحادثة"
+
+msgctxt "ui/views/views.py"
+msgid "Collections"
+msgstr "التحصيلات"
+
+msgctxt "ui/views/views.py"
+msgid "Collector ID"
+msgstr "معرف المحصّل"
+
+msgctxt "ui/views/views.py"
+msgid "Collector Side"
+msgstr "جهة المحصّل"
+
+msgctxt "ui/views/pending.py"
+msgid "Created"
+msgstr "تاريخ الإنشاء"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Created"
+msgstr "تاريخ الإنشاء"
+
+msgctxt "ui/views/pending.py"
+msgid "Created Record"
+msgstr "السجل المُنشأ"
+
+msgctxt "ui/views/pending.py"
+msgid "Customer"
+msgstr "العميل"
+
+msgctxt "ui/views/views.py"
+msgid "Customer"
+msgstr "العميل"
+
+msgctxt "ui/views/pending.py"
+msgid "Customer Confirmation"
+msgstr "تأكيد العميل"
+
+msgctxt "ui/views/views.py"
+msgid "Customer ID"
+msgstr "معرف العميل"
+
+msgctxt "ui/views/views.py"
+msgid "Customer ID (Qurtoba)"
+msgstr "معرف العميل (قرطبة)"
+
+msgctxt "ui/views/views.py"
+msgid "Date"
+msgstr "التاريخ"
+
+msgctxt "ui/views/views.py"
+msgid "Debt Records"
+msgstr "سجلات المديونية"
+
+msgctxt "ui/views/pending.py"
+msgid "Denial Reason"
+msgstr "سبب الرفض"
+
+msgctxt "ui/views/views.py"
+msgid "Device No"
+msgstr "رقم الجهاز"
+
+msgctxt "ui/views/views.py"
+msgid "Done"
+msgstr "تم"
+
+msgctxt "ui/views/views.py"
+msgid "Financial Info"
+msgstr "المعلومات المالية"
+
+msgctxt "ui/views/views.py"
+msgid "Grade"
+msgstr "الدرجة"
+
+msgctxt "ui/views/pending.py"
+msgid "ID"
+msgstr "المعرف"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "ID"
+msgstr "المعرف"
+
+msgctxt "ui/views/views.py"
+msgid "Is Payment"
+msgstr "سداد"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Last Attempt"
+msgstr "آخر محاولة"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Last Error"
+msgstr "آخر خطأ"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Model"
+msgstr "النموذج"
+
+msgctxt "ui/views/views.py"
+msgid "Name"
+msgstr "الاسم"
+
+msgctxt "ui/views/pending.py"
+msgid "Notes"
+msgstr "ملاحظات"
+
+msgctxt "ui/views/views.py"
+msgid "Notes"
+msgstr "ملاحظات"
+
+msgctxt "ui/views/views.py"
+msgid "Notes Plus"
+msgstr "ملاحظات إضافية"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Operation"
+msgstr "العملية"
+
+msgctxt "ui/views/views.py"
+msgid "Partners"
+msgstr "الشركاء"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Payload"
+msgstr "البيانات المُرسلة"
+
+msgctxt "ui/views/views.py"
+msgid "Payment"
+msgstr "سداد"
+
+msgctxt "ui/views/pending.py"
+msgid "Pending Qurtoba Payment"
+msgstr "سداد قرطبة معلّق"
+
+msgctxt "ui/views/pending.py"
+msgid "Pending Qurtoba Payments"
+msgstr "سدادات قرطبة المعلّقة"
+
+msgctxt "ui/views/pending.py"
+msgid "Pending Qurtoba Payments Search"
+msgstr "بحث سدادات قرطبة المعلّقة"
+
+msgctxt "ui/views/pending.py"
+msgid "Pending Qurtoba Transaction"
+msgstr "معاملة قرطبة معلّقة"
+
+msgctxt "ui/views/pending.py"
+msgid "Pending Qurtoba Transactions"
+msgstr "معاملات قرطبة المعلّقة"
+
+msgctxt "ui/views/pending.py"
+msgid "Pending Qurtoba Transactions Search"
+msgstr "بحث معاملات قرطبة المعلّقة"
+
+msgctxt "ui/views/views.py"
+msgid "Phone"
+msgstr "الهاتف"
+
+msgid "Qurtoba"
+msgstr "قرطبة"
+
+msgid "Qurtoba Customer"
+msgstr "عميل قرطبة"
+
+msgctxt "ui/views/views.py"
+msgid "Qurtoba Customer"
+msgstr "عميل قرطبة"
+
+msgctxt "ui/views/views.py"
+msgid "Qurtoba Customers"
+msgstr "عملاء قرطبة"
+
+msgctxt "ui/views/views.py"
+msgid "Qurtoba Records"
+msgstr "سجلات قرطبة"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Qurtoba Sync Problem"
+msgstr "مشكلة مزامنة قرطبة"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Qurtoba Sync Problems"
+msgstr "مشاكل مزامنة قرطبة"
+
+msgid "Qurtoba not configured"
+msgstr "قرطبة غير مهيأة"
+
+msgctxt "ui/views/pending.py"
+msgid "Reason"
+msgstr "السبب"
+
+msgctxt "ui/views/pending.py"
+msgid "Receipt"
+msgstr "الإيصال"
+
+msgctxt "ui/views/views.py"
+msgid "Record"
+msgstr "السجل"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Record #"
+msgstr "رقم السجل"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Resolved At"
+msgstr "تاريخ الحل"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Resolved By"
+msgstr "تم الحل بواسطة"
+
+msgctxt "ui/views/views.py"
+msgid "Rest"
+msgstr "المتبقي"
+
+msgctxt "ui/views/pending.py"
+msgid "Reviewed At"
+msgstr "تاريخ المراجعة"
+
+msgctxt "ui/views/pending.py"
+msgid "Reviewer"
+msgstr "المراجع"
+
+msgctxt "ui/views/pending.py"
+msgid "Screenshot"
+msgstr "لقطة الشاشة"
+
+msgctxt "ui/views/views.py"
+msgid "Shop Kind"
+msgstr "نوع المحل"
+
+msgctxt "ui/views/views.py"
+msgid "Shop Name"
+msgstr "اسم المحل"
+
+msgctxt "ui/views/pending.py"
+msgid "Source Phone"
+msgstr "هاتف المصدر"
+
+msgctxt "ui/views/pending.py"
+msgid "State"
+msgstr "الحالة"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "Status"
+msgstr "الحالة"
+
+msgctxt "ui/views/views.py"
+msgid "Sur Name"
+msgstr "اللقب"
+
+msgid "Sync data from Qurtoba financial management system"
+msgstr "مزامنة البيانات من نظام قرطبة للإدارة المالية"
+
+msgctxt "ui/views/pending.py"
+msgid "Type"
+msgstr "النوع"
+
+msgctxt "ui/views/views.py"
+msgid "Type"
+msgstr "النوع"
+
+msgctxt "ui/views/batch.py"
+msgid "أمان"
+msgstr "أمان"
+
+msgctxt "ui/views/views.py"
+msgid "إرسال لقرطبة"
+msgstr "إرسال لقرطبة"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "إعادة المحاولة"
+msgstr "إعادة المحاولة"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "إعادة المحاولة الآن"
+msgstr "إعادة المحاولة الآن"
+
+msgctxt "ui/views/batch.py"
+msgid "إعدادات قرطبة"
+msgstr "إعدادات قرطبة"
+
+msgctxt "ui/views/views.py"
+msgid "اختر الحساب — سيتم ملء النوع والرقم تلقائياً"
+msgstr "اختر الحساب — سيتم ملء النوع والرقم تلقائياً"
+
+msgctxt "ui/views/views.py"
+msgid "اختر الحساب — يملأ النوع والرقم تلقائياً"
+msgstr "اختر الحساب — يملأ النوع والرقم تلقائياً"
+
+msgctxt "ui/views/pending.py"
+msgid "اعتماد"
+msgstr "اعتماد"
+
+msgctxt "ui/views/pending.py"
+msgid "اعتماد السداد"
+msgstr "اعتماد السداد"
+
+msgctxt "ui/views/batch.py"
+msgid "التحكم في الوكيل الذكي"
+msgstr "التحكم في الوكيل الذكي"
+
+msgctxt "ui/views/pending.py"
+msgid "الحالة"
+msgstr "الحالة"
+
+msgctxt "ui/views/views.py"
+msgid "الحد الائتماني"
+msgstr "الحد الائتماني"
+
+msgctxt "ui/views/views.py"
+msgid "الحساب"
+msgstr "الحساب"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "الحل"
+msgstr "الحل"
+
+msgctxt "ui/views/batch.py"
+msgid "الخدمات المتاحة للوكيل الذكي"
+msgstr "الخدمات المتاحة للوكيل الذكي"
+
+msgctxt "ui/views/pending.py"
+msgid "الدرجة"
+msgstr "الدرجة"
+
+msgctxt "ui/views/pending.py"
+msgid "الرصيد الحالي"
+msgstr "الرصيد الحالي"
+
+msgctxt "ui/views/views.py"
+msgid "الرصيد الحالي"
+msgstr "الرصيد الحالي"
+
+msgctxt "ui/views/batch.py"
+msgid "السماح بإنشاء معاملات كاش العادية للمبالغ أقل من 10,000."
+msgstr "السماح بإنشاء معاملات كاش العادية للمبالغ أقل من 10,000."
+
+msgid "السماح بـ أمان"
+msgstr "السماح بـ أمان"
+
+msgid "السماح بـ طاير"
+msgstr "السماح بـ طاير"
+
+msgid "السماح بـ فورى"
+msgstr "السماح بـ فورى"
+
+msgid "السماح بـ كاش"
+msgstr "السماح بـ كاش"
+
+msgid "السماح بـ كاش(10)"
+msgstr "السماح بـ كاش(10)"
+
+msgid "السماح بـ كاش(20)"
+msgstr "السماح بـ كاش(20)"
+
+msgid "السماح بـ كاش(5)"
+msgstr "السماح بـ كاش(5)"
+
+msgid "السماح بـ مصاريف خدمه"
+msgstr "السماح بـ مصاريف خدمه"
+
+msgid "السماح للوكيل الذكي بإنشاء معاملات كاش (أقل من 10,000) لهذا الحساب."
+msgstr "السماح للوكيل الذكي بإنشاء معاملات كاش (أقل من 10,000) لهذا الحساب."
+
+msgid "السماح للوكيل الذكي بإنشاء معاملات كاش(10) (10,000 إلى أقل من 20,000)."
+msgstr "السماح للوكيل الذكي بإنشاء معاملات كاش(10) (10,000 إلى أقل من 20,000)."
+
+msgid "السماح للوكيل الذكي بإنشاء معاملات كاش(20) (20,000 فأكثر)."
+msgstr "السماح للوكيل الذكي بإنشاء معاملات كاش(20) (20,000 فأكثر)."
+
+msgid "السماح للوكيل الذكي بإنشاء معاملات كاش(5) — محجوزة حالياً."
+msgstr "السماح للوكيل الذكي بإنشاء معاملات كاش(5) — محجوزة حالياً."
+
+msgctxt "ui/views/views.py"
+msgid "الشركاء"
+msgstr "الشركاء"
+
+msgctxt "ui/views/pending.py"
+msgid "العميل"
+msgstr "العميل"
+
+msgctxt "ui/views/views.py"
+msgid "العميل"
+msgstr "العميل"
+
+msgctxt "ui/views/views.py"
+msgid "المبلغ"
+msgstr "المبلغ"
+
+msgctxt "ui/views/views.py"
+msgid "المبلغ المحصّل"
+msgstr "المبلغ المحصّل"
+
+msgid "المعاملات"
+msgstr "المعاملات"
+
+msgctxt "ui/views/pending.py"
+msgid "النوع"
+msgstr "النوع"
+
+msgctxt "ui/views/views.py"
+msgid "النوع"
+msgstr "النوع"
+
+msgctxt "ui/views/pending.py"
+msgid "بحث"
+msgstr "بحث"
+
+msgctxt "ui/views/views.py"
+msgid "تجاوز بـ"
+msgstr "تجاوز بـ"
+
+msgctxt "ui/views/views.py"
+msgid "تحديث المديونية"
+msgstr "تحديث المديونية"
+
+msgctxt "ui/views/batch.py"
+msgid "تحويلات أخرى"
+msgstr "تحويلات أخرى"
+
+msgctxt "ui/views/batch.py"
+msgid "تحويلات كاش"
+msgstr "تحويلات كاش"
+
+msgid "تسجيل تحصيل"
+msgstr "تسجيل تحصيل"
+
+msgctxt "ui/views/views.py"
+msgid "تسجيل تحصيل"
+msgstr "تسجيل تحصيل"
+
+msgid "تسجيل مديونية"
+msgstr "تسجيل مديونية"
+
+msgctxt "ui/views/views.py"
+msgid "تسجيل مديونية"
+msgstr "تسجيل مديونية"
+
+msgid "تشغيل/إيقاف رد الوكيل الذكي يدويًا لهذا الحساب."
+msgstr "تشغيل/إيقاف رد الوكيل الذكي يدويًا لهذا الحساب."
+
+msgctxt "ui/views/batch.py"
+msgid "تشغيل/إيقاف رد الوكيل الذكي يدويًا لهذا الحساب."
+msgstr "تشغيل/إيقاف رد الوكيل الذكي يدويًا لهذا الحساب."
+
+msgctxt "ui/views/pending.py"
+msgid "تفاصيل السداد"
+msgstr "تفاصيل السداد"
+
+msgctxt "ui/views/pending.py"
+msgid "تفاصيل العملية"
+msgstr "تفاصيل العملية"
+
+msgctxt "ui/views/sync_problems.py"
+msgid "تفاصيل المشكلة"
+msgstr "تفاصيل المشكلة"
+
+msgid "تفعيل الرد الآلي (AI)"
+msgstr "تفعيل الرد الآلي (AI)"
+
+msgctxt "ui/views/batch.py"
+msgid "تفعيل الرد الآلي (AI)"
+msgstr "تفعيل الرد الآلي (AI)"
+
+msgid "تم إرسال رصيد العميل على المحادثة"
+msgstr "تم إرسال رصيد العميل على المحادثة"
+
+msgctxt "ui/views/views.py"
+msgid "تم الإرسال"
+msgstr "تم الإرسال"
+
+msgid "تم تحديث الرصيد: %(n)d عميل"
+msgstr "تم تحديث الرصيد: %(n)d عميل"
+
+msgid "تمت المزامنة: %(n)d عميل"
+msgstr "تمت المزامنة: %(n)d عميل"
+
+msgid "تمت مزامنة الحسابات: %(c)d عميل، %(a)d حساب"
+msgstr "تمت مزامنة الحسابات: %(c)d عميل، %(a)d حساب"
+
+msgid "تنبيه: الرصيد الحالي %(bal).0f يساوي أو يتجاوز الحد %(limit).0f"
+msgstr "تنبيه: الرصيد الحالي %(bal).0f يساوي أو يتجاوز الحد %(limit).0f"
+
+msgctxt "ui/views/views.py"
+msgid "خطأ الإرسال"
+msgstr "خطأ الإرسال"
+
+msgctxt "ui/views/pending.py"
+msgid "رفض"
+msgstr "رفض"
+
+msgctxt "ui/views/views.py"
+msgid "رقم الحساب"
+msgstr "رقم الحساب"
+
+msgid "سداد"
+msgstr "سداد"
+
+msgctxt "ui/views/pending.py"
+msgid "صورة الإيصال"
+msgstr "صورة الإيصال"
+
+msgctxt "ui/views/batch.py"
+msgid "طاير"
+msgstr "طاير"
+
+msgid "عملية جديدة"
+msgstr "عملية جديدة"
+
+msgid "فحص الرصيد"
+msgstr "فحص الرصيد"
+
+msgid "فشل إرسال الرصيد: %(err)s"
+msgstr "فشل إرسال الرصيد: %(err)s"
+
+msgid "فشل الاتصال بقرطبة: %(err)s"
+msgstr "فشل الاتصال بقرطبة: %(err)s"
+
+msgctxt "ui/views/batch.py"
+msgid "فورى"
+msgstr "فورى"
+
+msgctxt "ui/views/pending.py"
+msgid "قيد المراجعة"
+msgstr "قيد المراجعة"
+
+msgctxt "ui/views/batch.py"
+msgid "كاش (أقل من 10,000)"
+msgstr "كاش (أقل من 10,000)"
+
+msgctxt "ui/views/batch.py"
+msgid "كاش(10) (من 10,000 إلى 19,999)"
+msgstr "كاش(10) (من 10,000 إلى 19,999)"
+
+msgctxt "ui/views/batch.py"
+msgid "كاش(20) (20,000 فأكثر)"
+msgstr "كاش(20) (20,000 فأكثر)"
+
+msgctxt "ui/views/batch.py"
+msgid "كاش(5) — محجوز"
+msgstr "كاش(5) — محجوز"
+
+msgctxt "ui/views/views.py"
+msgid "مديونيات"
+msgstr "مديونيات"
+
+msgctxt "ui/views/views.py"
+msgid "مديونية جديدة"
+msgstr "مديونية جديدة"
+
+msgctxt "ui/views/pending.py"
+msgid "مرفوض"
+msgstr "مرفوض"
+
+msgctxt "ui/views/views.py"
+msgid "مزامنة الحسابات"
+msgstr "مزامنة الحسابات"
+
+msgctxt "ui/views/views.py"
+msgid "مزامنة العملاء"
+msgstr "مزامنة العملاء"
+
+msgctxt "ui/views/batch.py"
+msgid "مصاريف خدمه"
+msgstr "مصاريف خدمه"
+
+msgid "معاملات: %(name)s"
+msgstr "معاملات: %(name)s"
+
+msgctxt "ui/views/views.py"
+msgid "معاملة جديدة"
+msgstr "معاملة جديدة"
+
+msgctxt "ui/views/views.py"
+msgid "معرف قرطبة"
+msgstr "معرف قرطبة"
+
+msgctxt "ui/views/pending.py"
+msgid "موافق عليه"
+msgstr "موافق عليه"
+
+msgctxt "ui/views/pending.py"
+msgid "نتيجة المراجعة"
+msgstr "نتيجة المراجعة"
+
+msgctxt "ui/views/batch.py"
+msgid "نوع محجوز للاستخدام المستقبلي."
+msgstr "نوع محجوز للاستخدام المستقبلي."
+
+msgid "هذه المحادثة غير مرتبطة بعميل قرطبة"
+msgstr "هذه المحادثة غير مرتبطة بعميل قرطبة"
+
+msgctxt "ui/views/views.py"
+msgid "وقت الإرسال"
+msgstr "وقت الإرسال"
