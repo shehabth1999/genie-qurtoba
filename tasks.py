@@ -206,6 +206,25 @@ def _webhook_retry_or_record(task, record, event: str, data: dict, exc):
                          event, getattr(record, 'pk', None), e2)
 
 
+def _retry_if_unresolved(task, event: str, data: dict) -> None:
+    """The QurtobaRecord couldn't be resolved yet — almost always a race where the
+    Cash-SYS webhook beat the push/sync that creates it (e.g. the accountant-
+    initiated flow fires forward_to_genie and the Cash-SYS order concurrently).
+    The view already 200-acked Cash-SYS, so returning here loses the event for
+    good. Retry with backoff to give the record time to appear; on exhaustion log
+    a durable error so it's at least visible.
+    """
+    if task.request.retries >= task.max_retries:
+        logger.error('[CashSys] %s: record unresolved after %d retries — dropping. '
+                     'external_ref=%s order=%s',
+                     event, task.request.retries,
+                     data.get('root_external_ref') or data.get('external_ref'),
+                     data.get('order_id'))
+        return
+    countdown = _RETRY_COUNTDOWNS[min(task.request.retries, len(_RETRY_COUNTDOWNS) - 1)]
+    raise task.retry(countdown=countdown)
+
+
 def _normalize_brief(txn: dict, record) -> dict:
     """Normalize a Cash-SYS transfer brief into the shape we persist + render."""
     txn = txn or {}
@@ -640,6 +659,7 @@ def handle_cash_sys_order_progress(self, data: dict):
 
     record = _resolve_root_record(data)
     if not record:
+        _retry_if_unresolved(self, 'order_progress', data)
         return
     txn = data.get('transaction') or {}
     skip, commit_key, cache_key = _claim_event(record, 'order_progress', data.get('order_id'), txn.get('id'))
@@ -676,6 +696,7 @@ def handle_cash_sys_order_done(self, data: dict):
 
     record = _resolve_root_record(data)
     if not record:
+        _retry_if_unresolved(self, 'order_done', data)
         return
     skip, commit_key, cache_key = _claim_event(record, 'order_done', data.get('order_id'), 'done')
     if skip:
@@ -716,14 +737,22 @@ def handle_cash_sys_order_done(self, data: dict):
 @shared_task(bind=True, max_retries=3)
 def handle_cash_sys_order_canceled(self, data: dict):
     """
-    A part was canceled. For reroute:true (number_limit) settle the already-sent
-    portion as done, edit the source record value down to `fulfilled`, propagate
-    the edit to the accountant (port 6000), send the done receipt(s), then ask the
-    customer for a new number for the remainder. For reroute:false just mark
-    canceled — no reissue.
+    A part was canceled.
+
+    reroute:true (number change / number_limit) — BUSINESS RULE:
+      The current order is STOPPED and COMPLETED at the amount actually sent.
+      i.e. edit its value down to `fulfilled` (the part that was transferred) and
+      mark it DONE. The leftover is NOT carried by this order — when the customer
+      sends a new number it becomes a COMPLETELY NEW, INDEPENDENT order through the
+      normal create flow. So here we only: settle this order at `fulfilled`,
+      propagate the value edit to the accountant (port 6000), send the done
+      receipt(s), and ASK the customer for a new number. We never reissue here.
+
+    reroute:false (plain customer/agent cancel) — just mark canceled, no reissue.
     """
     record = _resolve_root_record(data)
     if not record:
+        _retry_if_unresolved(self, 'order_canceled', data)
         return
     skip, commit_key, cache_key = _claim_event(record, 'order_canceled', data.get('order_id'), data.get('part_index'))
     if skip:
@@ -747,12 +776,19 @@ def handle_cash_sys_order_canceled(self, data: dict):
 
 def _apply_reroute(record, data: dict):
     """
-    Settle the sent portion and prepare the remainder for reissue to a new number.
+    Number change → STOP and COMPLETE this order at the amount actually sent.
 
-    Per the agreed split: the ORIGINAL record keeps the SENT part — edit its value
-    down to `fulfilled` (e.g. 10000 → 6000), mark it done, keep its receipts. The
-    remainder (`reroute_amount`) becomes a fully independent new order created later
-    when the customer sends a new number. Propagate the value edit to the accountant.
+    BUSINESS RULE (number change = new order):
+      • Edit THIS order's value down to `fulfilled` — the part that was really
+        transferred (e.g. 10000 → 6000) — and mark it DONE. After this, the order
+        reads "6000, done"; it no longer owes the remainder.
+      • The leftover (`reroute_amount`, e.g. 4000) is NOT this order's concern.
+        When the customer sends a new number it is created as a COMPLETELY NEW,
+        INDEPENDENT order via the normal create flow. We do NOT reissue it here.
+      • So: done(6000) on this order + new order(4000) on the new number = 10000.
+      • `cash_sys_reroute_amount` below is stored for REFERENCE ONLY (shown in the
+        status tool so the agent/customer knows the new order's amount); nothing
+        consumes it to auto-create anything.
     """
     from qurtoba.models import QurtobaRecord
     from qurtoba.utils_sync import edit_qurtoba_record_value
@@ -762,29 +798,35 @@ def _apply_reroute(record, data: dict):
         fulfilled = record.cash_sys_fulfilled or 0
     reroute_amount = data.get('reroute_amount') or 0
 
-    # Remember the original value once, then settle the record at the sent amount.
+    # Capture the original value once (before we overwrite it below).
     if record.cash_sys_original_value is None:
         record.cash_sys_original_value = record.value
-    record.value = fulfilled
-    record.cash_sys_done = True
-    record.cash_sys_state = 'rerouted'
-    record.cash_sys_fulfilled = fulfilled
-    record.cash_sys_reroute_amount = reroute_amount
-    record.cash_sys_canceled_reason = 'number_limit'
-    record.save()  # recomputes customer balance with the corrected value
 
-    # Propagate the value edit to the accountant (port 6000). This MUST succeed
-    # before we settle the customer-facing side: otherwise Genie shows the record
-    # at `fulfilled` (e.g. 6000) while the accountant ledger still holds the
-    # original (e.g. 10000) — a silent money discrepancy. Raise on failure so the
-    # handler retries and, on exhaustion, surfaces a visible QurtobaSyncProblem
-    # instead of asking the customer for a new number over an inconsistent ledger.
+    # ORDER MATTERS: update the accountant ledger (port 6000) FIRST, THEN save the
+    # Genie record. QurtobaRecord.save() → recompute_balance() PULLS the balance
+    # from port 6000 (the source of truth). If we saved first, Genie would pull the
+    # STALE pre-edit balance (computed at the original value) and never re-sync,
+    # leaving Genie's customer balance too high by the remainder. Editing port 6000
+    # first means the save() below pulls the already-corrected Rest → both in sync.
+    # Raise on failure so the handler retries instead of settling over an
+    # inconsistent ledger / asking the customer for a new number prematurely.
     if record.qurtoba_record_id:
         err = edit_qurtoba_record_value(record.qurtoba_record_id, fulfilled)
         if err:
             logger.error('[CashSys Reroute] accountant edit FAILED record=%d qid=%s: %s',
                          record.pk, record.qurtoba_record_id, err)
             raise RuntimeError(f'accountant edit failed for qid={record.qurtoba_record_id}: {err}')
+
+    # Settle THIS order at the sent amount and mark it done (state 'rerouted' is just
+    # a done-order marker explaining why value < original — cash_sys_done=True is
+    # what makes it complete). save() now pulls the corrected port-6000 Rest.
+    record.value = fulfilled
+    record.cash_sys_done = True
+    record.cash_sys_state = 'rerouted'
+    record.cash_sys_fulfilled = fulfilled
+    record.cash_sys_reroute_amount = reroute_amount  # reference only — see docstring
+    record.cash_sys_canceled_reason = 'number_limit'
+    record.save()  # recompute_balance() pulls the already-corrected (post-edit) Rest
 
     logger.info('[CashSys Reroute] record=%d original=%s fulfilled=%s remainder=%s',
                 record.pk, record.cash_sys_original_value, fulfilled, reroute_amount)
