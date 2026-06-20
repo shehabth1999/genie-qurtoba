@@ -44,33 +44,42 @@ def pull_cash_sys_catalog_task(self):
     plans_raw    = data.get('plans', [])
     vip_pages_raw = data.get('vip_pages', [])
 
-    # Full replace — atomic: delete all, bulk create
-    CashSysPlan.objects.all().delete()
-    CashSysPlan.objects.bulk_create([
-        CashSysPlan(
-            cash_sys_id   = p['id'],
-            name          = p['name'],
-            type          = p['type'],
-            price         = Decimal(p['price']),
-            device_limit  = p['device_limit'],
-            sim_limit     = p['sim_limit'],
-            account_limit = p['account_limit'],
-            vip_pages     = p.get('vip_pages', []),
-            is_active     = p.get('is_active', True),
-        )
-        for p in plans_raw
-    ])
+    # Full replace — genuinely atomic so a malformed row (e.g. a missing key)
+    # rolls back the delete instead of leaving the catalog empty until the next run.
+    from django.db import transaction as db_tx
+    try:
+        with db_tx.atomic():
+            CashSysPlan.objects.all().delete()
+            CashSysPlan.objects.bulk_create([
+                CashSysPlan(
+                    cash_sys_id   = p['id'],
+                    name          = p['name'],
+                    type          = p['type'],
+                    price         = Decimal(p['price']),
+                    device_limit  = p['device_limit'],
+                    sim_limit     = p['sim_limit'],
+                    account_limit = p['account_limit'],
+                    vip_pages     = p.get('vip_pages', []),
+                    is_active     = p.get('is_active', True),
+                )
+                for p in plans_raw
+            ])
 
-    CashSysVipPage.objects.all().delete()
-    CashSysVipPage.objects.bulk_create([
-        CashSysVipPage(
-            cash_sys_id = vp['id'],
-            name        = vp['name'],
-            key         = vp['key'],
-            price       = Decimal(vp['price']),
-        )
-        for vp in vip_pages_raw
-    ])
+            CashSysVipPage.objects.all().delete()
+            CashSysVipPage.objects.bulk_create([
+                CashSysVipPage(
+                    cash_sys_id = vp['id'],
+                    name        = vp['name'],
+                    key         = vp['key'],
+                    price       = Decimal(vp['price']),
+                )
+                for vp in vip_pages_raw
+            ])
+    except Exception as exc:
+        # Bad catalog shape — keep the existing catalog (rolled back) and retry.
+        logger.error('[CashSys Catalog] Failed to apply catalog (kept previous): %s', exc)
+        countdown = [30, 60, 120][min(self.request.retries, 2)]
+        raise self.retry(exc=exc, countdown=countdown)
 
     logger.info(
         '[CashSys Catalog] Synced %d plans, %d vip pages',
@@ -116,22 +125,85 @@ def _resolve_root_record(data: dict):
     return record
 
 
-def _event_already_processed(record, event: str, order_id, txn_id) -> bool:
+def _claim_event(record, event: str, order_id, txn_id):
+    """Claim an incoming webhook for exactly-once processing.
+
+    Returns ``(skip, commit_key, cache_key)``:
+      • ``skip=True``  → already processed durably, or another delivery is
+        in-flight right now → caller must return without processing.
+      • ``skip=False`` → caller owns processing and MUST call ``_commit_event``
+        on success or ``_release_event`` on failure (so a retry can re-claim).
+
+    A Cash-SYS retry typically arrives while the first delivery is still being
+    processed, so two duplicate webhooks can run concurrently. The durable
+    ``cash_sys_event_log`` append alone is a racy read-modify-write (both tasks
+    read the log before either writes ⇒ both process ⇒ duplicate transaction).
+    ``cache.add`` is an atomic SETNX in-flight lock that closes that race; the
+    durable log is the backstop once the lock expires. Crucially the durable
+    commit happens only AFTER the work succeeds, so a failed delivery can be
+    retried instead of being marked done and silently lost.
     """
-    Idempotent dedupe over (event, order_id, txn_id) — Cash-SYS retries any non-2xx
-    up to 3 times. Returns True if this exact event was already handled.
-    """
-    from qurtoba.models import QurtobaRecord
+    from django.core.cache import cache
 
     key = f'{event}:{order_id}:{txn_id}'
-    log = list(record.cash_sys_event_log or [])
-    if key in log:
-        logger.info('[CashSys] duplicate event %s for record %d — skipping', key, record.pk)
-        return True
-    log.append(key)
-    QurtobaRecord.objects.filter(pk=record.pk).update(cash_sys_event_log=log)
+    if key in list(record.cash_sys_event_log or []):
+        logger.info('[CashSys] duplicate event %s for record %d — skipping (log)', key, record.pk)
+        return True, None, None
+
+    cache_key = f'qurtoba:cashsys:evt:{record.pk}:{key}'
+    if not cache.add(cache_key, 1, timeout=600):
+        logger.info('[CashSys] duplicate event %s for record %d — skipping (in-flight)', key, record.pk)
+        return True, None, None
+
+    return False, key, cache_key
+
+
+def _commit_event(record, key: str):
+    """Durably mark a webhook event processed — only after it fully succeeded.
+
+    Locks the row for the read-modify-write so two legitimate concurrent events
+    on the same record (e.g. two partials) can't lose each other's log entry.
+    """
+    from django.db import transaction as db_tx
+    from qurtoba.models import QurtobaRecord
+
+    with db_tx.atomic():
+        locked = QurtobaRecord.objects.select_for_update().only(
+            'id', 'cash_sys_event_log'
+        ).get(pk=record.pk)
+        log = list(locked.cash_sys_event_log or [])
+        if key not in log:
+            log.append(key)
+            QurtobaRecord.objects.filter(pk=record.pk).update(cash_sys_event_log=log)
     record.cash_sys_event_log = log
-    return False
+
+
+def _release_event(cache_key):
+    """Release the in-flight lock so a retry of a FAILED event can re-claim it."""
+    if cache_key:
+        from django.core.cache import cache
+        cache.delete(cache_key)
+
+
+def _webhook_retry_or_record(task, record, event: str, data: dict, exc):
+    """A webhook handler crashed. The view already acked 200 to Cash-SYS, so this
+    would otherwise be a silent loss. Retry with backoff; on exhaustion record a
+    visible, UI-retryable ``QurtobaSyncProblem`` + notify admins — mirroring
+    ``push_record_to_qurtoba_task``.
+    """
+    countdown = _RETRY_COUNTDOWNS[min(task.request.retries, len(_RETRY_COUNTDOWNS) - 1)]
+    try:
+        raise task.retry(exc=exc, countdown=countdown)
+    except task.MaxRetriesExceededError:
+        logger.exception('[CashSys] %s permanently failed record=%s order=%s: %s',
+                         event, getattr(record, 'pk', None), data.get('order_id'), exc)
+        try:
+            if record is not None:
+                from qurtoba.models import QurtobaSyncProblem
+                QurtobaSyncProblem.record(record, f'cash_sys_{event}', str(exc), payload=data)
+        except Exception as e2:
+            logger.error('[CashSys] failed to record problem for %s record=%s: %s',
+                         event, getattr(record, 'pk', None), e2)
 
 
 def _normalize_brief(txn: dict, record) -> dict:
@@ -156,18 +228,26 @@ def _merge_briefs(record, new_briefs: list) -> list:
     (preserving the existing 'sent'/'attachment_id' state). Persists + returns
     the merged list.
     """
+    from django.db import transaction as db_tx
     from qurtoba.models import QurtobaRecord
 
-    existing = list(record.cash_sys_transactions or [])
-    by_id = {b.get('id'): b for b in existing if b.get('id') is not None}
-    for nb in new_briefs:
-        bid = nb.get('id')
-        if bid is not None and bid in by_id:
-            continue  # already tracked — keep its sent/attachment state
-        existing.append(nb)
-        if bid is not None:
-            by_id[bid] = nb
-    QurtobaRecord.objects.filter(pk=record.pk).update(cash_sys_transactions=existing)
+    # Row-lock the read-modify-write: two legitimate concurrent partial events on
+    # the same record would otherwise each read the list and clobber the other's
+    # append (a lost transfer brief ⇒ a receipt that never gets sent).
+    with db_tx.atomic():
+        locked = QurtobaRecord.objects.select_for_update().only(
+            'id', 'cash_sys_transactions'
+        ).get(pk=record.pk)
+        existing = list(locked.cash_sys_transactions or [])
+        by_id = {b.get('id'): b for b in existing if b.get('id') is not None}
+        for nb in new_briefs:
+            bid = nb.get('id')
+            if bid is not None and bid in by_id:
+                continue  # already tracked — keep its sent/attachment state
+            existing.append(nb)
+            if bid is not None:
+                by_id[bid] = nb
+        QurtobaRecord.objects.filter(pk=record.pk).update(cash_sys_transactions=existing)
     record.cash_sys_transactions = existing
     return existing
 
@@ -356,13 +436,35 @@ def _send_done_receipts(record):
             logger.warning('[CashSys Notify] receipt delivery FAILED record=%d txn=%s err=%s',
                            record.pk, brief.get('id'), result.get('error'))
 
-    # Persist the updated sent/attachment flags; keep one receipt on the record.
-    update = {'cash_sys_transactions': briefs}
-    if first_attachment is not None and not record.receipt_attachment_id:
-        update['receipt_attachment'] = first_attachment
-        record.receipt_attachment = first_attachment
-    QurtobaRecord.objects.filter(pk=record.pk).update(**update)
-    record.cash_sys_transactions = briefs
+    # Persist the updated sent/attachment flags WITHOUT clobbering briefs that a
+    # concurrent partial event may have appended while we were sending: re-read
+    # under a row lock and apply only the per-brief flags we just changed. (The
+    # `briefs` list was read before the slow sends, so writing it back wholesale
+    # would drop any brief merged in meanwhile.)
+    from django.db import transaction as db_tx
+
+    flag_updates = {
+        b.get('id'): b for b in pending
+        if b.get('id') is not None and (b.get('sent') or b.get('attachment_id'))
+    }
+    with db_tx.atomic():
+        locked = QurtobaRecord.objects.select_for_update().only(
+            'id', 'cash_sys_transactions', 'receipt_attachment'
+        ).get(pk=record.pk)
+        fresh = list(locked.cash_sys_transactions or [])
+        for b in fresh:
+            u = flag_updates.get(b.get('id'))
+            if u:
+                if u.get('sent'):
+                    b['sent'] = True
+                if u.get('attachment_id'):
+                    b['attachment_id'] = u['attachment_id']
+        update = {'cash_sys_transactions': fresh}
+        if first_attachment is not None and not locked.receipt_attachment_id:
+            update['receipt_attachment'] = first_attachment
+            record.receipt_attachment = first_attachment
+        QurtobaRecord.objects.filter(pk=record.pk).update(**update)
+    record.cash_sys_transactions = fresh
 
 
 def send_text_reply_for_record(record, text):
@@ -540,18 +642,24 @@ def handle_cash_sys_order_progress(self, data: dict):
     if not record:
         return
     txn = data.get('transaction') or {}
-    if _event_already_processed(record, 'order_progress', data.get('order_id'), txn.get('id')):
+    skip, commit_key, cache_key = _claim_event(record, 'order_progress', data.get('order_id'), txn.get('id'))
+    if skip:
         return
 
-    _merge_briefs(record, [_normalize_brief(txn, record)])
-    fulfilled = data.get('fulfilled')
-    state = record.cash_sys_state if record.cash_sys_state in ('rerouted', 'done') else 'partial'
-    QurtobaRecord.objects.filter(pk=record.pk).update(
-        cash_sys_state=state,
-        cash_sys_fulfilled=fulfilled if fulfilled is not None else record.cash_sys_fulfilled,
-    )
-    logger.info('[CashSys Progress] record=%d fulfilled=%s remaining=%s — no message',
-                record.pk, fulfilled, data.get('remaining'))
+    try:
+        _merge_briefs(record, [_normalize_brief(txn, record)])
+        fulfilled = data.get('fulfilled')
+        state = record.cash_sys_state if record.cash_sys_state in ('rerouted', 'done') else 'partial'
+        QurtobaRecord.objects.filter(pk=record.pk).update(
+            cash_sys_state=state,
+            cash_sys_fulfilled=fulfilled if fulfilled is not None else record.cash_sys_fulfilled,
+        )
+        _commit_event(record, commit_key)
+        logger.info('[CashSys Progress] record=%d fulfilled=%s remaining=%s — no message',
+                    record.pk, fulfilled, data.get('remaining'))
+    except Exception as exc:
+        _release_event(cache_key)
+        _webhook_retry_or_record(self, record, 'order_progress', data, exc)
 
 
 @shared_task(bind=True, max_retries=3)
@@ -569,34 +677,40 @@ def handle_cash_sys_order_done(self, data: dict):
     record = _resolve_root_record(data)
     if not record:
         return
-    if _event_already_processed(record, 'order_done', data.get('order_id'), 'done'):
+    skip, commit_key, cache_key = _claim_event(record, 'order_done', data.get('order_id'), 'done')
+    if skip:
         return
 
-    # Briefs: prefer the full transactions[] array; fall back to the single brief.
-    raw_txns = data.get('transactions') or ([data['transaction']] if data.get('transaction') else [])
-    briefs = [_normalize_brief(t, record) for t in raw_txns]
-    _merge_briefs(record, briefs)
+    try:
+        # Briefs: prefer the full transactions[] array; fall back to the single brief.
+        raw_txns = data.get('transactions') or ([data['transaction']] if data.get('transaction') else [])
+        briefs = [_normalize_brief(t, record) for t in raw_txns]
+        _merge_briefs(record, briefs)
 
-    done_at = parse_datetime(data.get('done_at') or '') or timezone.now()
-    fulfilled = data.get('fulfilled', data.get('value'))
-    last = raw_txns[-1] if raw_txns else {}
-    # Don't clobber a reroute that already settled this record.
-    state = 'rerouted' if record.cash_sys_state == 'rerouted' else 'done'
-    QurtobaRecord.objects.filter(pk=record.pk).update(
-        cash_sys_done=True,
-        cash_sys_done_at=done_at,
-        cash_sys_state=state,
-        cash_sys_fulfilled=fulfilled,
-        cash_sys_fee=last.get('fee'),
-        cash_sys_sim=last.get('sim_number'),
-        cash_sys_device=last.get('device_name'),
-    )
-    record.refresh_from_db()
+        done_at = parse_datetime(data.get('done_at') or '') or timezone.now()
+        fulfilled = data.get('fulfilled', data.get('value'))
+        last = raw_txns[-1] if raw_txns else {}
+        # Don't clobber a reroute that already settled this record.
+        state = 'rerouted' if record.cash_sys_state == 'rerouted' else 'done'
+        QurtobaRecord.objects.filter(pk=record.pk).update(
+            cash_sys_done=True,
+            cash_sys_done_at=done_at,
+            cash_sys_state=state,
+            cash_sys_fulfilled=fulfilled,
+            cash_sys_fee=last.get('fee'),
+            cash_sys_sim=last.get('sim_number'),
+            cash_sys_device=last.get('device_name'),
+        )
+        record.refresh_from_db()
 
-    _send_done_receipts(record)         # images first …
-    _create_service_fees(record)        # … then the auto service-fee note(s)
-    logger.info('[CashSys Done] record=%d order_id=%s value=%s fulfilled=%s txns=%d',
-                record.pk, data.get('order_id'), data.get('value'), fulfilled, len(briefs))
+        _send_done_receipts(record)         # images first …
+        _create_service_fees(record)        # … then the auto service-fee note(s)
+        _commit_event(record, commit_key)
+        logger.info('[CashSys Done] record=%d order_id=%s value=%s fulfilled=%s txns=%d',
+                    record.pk, data.get('order_id'), data.get('value'), fulfilled, len(briefs))
+    except Exception as exc:
+        _release_event(cache_key)
+        _webhook_retry_or_record(self, record, 'order_done', data, exc)
 
 
 @shared_task(bind=True, max_retries=3)
@@ -611,18 +725,24 @@ def handle_cash_sys_order_canceled(self, data: dict):
     record = _resolve_root_record(data)
     if not record:
         return
-    if _event_already_processed(record, 'order_canceled', data.get('order_id'), data.get('part_index')):
+    skip, commit_key, cache_key = _claim_event(record, 'order_canceled', data.get('order_id'), data.get('part_index'))
+    if skip:
         return
 
-    reason = data.get('cancel_reason')
-    if data.get('reroute'):
-        _apply_reroute(record, data)
-    else:
-        from qurtoba.models import QurtobaRecord
-        QurtobaRecord.objects.filter(pk=record.pk).update(
-            cash_sys_state='canceled', cash_sys_canceled_reason=reason,
-        )
-        logger.info('[CashSys Canceled] record=%d reason=%s (no reroute)', record.pk, reason)
+    try:
+        reason = data.get('cancel_reason')
+        if data.get('reroute'):
+            _apply_reroute(record, data)
+        else:
+            from qurtoba.models import QurtobaRecord
+            QurtobaRecord.objects.filter(pk=record.pk).update(
+                cash_sys_state='canceled', cash_sys_canceled_reason=reason,
+            )
+            logger.info('[CashSys Canceled] record=%d reason=%s (no reroute)', record.pk, reason)
+        _commit_event(record, commit_key)
+    except Exception as exc:
+        _release_event(cache_key)
+        _webhook_retry_or_record(self, record, 'order_canceled', data, exc)
 
 
 def _apply_reroute(record, data: dict):
@@ -653,12 +773,18 @@ def _apply_reroute(record, data: dict):
     record.cash_sys_canceled_reason = 'number_limit'
     record.save()  # recomputes customer balance with the corrected value
 
-    # Propagate the value edit to the accountant (port 6000).
+    # Propagate the value edit to the accountant (port 6000). This MUST succeed
+    # before we settle the customer-facing side: otherwise Genie shows the record
+    # at `fulfilled` (e.g. 6000) while the accountant ledger still holds the
+    # original (e.g. 10000) — a silent money discrepancy. Raise on failure so the
+    # handler retries and, on exhaustion, surfaces a visible QurtobaSyncProblem
+    # instead of asking the customer for a new number over an inconsistent ledger.
     if record.qurtoba_record_id:
         err = edit_qurtoba_record_value(record.qurtoba_record_id, fulfilled)
         if err:
             logger.error('[CashSys Reroute] accountant edit FAILED record=%d qid=%s: %s',
                          record.pk, record.qurtoba_record_id, err)
+            raise RuntimeError(f'accountant edit failed for qid={record.qurtoba_record_id}: {err}')
 
     logger.info('[CashSys Reroute] record=%d original=%s fulfilled=%s remainder=%s',
                 record.pk, record.cash_sys_original_value, fulfilled, reroute_amount)

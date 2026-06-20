@@ -80,6 +80,9 @@ def push_record_to_qurtoba(record_pk: int) -> str | None:
 def _build_payload(record, customer) -> dict:
     now = dt.datetime.now()
     return {
+        # Stable idempotency key: the accountant server dedupes on this, so a
+        # retry of this push never creates a duplicate ledger row.
+        'external_ref':  str(record.pk),
         'customerData':  customer.qurtoba_id,
         'type':          record.type,
         'accountNumber': record.account_number or '',
@@ -113,6 +116,22 @@ def _sync_customer_balance(base: str, token: str, customer) -> None:
 
 
 _CASH_TYPES = {'كاش', 'كاش(5)', 'كاش(10)', 'كاش(20)'}
+
+
+def _record_cash_sys_problem(qurtoba_record_id, error: str, payload=None) -> None:
+    """Surface a permanently-failed Cash-SYS order creation as a visible, UI-retryable
+    QurtobaSyncProblem instead of letting it die in a daemon-thread log line (the
+    order would otherwise never reach Cash-SYS with no one the wiser)."""
+    try:
+        from qurtoba.models import QurtobaRecord, QurtobaSyncProblem
+        rec = QurtobaRecord.objects.filter(qurtoba_record_id=qurtoba_record_id).first()
+        if rec:
+            QurtobaSyncProblem.record(rec, 'cash_sys_order', error, payload=payload or {})
+        else:
+            logger.error('cash_sys: no Genie record for qurtoba_id=%s — cannot record problem (%s)',
+                         qurtoba_record_id, error)
+    except Exception as exc:
+        logger.error('cash_sys: failed to record problem for qurtoba_id=%s: %s', qurtoba_record_id, exc)
 
 
 def _send_to_cash_sys(qurtoba_record_id: int, record_type: str, value, phone_no: str) -> None:
@@ -161,11 +180,13 @@ def _send_to_cash_sys(qurtoba_record_id: int, record_type: str, value, phone_no:
                     return
                 if resp.status_code == 400:
                     logger.error('cash_sys rejected qurtoba_id=%d (400): %s', qurtoba_record_id, resp.text[:200])
+                    _record_cash_sys_problem(qurtoba_record_id, f'Cash-SYS rejected (400): {resp.text[:200]}', payload)
                     return
                 logger.warning('cash_sys attempt %d HTTP %s for qurtoba_id=%d', attempt+1, resp.status_code, qurtoba_record_id)
             except Exception as exc:
                 logger.warning('cash_sys attempt %d failed for qurtoba_id=%d: %s', attempt+1, qurtoba_record_id, exc)
         logger.error('cash_sys gave up for qurtoba_id=%d', qurtoba_record_id)
+        _record_cash_sys_problem(qurtoba_record_id, 'Cash-SYS order creation failed after all retries', payload)
 
     threading.Thread(target=_post, daemon=True).start()
 
