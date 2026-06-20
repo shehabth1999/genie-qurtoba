@@ -6,6 +6,8 @@ Currently exposes:
     posts the linked customer's Qurtoba balance into the active chat as an
     outbound message, dispatched through the same ChatBridgeService used by
     the WhatsApp/Messenger integrations.
+  * alert_qurtoba_human — push-notify every team member on the conversation so a
+    human steps in, WITHOUT disabling the AI and WITHOUT telling the customer.
 """
 from typing import Any, Dict
 
@@ -82,4 +84,67 @@ def qurtoba_send_customer_balance_to_chat(context) -> Dict[str, Any]:
         'over_limit': remaining is not None and remaining < 0,
         'conversation_id': conv.pk,
         'note': 'Balance message dispatched to the chat (WhatsApp/Messenger delivery + WebSocket push).',
+    }
+
+
+@tool(
+    name='alert_qurtoba_human',
+    display_name='Alert Qurtoba Human (push only)',
+    description=(
+        'Send a PUSH notification to every team member on this conversation so a human '
+        'steps in. It does NOT disable the AI (the AI keeps handling the chat) and it does '
+        'NOT send anything to the customer. '
+        'Pass `note` with a short, specific reason a human is needed plus context — customer '
+        'name, amount, phone/account number, and exactly what they asked — so the human can '
+        'act without reading the whole chat. '
+        'After calling this tool, reply to the customer with only «لحظة» — never tell the '
+        'customer that a human/colleague will contact them or that you are escalating.'
+    ),
+    category='qurtoba',
+    requires_auth=True,
+    rate_limit=20,
+    parameters_schema={
+        'type': 'object',
+        'properties': {
+            'note': {
+                'type': 'string',
+                'description': (
+                    'Short, specific reason a human is needed + context '
+                    '(customer name, amount, number, what was asked).'
+                ),
+            },
+        },
+        'required': ['note'],
+    },
+)
+def alert_qurtoba_human(context, note: str = '') -> Dict[str, Any]:
+    """Push-notify every team member on the conversation, without disabling AI."""
+    conv = getattr(context, 'conversation', None)
+    if conv is None:
+        return {
+            'success': False,
+            'error': 'No active conversation in context. This tool requires a live customer chat.',
+            'error_type': 'no_conversation',
+        }
+
+    try:
+        # Push only: no DM spam, no favorite — just an inbox/push alert to all
+        # company participants on this conversation. AI handling stays ON.
+        conv.alert_human(
+            notify_dm=False,
+            notify_push=True,
+            mark_favorite=False,
+            message=(note or None),
+        )
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e),
+            'error_type': 'alert_failed',
+        }
+
+    return {
+        'success': True,
+        'conversation_id': conv.pk,
+        'note': 'Push notification sent to all conversation team members. AI handling stays ON.',
     }
