@@ -701,7 +701,9 @@ class QurtobaRecord(BaseModel):
     cash_sys_done_at = models.DateTimeField(null=True, blank=True, verbose_name='Cash Done At')
     cash_sys_fee     = models.FloatField(null=True, blank=True, verbose_name='Cash-SYS Fee')
     cash_sys_sim     = models.CharField(max_length=20, null=True, blank=True, verbose_name='SIM Number')
+    cash_sys_sim_code = models.CharField(max_length=20, null=True, blank=True, verbose_name='SIM Code')
     cash_sys_device  = models.CharField(max_length=100, null=True, blank=True, verbose_name='Device')
+    cash_sys_operator = models.CharField(max_length=100, null=True, blank=True, verbose_name='Operator')
 
     # ---- Multi-step chain / reroute state (Cash-SYS may fulfil an order in
     #      several partial transfers, and the recipient number can change) ----

@@ -234,7 +234,9 @@ def _normalize_brief(txn: dict, record) -> dict:
         'transfer_to': txn.get('transfer_to') or (record.account_number or '-'),
         'fee':         txn.get('fee'),
         'sim_number':  txn.get('sim_number'),
+        'sim_code':    txn.get('sim_code'),
         'device_name': txn.get('device_name'),
+        'operator':    txn.get('operator'),
         'executed_at': txn.get('executed_at'),
         'attachment_id': None,
         'sent':        False,
@@ -720,7 +722,9 @@ def handle_cash_sys_order_done(self, data: dict):
             cash_sys_fulfilled=fulfilled,
             cash_sys_fee=last.get('fee'),
             cash_sys_sim=last.get('sim_number'),
+            cash_sys_sim_code=last.get('sim_code'),
             cash_sys_device=last.get('device_name'),
+            cash_sys_operator=last.get('operator'),
         )
         record.refresh_from_db()
 
