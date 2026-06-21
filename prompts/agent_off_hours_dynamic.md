@@ -1,4 +1,3 @@
-<?xml version="1.0" encoding="UTF-8"?>
 <live_context>
 
   <!-- DYNAMIC / NOT cached. Live values only — all laws, tools, the report-date
