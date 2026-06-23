@@ -407,7 +407,7 @@ def _txn_text_fallback(record, brief: dict) -> str:
 # wait for the image message's 'delivered' webhook status before sending the text,
 # or pre-upload the media (send by media_id instead of link) so delivery is fast
 # and in-order. The webhook already tracks sent/delivered/read status.
-_RECEIPT_DELIVERY_DELAY = 3  # seconds
+_RECEIPT_DELIVERY_DELAY = 8  # seconds
 
 
 def _pause_after_receipts(images_sent):
@@ -570,9 +570,11 @@ def _send_reroute_ask(record, fulfilled, reroute_amount):
     if not ctx:
         return
     if fulfilled and float(fulfilled) > 0:
+        remainder_txt = f"{float(reroute_amount):,.0f}" if reroute_amount else "......"
         text = (
-            f"*تم تحويل جزء من المبلغ ( {float(fulfilled):,.0f} ) و محتاجين رقم تانى يا غالى علشان نكمل باقى المبلغ*\n\n"
-            f"الرقم مش قابل تحويل غير المبلغ ده \n\n"
+            f"*تم تحويل ( {float(fulfilled):,.0f} ) و الباقى ( {remainder_txt} )*\n\n"
+            f"محتاجين رقم تانى علشان نكمل\n"
+            f"الرقم مش قابل تحويل تانى\n"
             f"( الرقم تجاوز الحد اليومى او الشهرى )"
         )
     else:
