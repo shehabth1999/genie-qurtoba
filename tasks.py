@@ -238,6 +238,7 @@ def _normalize_brief(txn: dict, record) -> dict:
         'device_name': txn.get('device_name'),
         'operator':    txn.get('operator'),
         'executed_at': txn.get('executed_at'),
+        'is_manual':   bool(txn.get('is_manual')),
         'attachment_id': None,
         'sent':        False,
     }
@@ -398,94 +399,138 @@ def _txn_text_fallback(record, brief: dict) -> str:
     )
 
 
+# Images go to WhatsApp as a *link*, so the provider downloads the file before
+# delivering it; a light follow-up text (مصاريف خدمه / تغيير رقم) can overtake the
+# still-downloading receipt and arrive first. This pause lets the image land first.
+#
+# TODO(receipt-ordering): replace this fixed delay with a real guarantee — either
+# wait for the image message's 'delivered' webhook status before sending the text,
+# or pre-upload the media (send by media_id instead of link) so delivery is fast
+# and in-order. The webhook already tracks sent/delivered/read status.
+_RECEIPT_DELIVERY_DELAY = 3  # seconds
+
+
+def _pause_after_receipts(images_sent):
+    """Pause so a sent receipt image lands before the follow-up text. No-op when
+    no image was actually sent (e.g. nothing pending, or the text fallback ran)."""
+    if images_sent:
+        import time
+        time.sleep(_RECEIPT_DELIVERY_DELAY)
+
+
 def _send_done_receipts(record):
     """
     Send a receipt image for every NOT-yet-sent transfer brief on the record, all
     at once (back-to-back), each as a reply quoting the original request message.
     Marks each brief sent=True so retries / companion events never re-send.
     Idempotent + best-effort: a per-brief failure falls back to a text receipt.
+
+    Uses a Redis in-flight lock so concurrent callers (e.g. order_done +
+    order_canceled/reroute arriving simultaneously) never both send the same
+    receipt image.  The lock is released after the DB write so a subsequent
+    legitimate caller sees the updated sent=True flags and skips cleanly.
+
+    Returns the number of receipt IMAGES actually delivered (the text-fallback
+    case does not count) — callers use it to decide whether to pause before
+    sending a follow-up text so the heavy image lands first.
     """
+    from django.core.cache import cache
     from qurtoba.models import QurtobaRecord
 
-    briefs = list(record.cash_sys_transactions or [])
-    pending = [b for b in briefs if not b.get('sent')]
-    if not pending:
-        return
-    ctx = _notify_context(record)
-    if not ctx:
-        return
+    send_lock_key = f'qurtoba:receipt_send:{record.pk}'
+    if not cache.add(send_lock_key, 1, timeout=300):
+        logger.info(
+            '[CashSys Notify] receipt send already in-flight for record %d — skipping (lock)',
+            record.pk,
+        )
+        return 0
 
-    first_attachment = None
-    for brief in pending:
-        attachment, url = _build_and_save_receipt_for_txn(record, brief)
-        try:
-            if url:
-                result = ctx['svc'].send_and_broadcast(
-                    partner=ctx['conv'].social_partner,
-                    content={'url': url, 'filename': attachment.name},
-                    message_type='image',
-                    conversation=ctx['conv'],
-                    system_partner=ctx['system_partner'],
-                    reply_to_message_id=ctx['reply_wamid'],
-                    reply_to_id=ctx['reply_local_id'],
-                    websocket=True,
-                )
+    try:
+        briefs = list(record.cash_sys_transactions or [])
+        pending = [b for b in briefs if not b.get('sent')]
+        if not pending:
+            return 0
+
+        ctx = _notify_context(record)
+        if not ctx:
+            return 0
+
+        first_attachment = None
+        images_sent = 0
+        for brief in pending:
+            attachment, url = _build_and_save_receipt_for_txn(record, brief)
+            try:
+                if url:
+                    result = ctx['svc'].send_and_broadcast(
+                        partner=ctx['conv'].social_partner,
+                        content={'url': url, 'filename': attachment.name},
+                        message_type='image',
+                        conversation=ctx['conv'],
+                        system_partner=ctx['system_partner'],
+                        reply_to_message_id=ctx['reply_wamid'],
+                        reply_to_id=ctx['reply_local_id'],
+                        websocket=True,
+                    )
+                else:
+                    result = ctx['svc'].send_and_broadcast(
+                        partner=ctx['conv'].social_partner,
+                        content={'text': _txn_text_fallback(record, brief)},
+                        message_type='text',
+                        conversation=ctx['conv'],
+                        system_partner=ctx['system_partner'],
+                        reply_to_message_id=ctx['reply_wamid'],
+                        reply_to_id=ctx['reply_local_id'],
+                        websocket=True,
+                    )
+            except Exception as exc:
+                logger.exception('[CashSys Notify] send failed for record %d txn %s: %s',
+                                 record.pk, brief.get('id'), exc)
+                continue
+
+            if result.get('success'):
+                brief['sent'] = True
+                if attachment is not None:
+                    brief['attachment_id'] = attachment.id
+                    first_attachment = first_attachment or attachment
+                    images_sent += 1   # only a real image counts (not the text fallback)
+                logger.info('[CashSys Notify] receipt sent record=%d txn=%s msg=%s',
+                            record.pk, brief.get('id'), result.get('message_id'))
             else:
-                result = ctx['svc'].send_and_broadcast(
-                    partner=ctx['conv'].social_partner,
-                    content={'text': _txn_text_fallback(record, brief)},
-                    message_type='text',
-                    conversation=ctx['conv'],
-                    system_partner=ctx['system_partner'],
-                    reply_to_message_id=ctx['reply_wamid'],
-                    reply_to_id=ctx['reply_local_id'],
-                    websocket=True,
-                )
-        except Exception as exc:
-            logger.exception('[CashSys Notify] send failed for record %d txn %s: %s',
-                             record.pk, brief.get('id'), exc)
-            continue
+                logger.warning('[CashSys Notify] receipt delivery FAILED record=%d txn=%s err=%s',
+                               record.pk, brief.get('id'), result.get('error'))
 
-        if result.get('success'):
-            brief['sent'] = True
-            if attachment is not None:
-                brief['attachment_id'] = attachment.id
-                first_attachment = first_attachment or attachment
-            logger.info('[CashSys Notify] receipt sent record=%d txn=%s msg=%s',
-                        record.pk, brief.get('id'), result.get('message_id'))
-        else:
-            logger.warning('[CashSys Notify] receipt delivery FAILED record=%d txn=%s err=%s',
-                           record.pk, brief.get('id'), result.get('error'))
+        # Persist the updated sent/attachment flags WITHOUT clobbering briefs that a
+        # concurrent partial event may have appended while we were sending: re-read
+        # under a row lock and apply only the per-brief flags we just changed. (The
+        # `briefs` list was read before the slow sends, so writing it back wholesale
+        # would drop any brief merged in meanwhile.)
+        from django.db import transaction as db_tx
 
-    # Persist the updated sent/attachment flags WITHOUT clobbering briefs that a
-    # concurrent partial event may have appended while we were sending: re-read
-    # under a row lock and apply only the per-brief flags we just changed. (The
-    # `briefs` list was read before the slow sends, so writing it back wholesale
-    # would drop any brief merged in meanwhile.)
-    from django.db import transaction as db_tx
-
-    flag_updates = {
-        b.get('id'): b for b in pending
-        if b.get('id') is not None and (b.get('sent') or b.get('attachment_id'))
-    }
-    with db_tx.atomic():
-        locked = QurtobaRecord.objects.select_for_update().only(
-            'id', 'cash_sys_transactions', 'receipt_attachment'
-        ).get(pk=record.pk)
-        fresh = list(locked.cash_sys_transactions or [])
-        for b in fresh:
-            u = flag_updates.get(b.get('id'))
-            if u:
-                if u.get('sent'):
-                    b['sent'] = True
-                if u.get('attachment_id'):
-                    b['attachment_id'] = u['attachment_id']
-        update = {'cash_sys_transactions': fresh}
-        if first_attachment is not None and not locked.receipt_attachment_id:
-            update['receipt_attachment'] = first_attachment
-            record.receipt_attachment = first_attachment
-        QurtobaRecord.objects.filter(pk=record.pk).update(**update)
-    record.cash_sys_transactions = fresh
+        flag_updates = {
+            b.get('id'): b for b in pending
+            if b.get('id') is not None and (b.get('sent') or b.get('attachment_id'))
+        }
+        with db_tx.atomic():
+            locked = QurtobaRecord.objects.select_for_update().only(
+                'id', 'cash_sys_transactions', 'receipt_attachment'
+            ).get(pk=record.pk)
+            fresh = list(locked.cash_sys_transactions or [])
+            for b in fresh:
+                u = flag_updates.get(b.get('id'))
+                if u:
+                    if u.get('sent'):
+                        b['sent'] = True
+                    if u.get('attachment_id'):
+                        b['attachment_id'] = u['attachment_id']
+            update = {'cash_sys_transactions': fresh}
+            if first_attachment is not None and not locked.receipt_attachment_id:
+                update['receipt_attachment'] = first_attachment
+                record.receipt_attachment = first_attachment
+            QurtobaRecord.objects.filter(pk=record.pk).update(**update)
+        record.cash_sys_transactions = fresh
+        return images_sent
+    finally:
+        cache.delete(send_lock_key)
 
 
 def send_text_reply_for_record(record, text):
@@ -526,11 +571,16 @@ def _send_reroute_ask(record, fulfilled, reroute_amount):
         return
     if fulfilled and float(fulfilled) > 0:
         text = (
-            f"هذا الرقم تجاوز الحد الاقصي للمعاملات، تم تحويل {float(fulfilled):,.0f} "
-            f"محتاجين رقم تاني عشان نكمل باقي عملية التحويل"
+            f"*تم تحويل جزء من المبلغ ( {float(fulfilled):,.0f} ) و محتاجين رقم تانى يا غالى علشان نكمل باقى المبلغ*\n\n"
+            f"الرقم مش قابل تحويل غير المبلغ ده \n\n"
+            f"( الرقم تجاوز الحد اليومى او الشهرى )"
         )
     else:
-        text = "هذا الرقم تجاوز الحد الاقصي للمعاملات محتاجين رقم تاني نحول عليه"
+        text = (
+            "*محتاجين رقم تانى يا غالى علشان نبعت الرصيد*\n\n"
+            "الرقم مش قابل تحويل يا غالى \n\n"
+            "( تجاوز الحد اليومى او الشهرى )"
+        )
     try:
         ctx['svc'].send_and_broadcast(
             partner=ctx['conv'].social_partner,
@@ -728,8 +778,9 @@ def handle_cash_sys_order_done(self, data: dict):
         )
         record.refresh_from_db()
 
-        _send_done_receipts(record)         # images first …
-        _create_service_fees(record)        # … then the auto service-fee note(s)
+        images_sent = _send_done_receipts(record)   # images first …
+        _pause_after_receipts(images_sent)           # … let the image land …
+        _create_service_fees(record)                 # … then the auto service-fee note(s)
         _commit_event(record, commit_key)
         logger.info('[CashSys Done] record=%d order_id=%s value=%s fulfilled=%s txns=%d',
                     record.pk, data.get('order_id'), data.get('value'), fulfilled, len(briefs))
@@ -837,7 +888,8 @@ def _apply_reroute(record, data: dict):
 
     # Send any not-yet-sent done receipts, then ask for a new number.
     record.refresh_from_db()
-    _send_done_receipts(record)
+    images_sent = _send_done_receipts(record)
+    _pause_after_receipts(images_sent)   # let the image land before the «تغيير رقم» ask
     _send_reroute_ask(record, fulfilled, reroute_amount)
 
 

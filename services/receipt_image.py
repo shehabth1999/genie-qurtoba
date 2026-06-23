@@ -63,6 +63,13 @@ _Y_TIME = 186     # «توقيت العملية : {data}»
 _Y_SIM = 235      # «الرقم المحول منه : {data}»
 _Y_DEVICE = 283   # «( {device} )» — bold
 
+# Manual-entry underline: a thin solid bar drawn just below the device line, but
+# ONLY when the transfer was entered by hand (is_manual). Centered on cx, half
+# the card width — geometry matched to the cash-app card.
+_Y_RULE = 309         # bar top (native units)
+_RULE_THICK = 5       # bar thickness (native units)
+_RULE_W_FRAC = 0.5    # bar width as a fraction of the card width (centered)
+
 # Arabic month names (1-indexed via [m]).
 _AR_MONTHS = [
     '', 'يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو',
@@ -139,12 +146,12 @@ def _fmt_fee(value) -> str:
 
 def _device_line(sim_code, device_name, operator) -> str:
     """
-    The footer's last line: «( {sim_code} - {device_name} - {operator} )» — the
-    SIM short code, the device label, and the operator who executed the transfer,
+    The footer's last line: «( {operator} - {device_name} - {sim_code} )» — the
+    operator who executed the transfer, the device label, and the SIM short code,
     joined exactly as the cash-app card shows them. Missing parts are dropped so
     we never render stray «-» or «None».
     """
-    parts = [str(p).strip() for p in (sim_code, device_name, operator)
+    parts = [str(p).strip() for p in (operator, device_name, sim_code)
              if p not in (None, '', '-') and str(p).strip()]
     return f'( {" - ".join(parts)} )' if parts else '-'
 
@@ -246,11 +253,12 @@ def render_receipt_png_for_txn(txn: dict) -> bytes:
         device=txn.get('device_name'),
         operator=txn.get('operator'),
         done_at=done_at,
+        is_manual=bool(txn.get('is_manual')),
     )
 
 
 def _render(*, value, account, fee, sim, done_at, sim_code=None, device=None,
-            operator=None) -> bytes:
+            operator=None, is_manual=False) -> bytes:
     """
     Core PNG renderer — shared by the record-level and per-transfer entry points.
     Renders at `_SS`× supersample then downscales to the native 674x318 card.
@@ -297,8 +305,20 @@ def _render(*, value, account, fee, sim, done_at, sim_code=None, device=None,
         (_shape('الرقم المحول منه : '), fbold),
         (_shape(_mask_number(sim)), freg),
     ], _INK_FOOT, _Y_SIM * ss)
-    # last line — «( sim_code - device - operator )», bold throughout
+    # last line — «( operator - device - sim_code )», bold throughout
     _place_line(img, cx, _shape(device_line), fbold, _INK_FOOT, _Y_DEVICE * ss)
+
+    # manual-entry underline bar — only for hand-entered transfers (is_manual)
+    if is_manual:
+        rule_w = int(_W0 * _RULE_W_FRAC) * ss
+        x0, x1 = cx - rule_w // 2, cx + rule_w // 2
+        y0 = _Y_RULE * ss
+        y1 = y0 + _RULE_THICK * ss
+        radius = (_RULE_THICK * ss) // 2
+        try:
+            draw.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=_INK_FOOT)
+        except (TypeError, AttributeError):  # very old Pillow
+            draw.rectangle([x0, y0, x1, y1], fill=_INK_FOOT)
 
     img = img.resize((_W0, _H0), Image.LANCZOS)
     buf = io.BytesIO()
