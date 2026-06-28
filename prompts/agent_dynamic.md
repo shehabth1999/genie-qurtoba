@@ -2,7 +2,7 @@
 
   <!-- DYNAMIC / NOT cached. Appended after the static block at runtime. -->
   <!-- A Qurtoba customer is always linked, so the customer block is rendered directly
-       (no {% if %} wrapper, no not_linked branch). -->
+       (no if-wrapper, no not_linked branch). -->
 
   <partner>
     <name>{{partner.name}}</name>
@@ -40,6 +40,15 @@
   </customer>
 
   <conversation_history>{{conversation.recent_messages_pretty}}</conversation_history>
+
+  <!-- Inbound lines NOT yet turned into a transaction, each tagged with its [message_id].
+       Act only on these; a line missing here is already done — never re-create it. -->
+  <unprocessed_transactions>{{conversation.unprocessed_transactions}}</unprocessed_transactions>
+
+  <!-- Present ONLY after a superseded run: a discarded draft (NOT sent) + read-only hints
+       from before the newest message(s). HINT ONLY — re-read everything and recompute.
+       Empty on the normal path. See <preliminary_results_rule> in the static prompt. -->
+  <preliminary_results>{{conversation.preliminary_results}}</preliminary_results>
 
   <new_message>{{partner_message.text}}</new_message>
 

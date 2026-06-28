@@ -2,17 +2,18 @@
 Qurtoba transaction tools for AI Studio agents.
 
 Tools exposed:
-  * qurtoba_create_new_transaction         — record ONE new debt (عملية جديدة)
-  * qurtoba_create_new_transactions_bulk   — record MANY new debts at once
+  * qurtoba_create_new_transactions_bulk   — record one OR many new debts (عملية جديدة)
   * qurtoba_register_customer_payment      — record a customer payment (سداد) [SENSITIVE]
 
-All three resolve the target QurtobaCustomer from the active WhatsApp/Messenger
+Both resolve the target QurtobaCustomer from the active WhatsApp/Messenger
 conversation: `conversation.social_partner.qurtoba_customer`.
 """
 import logging
 from typing import Any, Dict, List, Optional
 
 from modules.aistudio.tools import tool
+
+from qurtoba.tools._amounts import normalize_amount, _ar_to_ascii
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,58 @@ def _send_start_ack(conversation) -> None:
         )
     except Exception:
         logger.warning('qurtoba: start-ack 👍 failed', exc_info=True)
+
+
+def _send_account_correction_reply(conversation, social_partner, src_message_id, corrected_number) -> bool:
+    """
+    Reply the corrected destination number to the chat — done by the TOOL, never the
+    LLM. (The LLM used to do this from the prompt and would sometimes skip it, which
+    is why the confirmation was flaky.) The message QUOTES the inbound message the
+    partner typed the number in, resolved from src_message_id → WAMID (social_id) +
+    local id, so it shows as a reply on both WhatsApp and our chat UI. Sent via the
+    omnichannel service. Best-effort; never raises into the tool flow.
+
+    Returns True if a message was dispatched.
+    """
+    try:
+        if conversation is None or social_partner is None or not corrected_number:
+            return False
+        from modules.chat.services.omnichannel_send_service import OmnichannelSendService
+        from qurtoba.extensions import _get_system_partner
+
+        # Resolve the message that carried the number so we can quote it. If it
+        # can't be resolved we still send the correction, just unquoted.
+        reply_wamid = None
+        reply_local_id = None
+        if src_message_id:
+            try:
+                from modules.chat.models import Message as ChatMessage
+                msg = (ChatMessage.objects_all
+                       .filter(id=str(src_message_id).strip(), conversation=conversation)
+                       .first())
+                if msg is not None:
+                    reply_wamid = getattr(msg, 'social_id', None)
+                    reply_local_id = msg.id
+            except Exception:
+                logger.warning('qurtoba: correction reply could not resolve src message %s',
+                               src_message_id, exc_info=True)
+
+        OmnichannelSendService().send_and_broadcast(
+            partner=social_partner,
+            content={'text': str(corrected_number)},
+            message_type='text',
+            conversation=conversation,
+            system_partner=_get_system_partner(conversation),
+            reply_to_message_id=reply_wamid,
+            reply_to_id=reply_local_id,
+            websocket=True,
+        )
+        logger.info('qurtoba: tool sent account-correction reply "%s" (quoted=%s)',
+                    corrected_number, bool(reply_wamid or reply_local_id))
+        return True
+    except Exception:
+        logger.warning('qurtoba: account-correction reply failed', exc_info=True)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +233,59 @@ def _normalize_phone(raw: Optional[str]) -> Optional[str]:
     return d or None
 
 
+def _message_digits(msg) -> str:
+    """All ASCII digits contained in a chat Message (text + caption + transcription).
+
+    Arabic-Indic digits are transliterated first so a phone written in Arabic
+    numerals still matches.
+    """
+    content = getattr(msg, 'content', None)
+    parts = []
+    if isinstance(content, dict):
+        if isinstance(content.get('text'), str):
+            parts.append(content['text'])
+        att = content.get('attachment')
+        if isinstance(att, dict):
+            for k in ('caption', 'filename', 'name'):
+                if isinstance(att.get(k), str):
+                    parts.append(att[k])
+        if isinstance(content.get('transcription'), str):
+            parts.append(content['transcription'])
+    elif isinstance(content, str):
+        parts.append(content)
+    blob = _ar_to_ascii(' '.join(parts))
+    return ''.join(ch for ch in blob if ch.isdigit())
+
+
+def _source_message_matches_account(source_message_id, final_account, conversation) -> str:
+    """Validate that the cited source message actually contains the destination phone.
+
+    Returns one of:
+      * 'ok'         — the phone (its 10-digit subscriber tail) appears in the message.
+      * 'mismatch'   — the cited message does NOT contain that phone (the 4125 class:
+                       the agent cited the amount/name message, not the number message).
+      * 'unverified' — no id given, or the message can't be resolved. Never reject on
+                       'unverified' alone — only an *actively wrong* citation is rejected.
+    """
+    if not source_message_id or not final_account:
+        return 'unverified'
+    try:
+        from modules.chat.models import Message as ChatMessage
+        qs = ChatMessage.objects_all.filter(id=str(source_message_id).strip())
+        if conversation is not None:
+            qs = qs.filter(conversation=conversation)
+        msg = qs.first()
+    except Exception:
+        return 'unverified'
+    if msg is None:
+        return 'unverified'
+    digits = _message_digits(msg)
+    subscriber = final_account[1:] if final_account.startswith('0') else final_account
+    if subscriber and subscriber in digits:
+        return 'ok'
+    return 'mismatch'
+
+
 def _validate_debt_item(
     type: str,
     value: Any,
@@ -192,10 +298,13 @@ def _validate_debt_item(
             'error_type': 'invalid_type',
             'error': f"النوع غير صحيح: '{type}'. الأنواع المسموحة: {DEBT_TYPES}",
         }
-    try:
-        amount = float(value)
-    except (TypeError, ValueError):
+    # Deterministic value normalization (Arabic/ASCII digits, `.`/`,` thousands
+    # vs decimal, word multipliers like "20الف"). This is the single source of
+    # truth for the amount — the agent no longer normalizes in its head.
+    norm = normalize_amount(value)
+    if not norm['ok']:
         return {'ok': False, 'error_type': 'invalid_value', 'error': 'المبلغ يجب أن يكون رقم موجب.'}
+    amount = norm['value']
     if amount <= 0:
         return {'ok': False, 'error_type': 'invalid_value', 'error': 'المبلغ يجب أن يكون أكبر من صفر.'}
 
@@ -232,6 +341,7 @@ def _create_one_debt(
     source_message_id: Optional[str] = None,
     account_input: Optional[str] = None,
     ack_state: Optional[dict] = None,
+    consumed_message_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a single debt record after validation.
@@ -264,6 +374,56 @@ def _create_one_debt(
             'error': disabled_msg,
             'disabled_type': type,
         }
+
+    src = (str(source_message_id).strip() if source_message_id else None)
+
+    # --- Source-message validation (B2) ---------------------------------------
+    # The cited message MUST contain the destination phone. This catches the
+    # mislink class where the agent pointed at the amount/name message instead of
+    # the number message (the record-4125 wrong-value cascade). Skipped on
+    # admin-approved overrides (the id may be stale) and for non-cash types.
+    if is_cash and not override_grade_limit:
+        verdict = _source_message_matches_account(src, final_account, conversation)
+        if verdict == 'mismatch':
+            return {
+                'success': False,
+                'error_type': 'source_mismatch',
+                'error': 'الرسالة المُشار إليها لا تحتوي رقم الحساب — راجِع ربط الرقم بالمبلغ.',
+                'expected_account': final_account,
+                'cited_message_id': src,
+            }
+        source_unverified = verdict == 'unverified'
+    else:
+        source_unverified = bool(is_cash and not src)
+
+    # --- Idempotency durable check (B4) ---------------------------------------
+    # A record (or a pending-review row) already created from THIS message for
+    # THIS account+amount means we re-ran on the full conversation context — do
+    # not create a second transaction. Scoped to agent calls only: the admin
+    # grade-limit approval path (override_grade_limit=True) is creating the record
+    # FROM a still-'pending' row and has its own double-create guard, so skip here.
+    conversation_uuid = str(getattr(conversation, 'id', '') or '') or None
+    if src and not override_grade_limit:
+        from qurtoba.models import QurtobaRecord, QurtobaPendingTransaction
+        dup_rec = QurtobaRecord.objects.filter(
+            origin_message_id=src, account_number=final_account, value=amount,
+        ).order_by('-id').first()
+        if dup_rec is not None:
+            return {
+                'success': True, 'duplicate': True, 'record_id': dup_rec.pk,
+                'type': dup_rec.type, 'value': dup_rec.value,
+                'account_number': dup_rec.account_number,
+            }
+        dup_pend = QurtobaPendingTransaction.objects.filter(
+            source_message_id=src, account_number=final_account, value=amount,
+            review_state='pending',
+        ).order_by('-id').first()
+        if dup_pend is not None:
+            return {
+                'success': True, 'duplicate': True, 'pending_review': True,
+                'pending_id': dup_pend.pk, 'type': dup_pend.type,
+                'value': dup_pend.value, 'account_number': dup_pend.account_number,
+            }
 
     # We're past all rejection gates — a real record (or a review-pending row) is
     # about to be written. Send the instant "received, handling now" 👍 ONCE per
@@ -309,6 +469,12 @@ def _create_one_debt(
                 review_state='pending',
             )
             _notify_all_users_pending(pending, kind='transaction')
+            # Confirm the corrected number now: the transaction WILL be created on
+            # approval, so the customer should see the canonical number immediately.
+            # (The approval path itself never re-sends — it passes no account_input,
+            # so account_corrected is false there.)
+            if account_corrected:
+                _send_account_correction_reply(conversation, social_partner, src, final_account)
             return {
                 'success': True,
                 'pending_review': True,
@@ -332,6 +498,22 @@ def _create_one_debt(
             }
 
     from qurtoba.models import QurtobaRecord
+    from django.core.cache import cache
+
+    # SETNX claim (B4): an atomic in-flight lock closing the concurrent-delivery
+    # race that the durable check above can't (both deliveries read "no record"
+    # before either writes). Mirrors tasks.py::_claim_event. Released on failure.
+    claim_key = (
+        f'qurtoba:txn:claim:{conversation_uuid}:{src}:{final_account}:{amount:.2f}'
+        if src else
+        f'qurtoba:txn:claim:{conversation_uuid}:{final_account}:{amount:.2f}:{type}'
+    )
+    if not cache.add(claim_key, 1, 900):
+        return {
+            'success': True, 'duplicate': True, 'record_id': None,
+            'type': type, 'value': amount, 'account_number': final_account,
+            'note': 'duplicate_in_flight',
+        }
     try:
         record = QurtobaRecord.objects.create(
             customer=customer,
@@ -344,6 +526,7 @@ def _create_one_debt(
             notes=(notes or '')[:100] or None,
         )
     except Exception as e:
+        cache.delete(claim_key)  # release so a legitimate retry can re-claim
         return {'success': False, 'error_type': 'create_failed', 'error': str(e)}
 
     # Link the inbound chat message that triggered this transaction, so the
@@ -354,6 +537,26 @@ def _create_one_debt(
             record.set_origin_message_from_uuid(source_message_id, conversation)
         except Exception:
             pass
+    # Watermark (B4): mark EVERY inbound message this transaction consumed — the
+    # phone message AND (for a split pair) the amount message — so a re-run never
+    # re-actions them AND a consumed amount can't linger 'unprocessed' to leak into
+    # the next burst's positional pairing (the 8310/13600 mis-route class).
+    # consumed_message_ids comes from the authoritative pairing (consumed_ids_by_source).
+    try:
+        from modules.chat.models import Message as ChatMessage
+        wm_ids = {x for x in ([src] + list(consumed_message_ids or [])) if x}
+        if wm_ids:
+            for _msg in ChatMessage.objects_all.filter(id__in=wm_ids):
+                _msg.mark_ai_consumed(record)
+    except Exception:
+        pass
+
+    # Number correction is confirmed by the TOOL itself (never the LLM): when
+    # normalization changed the destination number, reply the corrected number —
+    # quoting the message the partner typed it in. Deterministic, and fires ONLY
+    # here, on a real transaction being created (not on pending-review / duplicates).
+    if account_corrected:
+        _send_account_correction_reply(conversation, social_partner, src, final_account)
 
     customer.refresh_from_db(fields=['balance'])
     new_balance = customer.balance or 0
@@ -372,132 +575,192 @@ def _create_one_debt(
         'grade_limit': grade_limit,
         'extends_by': over_by,
         'over_limit': over_by > 0,
+        'source_unverified': source_unverified,
         'pending_qurtoba_push': True,
         'pending_cash_sys': is_cash,
     }
 
 
 # ---------------------------------------------------------------------------
-# Tool 1 — Create ONE new debt transaction (عملية جديدة)
+# Shared batch creator — used by the bulk tool AND the split tool
 # ---------------------------------------------------------------------------
+def _create_debts_batch(conv, customer, items, override_grade_limit, source_message_id=None):
+    """Create each item in `items` via _create_one_debt; return the batch summary.
 
-@tool(
-    name='qurtoba_create_new_transaction',
-    display_name='Create New Qurtoba Transaction (Debt)',
-    description=(
-        'Use this tool to register ONE new debt transaction (عملية جديدة) on the Qurtoba '
-        'customer linked to the current chat. This INCREASES the customer\'s outstanding '
-        'balance (مديونيات). Use it for: cash transfer to a phone (كاش), Fawry/Aman top-ups '
-        '(فورى/أمان), Tayyar loans (طاير), or service fees (مصاريف خدمه). '
-        'CASH BRACKET RULE: the four كاش variants are amount FILTERS, NOT commissions. '
-        'Always pass type="كاش" for any cash transfer; the tool auto-promotes by amount: '
-        '< 10,000 stays "كاش", 10,000–19,999 → "كاش(10)", ≥ 20,000 → "كاش(20)". The variant '
-        '"كاش(5)" is reserved and unused — do NOT pass it. '
-        'INPUTS YOU MUST PROVIDE: '
-        '1) type — one of: كاش, فورى, أمان, طاير, مصاريف خدمه. (For any cash transfer just '
-        'use "كاش" — the tool picks the right bracket.) '
-        '2) value — the amount in EGP (positive number). '
-        '3) account_number — REQUIRED for cash: the destination Egyptian mobile. Pass it '
-        'AS THE PARTNER WROTE IT — the tool auto-normalizes country-code / formatted forms '
-        '(+20, 0020, 20, 020, spaces, "+") to the canonical 01XXXXXXXXX, e.g. '
-        '"00201038857982" -> "01038857982". Only if it cannot be turned into a valid '
-        'Egyptian mobile is it rejected (error_type="invalid_account_number", error="من فضلك '
-        'ارسل رقم صحيح"). For non-cash types pass the customer\'s saved account string or omit. '
-        '4) override_grade_limit (optional, default False) — leave False so the tool '
-        'enforces the customer\'s credit ceiling (grade × 1000). Only set True if a manager '
-        'has explicitly authorized exceeding the limit. '
-        '5) source_message_id (optional but STRONGLY preferred) — the chat message id (UUID), '
-        'taken verbatim from the "[message_id: <uuid>]" marker. **ALWAYS pass the id of the '
-        'message that CONTAINS THE PHONE/ACCOUNT NUMBER** (the destination number). If the '
-        'phone and the amount arrive in two different messages, use the PHONE message\'s id — '
-        'never the amount-only message. Passing it lets the execution receipt be sent back '
-        'later as a reply that quotes the phone message, and lets the status check find this '
-        'transaction when the partner replies to that phone message. '
-        'BEHAVIOUR: '
-        '- If the merchant has disabled this transaction type on their WhatsApp account, '
-        'the tool REJECTS with error_type="service_disabled" and a ready-made Arabic '
-        'message in the `error` field. Send that exact message back to the chat verbatim. '
-        '- If the new transaction would push the customer over their credit ceiling and '
-        'override_grade_limit is False, the tool DOES NOT REJECT. It returns success=True '
-        'with pending_review=True and pending_id=<int>. The request is now queued for an '
-        'admin to approve or deny. Treat this exactly like a normal success — reply 👍 to '
-        'the partner. The real transaction will be created (and pushed to Qurtoba) only '
-        'after an admin approves it from the review queue. '
-        '- On normal success returns: record_id, type, value, previous_balance, new_balance, '
-        'grade_limit, extends_by, pending_cash_sys (true if Cash-SYS will execute the order). '
-        '- AUTO-ACK: the moment it starts creating the record, the tool sends an instant 👍 '
-        'to the chat itself ("received, handling now"). So on success you MUST stay SILENT '
-        '(empty reply) — do NOT send 👍 or any text. The tool does NOT send 👍 on a rejection. '
-        '- It ALSO returns account_corrected (bool) and account_number (the canonical '
-        'corrected number). If account_corrected is true, the destination number was '
-        'normalized (e.g. country-code/spaces removed); reply with the corrected number '
-        'ONLY — just send "{account_number}" (the bare number, nothing else). '
-        'GUARDRAILS: '
-        '- Do NOT use this for customer payments — use qurtoba_register_customer_payment. '
-        '- Do NOT invent a phone number for cash types; if the customer did not state one, ask. '
-        '- For MULTIPLE transactions in one customer message, prefer qurtoba_create_new_transactions_bulk.'
-    ),
-    category='qurtoba',
-    requires_auth=True,
-)
-def qurtoba_create_new_transaction(
-    context,
-    type: str,
-    value: float,
-    account_number: Optional[str] = None,
-    notes: Optional[str] = None,
-    override_grade_limit: bool = False,
-    source_message_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    conv, customer, err = _resolve_conversation_and_customer(context)
-    if err:
-        return err
+    Shared core of qurtoba_create_new_transactions_bulk and qurtoba_split_transfer.
+    Fires ONE 👍 for the whole batch (one shared ack_state). The caller runs any
+    burst-specific pre-checks (e.g. the bulk completeness guard) — this helper does not.
+    """
+    social_partner = getattr(conv, 'social_partner', None)
+    results: List[Dict[str, Any]] = []
+    created_count = 0
+    rejected_count = 0
+    pending_count = 0
+    duplicate_count = 0
+    # One 👍 for the whole batch — fired by the first item that actually creates.
+    ack_state = {'sent': False}
 
-    validation = _validate_debt_item(type, value, account_number)
-    if not validation['ok']:
-        return {
-            'success': False,
-            'error_type': validation['error_type'],
-            'error': validation['error'],
-        }
+    # Authoritative {phone source_message_id -> [all consumed message ids]} for this
+    # burst, so each create watermarks BOTH its phone and amount message (a split
+    # pair's amount message would otherwise linger and corrupt the next burst).
+    try:
+        from qurtoba.tools.planning import consumed_ids_by_source
+        _consumed_map = consumed_ids_by_source(conv)
+    except Exception:
+        _consumed_map = {}
 
-    result = _create_one_debt(
-        customer=customer,
-        social_partner=getattr(conv, 'social_partner', None),
-        type=validation['effective_type'],
-        amount=validation['amount'],
-        final_account=validation['final_account'],
-        is_cash=validation['is_cash'],
-        notes=notes,
-        override_grade_limit=override_grade_limit,
-        conversation=conv,
-        source_message_id=source_message_id,
-        account_input=account_number,
-        ack_state={'sent': False},
-    )
-    # Add identity info to the response
-    result['customer_id'] = customer.pk
-    result['customer_name'] = customer.name
-    if result.get('success'):
-        result['note'] = (
-            'تم حفظ المعاملة وسيتم إرسالها إلى قرطبة في الخلفية' +
-            (' وإلى Cash-SYS للتنفيذ.' if result.get('pending_cash_sys') else '.')
+    for index, raw_item in enumerate(items):
+        if not isinstance(raw_item, dict):
+            rejected_count += 1
+            results.append({
+                'index': index,
+                'status': 'rejected',
+                'error_type': 'invalid_item',
+                'error': 'كل عنصر يجب أن يكون كائن (object) بحقول type و value.',
+            })
+            continue
+
+        type_ = raw_item.get('type')
+        value_ = raw_item.get('value')
+        account_ = raw_item.get('account_number')
+        notes_ = raw_item.get('notes')
+        # Per-item phone-message id — each transaction quotes ITS OWN number message.
+        # Fall back to the batch-level id only when the item didn't supply one.
+        item_source_message_id = raw_item.get('source_message_id') or source_message_id
+
+        validation = _validate_debt_item(type_, value_, account_)
+        if not validation['ok']:
+            rejected_count += 1
+            results.append({
+                'index': index,
+                'status': 'rejected',
+                'error_type': validation['error_type'],
+                'error': validation['error'],
+                'input': {'type': type_, 'value': value_, 'account_number': account_},
+            })
+            continue
+
+        outcome = _create_one_debt(
+            customer=customer,
+            social_partner=social_partner,
+            type=validation['effective_type'],
+            amount=validation['amount'],
+            final_account=validation['final_account'],
+            is_cash=validation['is_cash'],
+            notes=notes_,
+            override_grade_limit=override_grade_limit,
+            conversation=conv,
+            source_message_id=item_source_message_id,
+            account_input=account_,
+            ack_state=ack_state,
+            consumed_message_ids=_consumed_map.get(item_source_message_id),
         )
-    return result
+
+        if outcome.get('success'):
+            if outcome.get('duplicate'):
+                # Already created from this message on a prior run — idempotent
+                # no-op. Don't re-tally balances (none returned for a duplicate).
+                duplicate_count += 1
+                results.append({
+                    'index': index,
+                    'status': 'duplicate',
+                    'record_id': outcome.get('record_id'),
+                    'type': outcome.get('type'),
+                    'value': outcome.get('value'),
+                    'account_number': outcome.get('account_number'),
+                    'input': {'type': type_, 'value': value_, 'account_number': account_},
+                })
+            elif outcome.get('pending_review'):
+                pending_count += 1
+                results.append({
+                    'index': index,
+                    'status': 'pending_review',
+                    'pending_id': outcome.get('pending_id'),
+                    'type': outcome.get('type'),
+                    'value': outcome.get('value'),
+                    'account_number': outcome.get('account_number'),
+                    'account_corrected': outcome.get('account_corrected', False),
+                    'account_input': outcome.get('account_input'),
+                    'input': {'type': type_, 'value': value_, 'account_number': account_},
+                })
+            else:
+                created_count += 1
+                results.append({
+                    'index': index,
+                    'status': 'created',
+                    'record_id': outcome['record_id'],
+                    'type': outcome['type'],
+                    'value': outcome['value'],
+                    'account_number': outcome['account_number'],
+                    'account_corrected': outcome.get('account_corrected', False),
+                    'account_input': outcome.get('account_input'),
+                    'previous_balance': outcome['previous_balance'],
+                    'new_balance': outcome['new_balance'],
+                    'pending_cash_sys': outcome['pending_cash_sys'],
+                })
+        else:
+            rejected_count += 1
+            results.append({
+                'index': index,
+                'status': 'rejected',
+                'error_type': outcome.get('error_type'),
+                'error': outcome.get('error'),
+                'disabled_type': outcome.get('disabled_type'),
+                'current_balance': outcome.get('current_balance'),
+                'grade_limit': outcome.get('grade_limit'),
+                'projected_balance': outcome.get('projected_balance'),
+                'extends_by': outcome.get('extends_by'),
+                'input': {'type': type_, 'value': value_, 'account_number': account_},
+            })
+
+    customer.refresh_from_db(fields=['balance'])
+    final_balance = customer.balance or 0
+    grade_limit = (customer.grade or 0) * 1000
+    remaining_credit = grade_limit - final_balance if grade_limit else None
+
+    return {
+        'success': True,
+        'customer_id': customer.pk,
+        'customer_name': customer.name,
+        'total': len(items),
+        'created_count': created_count,
+        'pending_count': pending_count,
+        'rejected_count': rejected_count,
+        'duplicate_count': duplicate_count,
+        'final_balance': final_balance,
+        'grade_limit': grade_limit,
+        'remaining_credit': remaining_credit,
+        'results': results,
+    }
+
+
+def _split_total_evenly(total_int: int, n: int) -> List[int]:
+    """Split `total_int` whole pounds across `n` parts that sum EXACTLY to total_int.
+
+    Each part is a whole integer; the parts differ by at most 1; the extra pound(s)
+    (the remainder) land on the LAST parts, so 75/2 → [37, 38] and 100/3 → [33, 33, 34].
+    Caller MUST guarantee n >= 1 and total_int >= n, which makes every part >= 1.
+    """
+    base = total_int // n
+    rem = total_int - base * n          # 0 <= rem < n
+    return [base] * (n - rem) + [base + 1] * rem
 
 
 # ---------------------------------------------------------------------------
-# Tool 2 — BULK create debt transactions
+# Create debt transaction(s) — one OR many (عملية جديدة)
 # ---------------------------------------------------------------------------
 
 @tool(
     name='qurtoba_create_new_transactions_bulk',
+    side_effect=True,  # mutating: creates debt records — never carry its result forward
     display_name='Create Many Qurtoba Transactions at Once',
     description=(
-        'Use this tool to register MANY new debt transactions in a single call for the '
-        'customer linked to the current chat. Use it whenever the customer sends multiple '
-        'requests in one message (each line / each separated entry is a separate '
-        'transaction). Each transaction increases the customer\'s outstanding balance. '
+        'Use this tool to register new debt transaction(s) (عملية جديدة) for the customer '
+        'linked to the current chat — ONE transaction or MANY in a single call. This is the '
+        'ONLY create-transaction tool: for a single op, pass an array with one item. Use it '
+        'whenever the customer sends one or several requests (each line / each separated '
+        'entry is a separate transaction). Each transaction increases the customer\'s '
+        'outstanding balance. '
         'CASH BRACKET RULE: cash variants are amount FILTERS, not commissions. Always pass '
         'type="كاش" for any cash transfer; the tool auto-promotes by amount: < 10,000 stays '
         '"كاش", 10,000–19,999 → "كاش(10)", ≥ 20,000 → "كاش(20)". "كاش(5)" is reserved — do '
@@ -536,14 +799,15 @@ def qurtoba_create_new_transaction(
         '- The tool ALWAYS returns a results array, one entry per input item, with '
         'status one of {created, pending_review, rejected}. The response summary contains '
         'created_count, pending_count, rejected_count. On success stay silent; '
-        'only mention items whose status is "rejected" (and per-item account_corrected). '
+        'only mention items whose status is "rejected". Number correction is handled by '
+        'the tool itself (it replies the corrected number per created item) — never send it. '
         '- The tool returns final_balance, grade_limit, and remaining_credit after the batch. '
         'WHEN TO USE: '
         '- The customer\'s single message contains multiple amounts/lines (e.g. '
         '"01000000001 5000 / 01000000002 3000"). Parse all lines and pass them as one array. '
         '- Do NOT call this tool multiple times for the same set of transactions; one call '
         'handles the whole batch atomically per-item. '
-        '- For a single transaction prefer qurtoba_create_new_transaction.'
+        '- For a SINGLE transaction, call this same tool with a one-item array.'
     ),
     category='qurtoba',
     requires_auth=True,
@@ -617,122 +881,209 @@ def qurtoba_create_new_transactions_bulk(
             'error': 'يجب تمرير قائمة بمعاملة واحدة على الأقل.',
         }
 
-    social_partner = getattr(conv, 'social_partner', None)
-    results: List[Dict[str, Any]] = []
-    created_count = 0
-    rejected_count = 0
-    pending_count = 0
-    # One 👍 for the whole batch — fired by the first item that actually creates.
-    ack_state = {'sent': False}
+    # --- Completeness guard (self-contained pairs only) -----------------------
+    # The LLM builds this `transactions` list from the messages and can silently DROP one
+    # (caught it omitting 01031170652←1360 → that transfer just vanished, no error). Scan the
+    # RECENT unconsumed inbound messages that each contain exactly ONE number + ONE amount —
+    # those are UNAMBIGUOUS, so requiring them is always safe (no positional guessing, no
+    # stale-burst pollution). If any such pair is missing from the LLM's list, reject and NAME
+    # it so the LLM retries with the complete list. Only fires when something is missing;
+    # skipped on admin override (single-item approval path).
+    if not override_grade_limit and conv is not None:
+        try:
+            from datetime import timedelta as _td
+            from django.utils import timezone as _tz
+            from modules.chat.models import Message as _M
+            from qurtoba.tools.planning import _classify_message as _cls
 
-    for index, raw_item in enumerate(transactions):
-        if not isinstance(raw_item, dict):
-            rejected_count += 1
-            results.append({
-                'index': index,
-                'status': 'rejected',
-                'error_type': 'invalid_item',
-                'error': 'كل عنصر يجب أن يكون كائن (object) بحقول type و value.',
-            })
-            continue
+            def _key(ph, val):
+                return (_normalize_phone(ph), round(float(val), 2))
 
-        type_ = raw_item.get('type')
-        value_ = raw_item.get('value')
-        account_ = raw_item.get('account_number')
-        notes_ = raw_item.get('notes')
-        # Per-item phone-message id — each transaction quotes ITS OWN number message.
-        # Fall back to the batch-level id only when the item didn't supply one.
-        item_source_message_id = raw_item.get('source_message_id') or source_message_id
+            expected = {}
+            for _mm in _M.objects_all.filter(
+                    conversation=conv, direction='inbound', active=True, type='text',
+                    ai_consumed_at__isnull=True, created_at__gte=_tz.now() - _td(minutes=10)):
+                _c = _mm.content
+                _txt = _c.get('text') if isinstance(_c, dict) else None
+                if not _txt:
+                    continue
+                _cc = _cls(_txt)
+                if len(_cc['phones']) == 1 and len(_cc['amounts']) == 1:  # one number, one amount
+                    k = _key(_cc['phones'][0], _cc['amounts'][0])
+                    if k[0]:
+                        expected[k] = expected.get(k, 0) + 1
+            provided = {}
+            for t in transactions:
+                if isinstance(t, dict) and t.get('account_number') is not None:
+                    _nv = normalize_amount(t.get('value'))
+                    if _nv.get('ok'):
+                        k = _key(t.get('account_number'), _nv['value'])
+                        provided[k] = provided.get(k, 0) + 1
+            missing = []
+            for k, cnt in expected.items():
+                for _ in range(max(0, cnt - provided.get(k, 0))):
+                    missing.append({'account_number': k[0], 'value': k[1]})
+            if missing:
+                _names = '، '.join(f"{m['account_number']}←{int(m['value'])}" for m in missing)
+                return {
+                    'success': False,
+                    'error_type': 'incomplete_list',
+                    'missing': missing,
+                    'error': ('القائمة ناقصة — الأرقام دي ليها رقم ومبلغ في نفس الرسالة لكنها مش في '
+                              f'طلبك: {_names}. أعِد إرسال bulk بكل المعاملات مرة واحدة.'),
+                }
+        except Exception:
+            logger.warning('bulk completeness check failed; proceeding without it', exc_info=True)
+    # --------------------------------------------------------------------------
 
-        validation = _validate_debt_item(type_, value_, account_)
-        if not validation['ok']:
-            rejected_count += 1
-            results.append({
-                'index': index,
-                'status': 'rejected',
-                'error_type': validation['error_type'],
-                'error': validation['error'],
-                'input': {'type': type_, 'value': value_, 'account_number': account_},
-            })
-            continue
+    return _create_debts_batch(conv, customer, transactions, override_grade_limit, source_message_id)
 
-        outcome = _create_one_debt(
-            customer=customer,
-            social_partner=social_partner,
-            type=validation['effective_type'],
-            amount=validation['amount'],
-            final_account=validation['final_account'],
-            is_cash=validation['is_cash'],
-            notes=notes_,
-            override_grade_limit=override_grade_limit,
-            conversation=conv,
-            source_message_id=item_source_message_id,
-            account_input=account_,
-            ack_state=ack_state,
-        )
 
-        if outcome.get('success'):
-            if outcome.get('pending_review'):
-                pending_count += 1
-                results.append({
-                    'index': index,
-                    'status': 'pending_review',
-                    'pending_id': outcome.get('pending_id'),
-                    'type': outcome.get('type'),
-                    'value': outcome.get('value'),
-                    'account_number': outcome.get('account_number'),
-                    'account_corrected': outcome.get('account_corrected', False),
-                    'account_input': outcome.get('account_input'),
-                    'input': {'type': type_, 'value': value_, 'account_number': account_},
-                })
-            else:
-                created_count += 1
-                results.append({
-                    'index': index,
-                    'status': 'created',
-                    'record_id': outcome['record_id'],
-                    'type': outcome['type'],
-                    'value': outcome['value'],
-                    'account_number': outcome['account_number'],
-                    'account_corrected': outcome.get('account_corrected', False),
-                    'account_input': outcome.get('account_input'),
-                    'previous_balance': outcome['previous_balance'],
-                    'new_balance': outcome['new_balance'],
-                    'pending_cash_sys': outcome['pending_cash_sys'],
-                })
-        else:
-            rejected_count += 1
-            results.append({
-                'index': index,
-                'status': 'rejected',
-                'error_type': outcome.get('error_type'),
-                'error': outcome.get('error'),
-                'disabled_type': outcome.get('disabled_type'),
-                'current_balance': outcome.get('current_balance'),
-                'grade_limit': outcome.get('grade_limit'),
-                'projected_balance': outcome.get('projected_balance'),
-                'extends_by': outcome.get('extends_by'),
-                'input': {'type': type_, 'value': value_, 'account_number': account_},
-            })
+# ---------------------------------------------------------------------------
+# Split ONE cash total across several numbers (قسم/وزّع التحويلة) — cash only
+# ---------------------------------------------------------------------------
 
-    customer.refresh_from_db(fields=['balance'])
-    final_balance = customer.balance or 0
-    grade_limit = (customer.grade or 0) * 1000
-    remaining_credit = grade_limit - final_balance if grade_limit else None
+@tool(
+    name='qurtoba_split_transfer',
+    side_effect=True,  # mutating: creates debt records — never carry its result forward
+    display_name='Split one cash total across several numbers',
+    description=(
+        'Use this tool ONLY when the customer asks to DIVIDE one single total across several '
+        'destination numbers (e.g. «قسم التحويلة دي على الأرقام دي» / «وزّع المبلغ ده عليهم» '
+        'followed by a list of numbers and ONE total amount). CASH ONLY (كاش). '
+        'THE TOOL does the division into whole pounds — you must NEVER compute the per-number '
+        'amount yourself and NEVER pass pre-divided amounts; pass only the numbers and the one total. '
+        'INPUT: '
+        '1) account_numbers — array of the destination Egyptian mobiles, AS THE CUSTOMER WROTE '
+        'them (the tool normalizes +20/0020/spaces to 01XXXXXXXXX). At least 2 numbers. '
+        '2) total_value — the SINGLE total amount in EGP to divide across them (positive whole number). '
+        '3) source_message_id (STRONGLY preferred) — the chat message id (UUID) of the message that '
+        'holds the request (it contains all the numbers); each created transaction quotes it. '
+        '4) override_grade_limit (optional, default False) — leave False to enforce the credit ceiling. '
+        '5) notes (optional). '
+        'BEHAVIOUR: '
+        '- The tool splits total_value into whole-pound parts that sum EXACTLY to the total, each '
+        'part >= 1, differing by at most 1 (90000 across 3 → 30000/30000/30000; 75 across 2 → 37/38). '
+        'It then creates ONE كاش transaction per number (auto-bracketed by amount) and sends ONE 👍 — '
+        'so on success stay SILENT, exactly like the bulk tool. '
+        '- Number correction is handled by the tool itself per created number — never send it. '
+        '- Returns the usual created/pending/rejected summary PLUS split_total, parts, per_number. '
+        '- REJECTS (success=False) with a ready Arabic `error`: need_two_numbers (fewer than 2 '
+        'numbers), non_integer_total (total has a fraction), total_too_small (total smaller than the '
+        'count, can\'t give each >= 1). Send that message to the chat. '
+        'GUARDRAILS: '
+        '- Use this ONLY for one-total-many-numbers. If each number has its OWN amount, that is a '
+        'normal burst → use qurtoba_create_new_transactions_bulk (with the planner), NOT this tool. '
+        '- Never compute or pass the per-number amounts.'
+    ),
+    category='qurtoba',
+    requires_auth=True,
+    parameters_schema={
+        'type': 'object',
+        'properties': {
+            'account_numbers': {
+                'type': 'array',
+                'minItems': 2,
+                'maxItems': 50,
+                'items': {'type': 'string'},
+                'description': 'Destination Egyptian mobiles to split across, as written '
+                               '(tool normalizes +20/0020/spaces to 01XXXXXXXXX). At least 2.',
+            },
+            'total_value': {
+                'type': 'number',
+                'exclusiveMinimum': 0,
+                'description': 'The SINGLE total amount in EGP to divide across the numbers. '
+                               'Whole number — the tool does the division; never pre-divide.',
+            },
+            'source_message_id': {
+                'type': ['string', 'null'],
+                'description': 'UUID of the message holding the split request (from its '
+                               '"[message_id: <uuid>]" marker). It contains all the numbers.',
+            },
+            'override_grade_limit': {
+                'type': 'boolean',
+                'default': False,
+            },
+            'notes': {
+                'type': ['string', 'null'],
+            },
+        },
+        'required': ['account_numbers', 'total_value'],
+    },
+)
+def qurtoba_split_transfer(
+    context,
+    account_numbers: List[str],
+    total_value: float,
+    source_message_id: Optional[str] = None,
+    override_grade_limit: bool = False,
+    notes: Optional[str] = None,
+) -> Dict[str, Any]:
+    conv, customer, err = _resolve_conversation_and_customer(context)
+    if err:
+        return err
 
-    return {
-        'success': True,
-        'customer_id': customer.pk,
-        'customer_name': customer.name,
-        'total': len(transactions),
-        'created_count': created_count,
-        'pending_count': pending_count,
-        'rejected_count': rejected_count,
-        'final_balance': final_balance,
-        'grade_limit': grade_limit,
-        'remaining_credit': remaining_credit,
-        'results': results,
-    }
+    # Need at least two numbers to split across.
+    if not isinstance(account_numbers, list) or len(account_numbers) < 2:
+        return {
+            'success': False,
+            'error_type': 'need_two_numbers',
+            'error': 'محتاج رقمين على الأقل عشان أقسم المبلغ عليهم.',
+        }
+
+    # Deterministic amount normalization (Arabic/ASCII digits, separators). The split is in
+    # whole pounds, so the total itself must be a whole number (no fractional split).
+    norm = normalize_amount(total_value)
+    if not norm['ok']:
+        return {'success': False, 'error_type': 'invalid_value', 'error': 'المبلغ يجب أن يكون رقم موجب.'}
+    total = norm['value']
+    if total <= 0:
+        return {'success': False, 'error_type': 'invalid_value', 'error': 'المبلغ يجب أن يكون أكبر من صفر.'}
+    total_int = int(round(total))
+    if total_int != total:
+        return {
+            'success': False,
+            'error_type': 'non_integer_total',
+            'error': 'مبلغ التقسيم لازم يكون رقم صحيح بدون كسور.',
+        }
+
+    n = len(account_numbers)
+    # Each part must be >= 1, so the total can't be smaller than the count.
+    if total_int < n:
+        return {
+            'success': False,
+            'error_type': 'total_too_small',
+            'error': 'المبلغ صغير على التقسيم — لازم يكون على الأقل بعدد الأرقام.',
+        }
+
+    parts = _split_total_evenly(total_int, n)
+
+    # One كاش item per (number, part). Same source_message_id for every item — the request
+    # message contains all the numbers, so each passes _create_one_debt's source check. The
+    # كاش bracket (كاش/كاش(10)/كاش(20)) is picked per part by _validate_debt_item.
+    items = [
+        {
+            'type': 'كاش',
+            'value': part,
+            'account_number': num,
+            'source_message_id': source_message_id,
+            'notes': notes,
+        }
+        for num, part in zip(account_numbers, parts)
+    ]
+
+    batch = _create_debts_batch(conv, customer, items, override_grade_limit, source_message_id)
+    # Augment with the split breakdown (do NOT clobber the batch's own 'total' = item count).
+    batch.update({
+        'split': True,
+        'split_total': total_int,
+        'parts': parts,
+        'per_number': [
+            {'account_number': num, 'value': part}
+            for num, part in zip(account_numbers, parts)
+        ],
+    })
+    return batch
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +1092,7 @@ def qurtoba_create_new_transactions_bulk(
 
 @tool(
     name='qurtoba_register_customer_payment',
+    side_effect=True,  # mutating: creates a pending-payment row — never carry its result forward
     display_name='Register Customer Payment (سداد) — Review Queue',
     description=(
         'Use this tool ONLY to register a payment the customer has made TO the merchant '

@@ -182,6 +182,54 @@ class PartnerQurtobaExtension(ModelExtension):
         """True when this partner is linked to a Qurtoba customer."""
         return self.qurtoba_customer_id is not None
 
+
+# ---------------------------------------------------------------------------
+# MessageQurtobaExtension — watermark on chat.Message marking which inbound
+# messages the AI already turned into a Qurtoba transaction. Two jobs:
+#   1. Idempotency backstop — a message already consumed must never produce a
+#      second transaction when the workflow re-runs on the full conversation.
+#   2. Live context — feeds <unprocessed_transactions> so the agent sees exactly
+#      which burst lines are still open and never re-actions a done one.
+# Added via the model-extension mechanism (no edit to the chat module's source).
+# ---------------------------------------------------------------------------
+
+class MessageQurtobaExtension(ModelExtension):
+    """Marks chat.Message rows the AI consumed into a Qurtoba transaction."""
+
+    _inherit = 'chat.message'
+    _depends = ['base']
+
+    ai_consumed_at = models.DateTimeField(
+        null=True, blank=True, db_index=True,
+        verbose_name=_('AI Consumed At'),
+        help_text=_('Set when the AI created a Qurtoba transaction from this message.'),
+    )
+    qurtoba_record = models.ForeignKey(
+        'qurtoba.QurtobaRecord',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='consumed_messages',
+        verbose_name=_('Qurtoba Record'),
+    )
+
+    def mark_ai_consumed(self, record=None):
+        """Best-effort: flag this message as consumed into `record`.
+
+        Uses ``.update()`` so it triggers no signals (no re-batching) and never
+        raises into the tool flow. No-op if the watermark column isn't synced yet.
+        """
+        try:
+            from django.utils import timezone
+            from modules.chat.models import Message
+            Message.objects_all.filter(pk=self.pk).update(
+                ai_consumed_at=timezone.now(),
+                qurtoba_record=record,
+            )
+            return True
+        except Exception:
+            return False
+
+
 # ---------------------------------------------------------------------------
 # WhatsAppAccountQurtobaExtension — per-account toggles for which Qurtoba
 # transfer types the AI agent is allowed to create on this WhatsApp account.
@@ -348,6 +396,56 @@ class ConversationQurtobaExtension(ModelExtension):
 
     _inherit = 'chat.conversation'
     _depends = ['base']
+
+    def template_context_extras(self):
+        """Live values surfaced into ``{{ conversation.* }}`` for the agent prompt.
+
+        ``unprocessed_transactions``: the inbound text lines not yet turned into a
+        Qurtoba transaction (``ai_consumed_at`` is null), each tagged with its
+        ``[message_id]``.
+
+        Scope is a PURE RECENCY window: a message stays "open" (and linkable by its
+        [message_id]) until it is CONSUMED into a transaction or ages out. We do NOT
+        cut the window at the agent's last reply — a number the agent just asked a
+        clarifying question about was sent BEFORE that reply, and it MUST stay visible
+        so the resulting transaction can carry its source_message_id (required for the
+        auto receipt mention when Cash-SYS pays it). Stale/abandoned bursts fall out
+        of the window by time + the watermark; the planner handles any overlap. The
+        window (``AI_UNPROCESSED_WINDOW_MIN``, default 6 min) comfortably covers a
+        clarification round-trip while excluding an old burst. Best-effort — any
+        failure renders an empty block rather than breaking prompt rendering.
+        """
+        try:
+            from datetime import timedelta
+            from django.conf import settings as dj_settings
+            from django.utils import timezone
+            from modules.chat.models import Message
+
+            from django.db.models import F
+            from django.db.models.functions import Coalesce
+            window_min = getattr(dj_settings, 'AI_UNPROCESSED_WINDOW_MIN', 6)
+            cutoff = timezone.now() - timedelta(minutes=window_min)
+            # Recency window stays on created_at (arrival-based, correct). The SORT key is
+            # the true send order (social_sent_at + ingest_seq, created_at fallback) so a
+            # forwarded burst reaches the planner in the order the customer actually sent.
+            rows = list(
+                Message.objects_all
+                .filter(conversation=self, direction='inbound', active=True,
+                        type='text', ai_consumed_at__isnull=True,
+                        created_at__gte=cutoff)
+                .annotate(_ord=Coalesce('social_sent_at', 'created_at'))
+                .order_by(F('_ord').desc(), F('ingest_seq').desc(nulls_last=True))[:40]
+            )[::-1]  # back to chronological (true send) order
+            lines = []
+            for m in rows:
+                c = m.content
+                txt = c.get('text') if isinstance(c, dict) else None
+                if not txt:
+                    continue
+                lines.append(f"[message_id: {m.id}] {' '.join(str(txt).split())}")
+            return {'unprocessed_transactions': '\n'.join(lines)}
+        except Exception:
+            return {'unprocessed_transactions': ''}
 
     @action
     def action_qurtoba_new_debt(self):

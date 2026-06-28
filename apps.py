@@ -11,6 +11,14 @@ class QurtobaConfig(AppConfig):
         from . import extensions  # noqa: F401
         from . import tools  # noqa: F401  — registers @tool decorators with AI Studio
 
+        # Durable catcher for the "AI reply seen as inbound" bug — logs every
+        # occurrence (with creation stack trace) to logs/ai_inbound_catcher.log.
+        try:
+            from . import ai_inbound_catcher
+            ai_inbound_catcher.register()
+        except Exception:
+            pass
+
         # Kick off a catalog pull on first startup so the tables are never empty.
         # Skipped during manage.py migrate / test runs to avoid hitting Cash-SYS
         # before the DB is ready.

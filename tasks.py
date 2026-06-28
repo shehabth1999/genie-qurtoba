@@ -619,12 +619,34 @@ def _floor_fee(value):
         return None
 
 
-def _service_fee_plan(briefs):
+def _is_010_number(raw):
+    """True if the recipient mobile is a Vodafone «010» number.
+
+    Tolerates the country-code / formatting variants Cash-SYS may send
+    (2010…, 002010…, +2010…, or the bare 10-digit 10…) and the canonical
+    01XXXXXXXXX form we already store on cash records.
+    """
+    if not raw:
+        return False
+    d = ''.join(ch for ch in str(raw) if ch.isdigit())
+    if d.startswith('0020'):
+        d = d[2:]                 # 0020 10… → 010…
+    elif d.startswith('20') and len(d) >= 12:
+        d = '0' + d[2:]           # 20 10… → 010…
+    elif len(d) == 10 and d.startswith('1'):
+        d = '0' + d               # 10… (no leading 0) → 010…
+    return d.startswith('010')
+
+
+def _service_fee_plan(briefs, recipient=None):
     """
     Pure decision: given the transfer briefs, return the list of مصاريف خدمه amounts
     to create (each an int, fraction dropped, ≥ 2).
       - floor each fee; keep only ≥ 2 (0/1 and 1.9→1 skipped).
-      - total transferred ≤ 60,000 → one fee = the highest; else → all (one per transfer).
+      - recipient number starts with «010» (Vodafone) → one fee = the SUM of all
+        transfers' fees, regardless of the total amount.
+      - otherwise: total transferred ≤ 60,000 → one fee = the highest;
+        else → all (one per transfer).
     """
     fees = []
     total_transferred = 0.0
@@ -638,6 +660,9 @@ def _service_fee_plan(briefs):
             fees.append(ff)
     if not fees:
         return []
+    # 010 (Vodafone) recipient → charge the sum of every transfer's fee.
+    if _is_010_number(recipient):
+        return [sum(fees)]
     return [max(fees)] if total_transferred <= SERVICE_FEE_THRESHOLD else fees
 
 
@@ -646,6 +671,8 @@ def _create_service_fees(record):
     Auto-create the مصاريف خدمه debt record(s) for an executed order and post the
     static fee note (quoting the request message). Rules:
       - floor each transfer's fee; keep only floored fee ≥ 2 (0/1 — and 1.9→1 — skipped).
+      - recipient number starts with «010» (Vodafone) → ONE fee record = the SUM of
+        all transfers' fees, regardless of the total amount.
       - total transferred ≤ 60,000 → ONE fee record = the highest floored fee.
       - total transferred > 60,000 → ONE fee record per transfer (not summed).
     Idempotent via record.cash_sys_service_fee_done. The fee record is a normal
@@ -656,7 +683,11 @@ def _create_service_fees(record):
         return
     from qurtoba.models import QurtobaRecord
 
-    chosen = _service_fee_plan(record.cash_sys_transactions or [])
+    recipient = record.account_number or next(
+        (b.get('transfer_to') for b in (record.cash_sys_transactions or []) if b.get('transfer_to')),
+        None,
+    )
+    chosen = _service_fee_plan(record.cash_sys_transactions or [], recipient=recipient)
 
     # Mark done up-front so a webhook retry / companion event never double-charges.
     QurtobaRecord.objects.filter(pk=record.pk).update(cash_sys_service_fee_done=True)
