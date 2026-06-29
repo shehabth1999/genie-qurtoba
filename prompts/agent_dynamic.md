@@ -10,7 +10,7 @@
   </partner>
 
   <!-- Live per-type on/off state. Apply guards/service_availability. -->
-  <service_availability>{{function_1779213555168}}</service_availability>
+  <service_availability>{{function_1780949181829}}</service_availability>
 
   <customer>
     <identity>

@@ -9,6 +9,7 @@ Both resolve the target QurtobaCustomer from the active WhatsApp/Messenger
 conversation: `conversation.social_partner.qurtoba_customer`.
 """
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from modules.aistudio.tools import tool
@@ -49,25 +50,19 @@ def _send_start_ack(conversation) -> None:
         logger.warning('qurtoba: start-ack 👍 failed', exc_info=True)
 
 
-def _send_account_correction_reply(conversation, social_partner, src_message_id, corrected_number) -> bool:
+def _send_quoted_text(conversation, social_partner, src_message_id, text) -> bool:
     """
-    Reply the corrected destination number to the chat — done by the TOOL, never the
-    LLM. (The LLM used to do this from the prompt and would sometimes skip it, which
-    is why the confirmation was flaky.) The message QUOTES the inbound message the
-    partner typed the number in, resolved from src_message_id → WAMID (social_id) +
-    local id, so it shows as a reply on both WhatsApp and our chat UI. Sent via the
-    omnichannel service. Best-effort; never raises into the tool flow.
-
-    Returns True if a message was dispatched.
+    Send `text` to the chat as a reply that QUOTES the inbound message src_message_id
+    (resolved to WAMID/social_id + local id) — done by the TOOL, via the omnichannel
+    service, as the system partner. If the message can't be resolved it still sends,
+    just unquoted. Best-effort; never raises. Returns True if a message was dispatched.
     """
     try:
-        if conversation is None or social_partner is None or not corrected_number:
+        if conversation is None or social_partner is None or not text:
             return False
         from modules.chat.services.omnichannel_send_service import OmnichannelSendService
         from qurtoba.extensions import _get_system_partner
 
-        # Resolve the message that carried the number so we can quote it. If it
-        # can't be resolved we still send the correction, just unquoted.
         reply_wamid = None
         reply_local_id = None
         if src_message_id:
@@ -80,12 +75,12 @@ def _send_account_correction_reply(conversation, social_partner, src_message_id,
                     reply_wamid = getattr(msg, 'social_id', None)
                     reply_local_id = msg.id
             except Exception:
-                logger.warning('qurtoba: correction reply could not resolve src message %s',
+                logger.warning('qurtoba: could not resolve src message %s for quoted reply',
                                src_message_id, exc_info=True)
 
         OmnichannelSendService().send_and_broadcast(
             partner=social_partner,
-            content={'text': str(corrected_number)},
+            content={'text': str(text)},
             message_type='text',
             conversation=conversation,
             system_partner=_get_system_partner(conversation),
@@ -93,12 +88,44 @@ def _send_account_correction_reply(conversation, social_partner, src_message_id,
             reply_to_id=reply_local_id,
             websocket=True,
         )
-        logger.info('qurtoba: tool sent account-correction reply "%s" (quoted=%s)',
-                    corrected_number, bool(reply_wamid or reply_local_id))
         return True
     except Exception:
-        logger.warning('qurtoba: account-correction reply failed', exc_info=True)
+        logger.warning('qurtoba: quoted reply failed', exc_info=True)
         return False
+
+
+def _send_account_correction_reply(conversation, social_partner, src_message_id, corrected_number) -> bool:
+    """
+    Reply the corrected destination number to the chat — done by the TOOL, never the
+    LLM, quoting the message the partner typed the number in. Best-effort.
+    Returns True if a message was dispatched.
+    """
+    if not corrected_number:
+        return False
+    sent = _send_quoted_text(conversation, social_partner, src_message_id, str(corrected_number))
+    if sent:
+        logger.info('qurtoba: tool sent account-correction reply "%s"', corrected_number)
+    return sent
+
+
+def _split_clarification_text(total_int, n) -> str:
+    """The ambiguity question for a split: divide the total across the numbers, or full to each."""
+    return (
+        f'تأكيد: تقصد أقسم {total_int} جنيه على الـ{n} أرقام (كل رقم ياخد جزء من المبلغ)؟ '
+        f'رد بـ«نعم» للتقسيم، أو قول «{total_int} لكل رقم» لو تقصد المبلغ كامل لكل رقم.'
+    )
+
+
+def _send_split_clarification(conversation, social_partner, src_message_id, total_int, n) -> bool:
+    """
+    Ask the customer — via the TOOL, quoting their request — whether `total_int` should be
+    SPLIT across the n numbers or sent in FULL to each. Nothing is created until they confirm.
+    Best-effort; never raises. Returns True if the question was dispatched.
+    """
+    sent = _send_quoted_text(conversation, social_partner, src_message_id,
+                             _split_clarification_text(total_int, n))
+    logger.info('qurtoba: tool sent split clarification (total=%s, n=%s, sent=%s)', total_int, n, sent)
+    return sent
 
 
 # ---------------------------------------------------------------------------
@@ -233,12 +260,8 @@ def _normalize_phone(raw: Optional[str]) -> Optional[str]:
     return d or None
 
 
-def _message_digits(msg) -> str:
-    """All ASCII digits contained in a chat Message (text + caption + transcription).
-
-    Arabic-Indic digits are transliterated first so a phone written in Arabic
-    numerals still matches.
-    """
+def _message_text_raw(msg) -> str:
+    """A chat Message's text + caption + transcription, joined VERBATIM (no transliteration)."""
     content = getattr(msg, 'content', None)
     parts = []
     if isinstance(content, dict):
@@ -253,8 +276,48 @@ def _message_digits(msg) -> str:
             parts.append(content['transcription'])
     elif isinstance(content, str):
         parts.append(content)
-    blob = _ar_to_ascii(' '.join(parts))
-    return ''.join(ch for ch in blob if ch.isdigit())
+    return ' '.join(parts)
+
+
+def _message_text_ascii(msg) -> str:
+    """Like _message_text_raw but with Arabic-Indic digits transliterated to ASCII (so a phone
+    written in Arabic numerals or with separators still matches on digit presence)."""
+    return _ar_to_ascii(_message_text_raw(msg))
+
+
+def _message_digits(msg) -> str:
+    """All ASCII digits contained in a chat Message (text + caption + transcription)."""
+    return ''.join(ch for ch in _message_text_ascii(msg) if ch.isdigit())
+
+
+def _account_as_written_differs(final_account, msg) -> bool:
+    """True when the canonical number (01XXXXXXXXX) is NOT how the customer literally typed it
+    in `msg` — i.e. normalization changed it (spaces / +20 / 0020 / dashes / missing leading 0),
+    so the correction is worth confirming back.
+
+    This is the RELIABLE correction signal: the LLM often hands the tool an already-cleaned
+    number, so comparing the tool's input to the canonical form misses real corrections. We
+    instead compare the canonical form to how the number appears in the partner's own message.
+    Returns False when the canonical form appears verbatim, when msg is missing, or when the
+    number isn't in the message at all.
+    """
+    if msg is None or not final_account:
+        return False
+    raw = _message_text_raw(msg)
+    if not raw:
+        return False
+    # Verbatim check on the RAW text with ASCII-ONLY digit runs ([0-9], so Arabic-Indic digits are
+    # NOT counted): the partner typed the canonical number only if it appears as a clean ASCII run.
+    #  - «٠١٠٢٥٢٩٤٥٩٤» (Arabic) → no ASCII run → counts as a correction (send the English number).
+    #  - «+201006000100» → the ASCII run is «201006000100», not «01006000100» → a correction.
+    #  - «01025294594» (clean ASCII) → matches → NOT a correction.
+    if final_account in re.findall(r'[0-9]+', raw):
+        return False
+    # Otherwise confirm it IS the same number (subscriber tail present once Arabic digits are
+    # transliterated) — written differently (Arabic numerals / code / spaces / dashes).
+    subscriber = final_account[1:] if final_account.startswith('0') else final_account
+    digits = ''.join(ch for ch in _ar_to_ascii(raw) if ch.isdigit())
+    return bool(subscriber and subscriber in digits)
 
 
 def _source_message_matches_account(source_message_id, final_account, conversation) -> str:
@@ -359,11 +422,28 @@ def _create_one_debt(
             'error': 'مصاريف الخدمة تُضاف تلقائياً من النظام — لا تُسجَّل يدوياً.',
         }
 
+    src = (str(source_message_id).strip() if source_message_id else None)
+
     # Did normalization change the destination number the partner typed?
-    # (e.g. "00201038857982" -> "01038857982", or spaces/+20 stripped). The agent
-    # uses this to confirm the correction back on the partner's message.
+    # (e.g. "00201038857982" -> "01038857982", or "010 06000 100" -> "01006000100").
+    # Detect against the PARTNER'S MESSAGE, not the tool input — the LLM usually hands us an
+    # already-cleaned number, so comparing input vs canonical misses the change. We compare the
+    # canonical number to how it literally appears in the source message; fall back to the raw
+    # tool input only when the message can't be resolved. Used to confirm the correction back.
+    account_corrected = False
     _raw_in = (account_input or '').strip()
-    account_corrected = bool(is_cash and final_account and _raw_in and _raw_in != final_account)
+    if is_cash and final_account:
+        _src_msg = None
+        if src:
+            try:
+                from modules.chat.models import Message as ChatMessage
+                _src_msg = ChatMessage.objects_all.filter(id=src, conversation=conversation).first()
+            except Exception:
+                _src_msg = None
+        if _src_msg is not None:
+            account_corrected = _account_as_written_differs(final_account, _src_msg)
+        else:
+            account_corrected = bool(_raw_in and _raw_in != final_account)
 
     # Pre-check: is this type enabled on the current WhatsApp account?
     allowed, disabled_msg = _check_type_allowed_for_account(conversation, type)
@@ -374,8 +454,6 @@ def _create_one_debt(
             'error': disabled_msg,
             'disabled_type': type,
         }
-
-    src = (str(source_message_id).strip() if source_message_id else None)
 
     # --- Source-message validation (B2) ---------------------------------------
     # The cited message MUST contain the destination phone. This catches the
@@ -959,9 +1037,19 @@ def qurtoba_create_new_transactions_bulk(
         '2) total_value — the SINGLE total amount in EGP to divide across them (positive whole number). '
         '3) source_message_id (STRONGLY preferred) — the chat message id (UUID) of the message that '
         'holds the request (it contains all the numbers); each created transaction quotes it. '
-        '4) override_grade_limit (optional, default False) — leave False to enforce the credit ceiling. '
-        '5) notes (optional). '
-        'BEHAVIOUR: '
+        '4) clarified (bool, default False) — the split-vs-each AMBIGUITY gate (see CLARIFICATION). '
+        '5) override_grade_limit (optional, default False) — leave False to enforce the credit ceiling. '
+        '6) notes (optional). '
+        'CLARIFICATION (critical): «حولي الرقمين دول 90001» is AMBIGUOUS — split 90001 ACROSS the '
+        'numbers, or 90001 to EACH number? NEVER guess with money. If the customer was not explicit, '
+        'call with clarified=False (the default): the TOOL itself asks the customer (quoting their '
+        'message) and creates NOTHING, returning awaiting_clarification=True — you then stay SILENT '
+        '(the tool already asked; do not write the question yourself). When the customer confirms the '
+        'split (e.g. «نعم» / «قسّمها»), call again with clarified=True to execute. Set clarified=True '
+        'up-front ONLY when the request is already explicit about splitting («قسم/وزّع … على الأرقام '
+        'دي»). If the customer instead means the FULL amount to EACH number, that is NOT a split → use '
+        'qurtoba_create_new_transactions_bulk with that amount per number. '
+        'BEHAVIOUR (when clarified=True): '
         '- The tool splits total_value into whole-pound parts that sum EXACTLY to the total, each '
         'part >= 1, differing by at most 1 (90000 across 3 → 30000/30000/30000; 75 across 2 → 37/38). '
         'It then creates ONE كاش transaction per number (auto-bracketed by amount) and sends ONE 👍 — '
@@ -974,7 +1062,8 @@ def qurtoba_create_new_transactions_bulk(
         'GUARDRAILS: '
         '- Use this ONLY for one-total-many-numbers. If each number has its OWN amount, that is a '
         'normal burst → use qurtoba_create_new_transactions_bulk (with the planner), NOT this tool. '
-        '- Never compute or pass the per-number amounts.'
+        '- Never compute or pass the per-number amounts. Never set clarified=True yourself unless the '
+        'split intent is explicit or the customer just confirmed it.'
     ),
     category='qurtoba',
     requires_auth=True,
@@ -1000,6 +1089,15 @@ def qurtoba_create_new_transactions_bulk(
                 'description': 'UUID of the message holding the split request (from its '
                                '"[message_id: <uuid>]" marker). It contains all the numbers.',
             },
+            'clarified': {
+                'type': 'boolean',
+                'default': False,
+                'description': 'Split-vs-each ambiguity gate. False (default) → the tool ASKS the '
+                               'customer (split across, or full to each?) and creates NOTHING '
+                               '(awaiting_clarification). True → execute the split — set True only '
+                               'when the request is explicitly «قسم/وزّع» or the customer just '
+                               'confirmed the split.',
+            },
             'override_grade_limit': {
                 'type': 'boolean',
                 'default': False,
@@ -1016,6 +1114,7 @@ def qurtoba_split_transfer(
     account_numbers: List[str],
     total_value: float,
     source_message_id: Optional[str] = None,
+    clarified: bool = False,
     override_grade_limit: bool = False,
     notes: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1054,6 +1153,26 @@ def qurtoba_split_transfer(
             'success': False,
             'error_type': 'total_too_small',
             'error': 'المبلغ صغير على التقسيم — لازم يكون على الأقل بعدد الأرقام.',
+        }
+
+    # --- Clarify intent BEFORE creating anything ------------------------------
+    # «حولي الرقمين دول 90001» is AMBIGUOUS: split 90001 ACROSS the numbers, or send
+    # 90001 to EACH? Never guess with money. Unless the agent already confirmed the
+    # intent (clarified=True — explicit «قسم/وزّع», or the customer answered «نعم»),
+    # the TOOL itself asks (quoting the request) and creates NOTHING. The agent then
+    # re-calls with clarified=True once the customer confirms the split.
+    if not clarified:
+        sent = _send_split_clarification(
+            conv, getattr(conv, 'social_partner', None), source_message_id, total_int, n)
+        return {
+            'success': True,
+            'awaiting_clarification': True,
+            'clarification_sent': sent,
+            'split': True,
+            'split_total': total_int,
+            'count': n,
+            'note': 'asked the customer to confirm split-across vs full-to-each; nothing created. '
+                    'Re-call with clarified=True only after the customer confirms the split.',
         }
 
     parts = _split_total_evenly(total_int, n)
