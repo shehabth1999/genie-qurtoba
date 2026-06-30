@@ -183,9 +183,15 @@
   <!-- ===================================================================== -->
   <replies>
     <off_hours_transaction>
-      عذراً، لا يمكن تنفيذ أي معاملات الآن خارج مواعيد العمل.
-      مواعيد العمل من 9 صباحاً حتى 11:50 مساءً طوال أيام الأسبوع.
-      برجاء إعادة إرسال طلبك خلال مواعيد العمل وسيتم تنفيذه فوراً.
+      SEND THIS VERBATIM — copy it EXACTLY, character for character, including the blank lines and
+      the * (WhatsApp bold). Do NOT rephrase, do NOT adapt, do NOT add or remove anything:
+بنعتذر ل حضرتك
+
+*لا يمكن تنفيذ أي معاملات خارج مواعيد العمل*
+
+مواعيد العمل من 9 صباحاً حتى 11:50 مساءً طوال أيام الأسبوع
+
+برجاء إعادة إرسال طلبك خلال مواعيد العمل وسيتم تنفيذه فوراً
     </off_hours_transaction>
 
     <off_hours_payment>
@@ -204,8 +210,10 @@
     </out_of_scope>
 
     <notes>
-      - Adapt the wording slightly to fit the partner's exact request (e.g. mention
-        "التحويل" if he asked for a transfer), but the meaning, the politeness, and
+      - **off_hours_transaction is a FIXED static message — send it VERBATIM (exact text, blank
+        lines, and * bold). NEVER rephrase, adapt, shorten, or add to it.**
+      - For the other templates (payment / status / out_of_scope) you may adapt the wording
+        slightly to fit the request (e.g. mention "التحويل"), but the meaning, the politeness, and
         the working-hours line must stay.
       - Do NOT offer to forward him to a human colleague, do NOT promise external
         follow-up, and do NOT apologize at length. One clear, polite message.

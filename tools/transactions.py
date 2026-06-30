@@ -108,26 +108,6 @@ def _send_account_correction_reply(conversation, social_partner, src_message_id,
     return sent
 
 
-def _split_clarification_text(total_int, n) -> str:
-    """The ambiguity question for a split: divide the total across the numbers, or full to each."""
-    return (
-        f'تأكيد: تقصد أقسم {total_int} جنيه على الـ{n} أرقام (كل رقم ياخد جزء من المبلغ)؟ '
-        f'رد بـ«نعم» للتقسيم، أو قول «{total_int} لكل رقم» لو تقصد المبلغ كامل لكل رقم.'
-    )
-
-
-def _send_split_clarification(conversation, social_partner, src_message_id, total_int, n) -> bool:
-    """
-    Ask the customer — via the TOOL, quoting their request — whether `total_int` should be
-    SPLIT across the n numbers or sent in FULL to each. Nothing is created until they confirm.
-    Best-effort; never raises. Returns True if the question was dispatched.
-    """
-    sent = _send_quoted_text(conversation, social_partner, src_message_id,
-                             _split_clarification_text(total_int, n))
-    logger.info('qurtoba: tool sent split clarification (total=%s, n=%s, sent=%s)', total_int, n, sent)
-    return sent
-
-
 # ---------------------------------------------------------------------------
 # Type catalogs (mirrors QurtobaRecord.DEBT_TYPES / COLLECTION_TYPES)
 # ---------------------------------------------------------------------------
@@ -320,6 +300,35 @@ def _account_as_written_differs(final_account, msg) -> bool:
     return bool(subscriber and subscriber in digits)
 
 
+def _find_message_with_account(final_account, conversation, *, limit=50):
+    """Locate the partner's most-recent inbound message that literally contains this
+    destination number — in ANY written form (ASCII / Arabic-Indic / +20 / 0020 / spaces /
+    dashes). This is the TOOL's OWN correction control: the LLM frequently hands us an
+    already-cleaned number AND no usable source_message_id, which blinds the input-vs-canonical
+    fallback (both are already clean → no correction ever fires). Searching the customer's
+    actual message restores the signal regardless of what the LLM did. Returns the Message
+    or None.
+    """
+    if not final_account or conversation is None:
+        return None
+    subscriber = final_account[1:] if final_account.startswith('0') else final_account
+    if not subscriber:
+        return None
+    try:
+        from modules.chat.models import Message as ChatMessage
+        rows = (ChatMessage.objects_all
+                .filter(conversation=conversation, direction='inbound', active=True, type='text')
+                .order_by('-created_at')[:limit])
+    except Exception:
+        return None
+    for m in rows:
+        # _message_digits transliterates Arabic-Indic digits, so the 10-digit subscriber
+        # tail is found whether the customer typed 01…, +2010…, ٠١٠…, or with separators.
+        if subscriber in _message_digits(m):
+            return m
+    return None
+
+
 def _source_message_matches_account(source_message_id, final_account, conversation) -> str:
     """Validate that the cited source message actually contains the destination phone.
 
@@ -432,6 +441,10 @@ def _create_one_debt(
     # tool input only when the message can't be resolved. Used to confirm the correction back.
     account_corrected = False
     _raw_in = (account_input or '').strip()
+    # Message id to QUOTE in the correction reply. Starts as the LLM's cited id, but the TOOL
+    # overrides it with the message it finds itself — so the quote is right even when the LLM
+    # gave no (usable) source id.
+    correction_src_id = src
     if is_cash and final_account:
         _src_msg = None
         if src:
@@ -440,6 +453,13 @@ def _create_one_debt(
                 _src_msg = ChatMessage.objects_all.filter(id=src, conversation=conversation).first()
             except Exception:
                 _src_msg = None
+        if _src_msg is None:
+            # The LLM pre-cleaned the number and/or gave no usable source id — find the
+            # partner's own message so the TOOL (never the LLM) decides AND fires the
+            # correction, and so we quote the message the partner actually typed it in.
+            _src_msg = _find_message_with_account(final_account, conversation)
+            if _src_msg is not None:
+                correction_src_id = str(_src_msg.id)
         if _src_msg is not None:
             account_corrected = _account_as_written_differs(final_account, _src_msg)
         else:
@@ -552,7 +572,7 @@ def _create_one_debt(
             # (The approval path itself never re-sends — it passes no account_input,
             # so account_corrected is false there.)
             if account_corrected:
-                _send_account_correction_reply(conversation, social_partner, src, final_account)
+                _send_account_correction_reply(conversation, social_partner, correction_src_id, final_account)
             return {
                 'success': True,
                 'pending_review': True,
@@ -634,7 +654,7 @@ def _create_one_debt(
     # quoting the message the partner typed it in. Deterministic, and fires ONLY
     # here, on a real transaction being created (not on pending-review / duplicates).
     if account_corrected:
-        _send_account_correction_reply(conversation, social_partner, src, final_account)
+        _send_account_correction_reply(conversation, social_partner, correction_src_id, final_account)
 
     customer.refresh_from_db(fields=['balance'])
     new_balance = customer.balance or 0
@@ -665,7 +685,7 @@ def _create_one_debt(
 def _create_debts_batch(conv, customer, items, override_grade_limit, source_message_id=None):
     """Create each item in `items` via _create_one_debt; return the batch summary.
 
-    Shared core of qurtoba_create_new_transactions_bulk and qurtoba_split_transfer.
+    Shared core of qurtoba_create_new_transactions_bulk.
     Fires ONE 👍 for the whole batch (one shared ack_state). The caller runs any
     burst-specific pre-checks (e.g. the bulk completeness guard) — this helper does not.
     """
@@ -810,18 +830,6 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
         'remaining_credit': remaining_credit,
         'results': results,
     }
-
-
-def _split_total_evenly(total_int: int, n: int) -> List[int]:
-    """Split `total_int` whole pounds across `n` parts that sum EXACTLY to total_int.
-
-    Each part is a whole integer; the parts differ by at most 1; the extra pound(s)
-    (the remainder) land on the LAST parts, so 75/2 → [37, 38] and 100/3 → [33, 33, 34].
-    Caller MUST guarantee n >= 1 and total_int >= n, which makes every part >= 1.
-    """
-    base = total_int // n
-    rem = total_int - base * n          # 0 <= rem < n
-    return [base] * (n - rem) + [base + 1] * rem
 
 
 # ---------------------------------------------------------------------------
@@ -1015,194 +1023,6 @@ def qurtoba_create_new_transactions_bulk(
     # --------------------------------------------------------------------------
 
     return _create_debts_batch(conv, customer, transactions, override_grade_limit, source_message_id)
-
-
-# ---------------------------------------------------------------------------
-# Split ONE cash total across several numbers (قسم/وزّع التحويلة) — cash only
-# ---------------------------------------------------------------------------
-
-@tool(
-    name='qurtoba_split_transfer',
-    side_effect=True,  # mutating: creates debt records — never carry its result forward
-    display_name='Split one cash total across several numbers',
-    description=(
-        'Use this tool ONLY when the customer asks to DIVIDE one single total across several '
-        'destination numbers (e.g. «قسم التحويلة دي على الأرقام دي» / «وزّع المبلغ ده عليهم» '
-        'followed by a list of numbers and ONE total amount). CASH ONLY (كاش). '
-        'THE TOOL does the division into whole pounds — you must NEVER compute the per-number '
-        'amount yourself and NEVER pass pre-divided amounts; pass only the numbers and the one total. '
-        'INPUT: '
-        '1) account_numbers — array of the destination Egyptian mobiles, AS THE CUSTOMER WROTE '
-        'them (the tool normalizes +20/0020/spaces to 01XXXXXXXXX). At least 2 numbers. '
-        '2) total_value — the SINGLE total amount in EGP to divide across them (positive whole number). '
-        '3) source_message_id (STRONGLY preferred) — the chat message id (UUID) of the message that '
-        'holds the request (it contains all the numbers); each created transaction quotes it. '
-        '4) clarified (bool, default False) — the split-vs-each AMBIGUITY gate (see CLARIFICATION). '
-        '5) override_grade_limit (optional, default False) — leave False to enforce the credit ceiling. '
-        '6) notes (optional). '
-        'CLARIFICATION (critical): «حولي الرقمين دول 90001» is AMBIGUOUS — split 90001 ACROSS the '
-        'numbers, or 90001 to EACH number? NEVER guess with money. If the customer was not explicit, '
-        'call with clarified=False (the default): the TOOL itself asks the customer (quoting their '
-        'message) and creates NOTHING, returning awaiting_clarification=True — you then stay SILENT '
-        '(the tool already asked; do not write the question yourself). When the customer confirms the '
-        'split (e.g. «نعم» / «قسّمها»), call again with clarified=True to execute. Set clarified=True '
-        'up-front ONLY when the request is already explicit about splitting («قسم/وزّع … على الأرقام '
-        'دي»). If the customer instead means the FULL amount to EACH number, that is NOT a split → use '
-        'qurtoba_create_new_transactions_bulk with that amount per number. '
-        'BEHAVIOUR (when clarified=True): '
-        '- The tool splits total_value into whole-pound parts that sum EXACTLY to the total, each '
-        'part >= 1, differing by at most 1 (90000 across 3 → 30000/30000/30000; 75 across 2 → 37/38). '
-        'It then creates ONE كاش transaction per number (auto-bracketed by amount) and sends ONE 👍 — '
-        'so on success stay SILENT, exactly like the bulk tool. '
-        '- Number correction is handled by the tool itself per created number — never send it. '
-        '- Returns the usual created/pending/rejected summary PLUS split_total, parts, per_number. '
-        '- REJECTS (success=False) with a ready Arabic `error`: need_two_numbers (fewer than 2 '
-        'numbers), non_integer_total (total has a fraction), total_too_small (total smaller than the '
-        'count, can\'t give each >= 1). Send that message to the chat. '
-        'GUARDRAILS: '
-        '- Use this ONLY for one-total-many-numbers. If each number has its OWN amount, that is a '
-        'normal burst → use qurtoba_create_new_transactions_bulk (with the planner), NOT this tool. '
-        '- Never compute or pass the per-number amounts. Never set clarified=True yourself unless the '
-        'split intent is explicit or the customer just confirmed it.'
-    ),
-    category='qurtoba',
-    requires_auth=True,
-    parameters_schema={
-        'type': 'object',
-        'properties': {
-            'account_numbers': {
-                'type': 'array',
-                'minItems': 2,
-                'maxItems': 50,
-                'items': {'type': 'string'},
-                'description': 'Destination Egyptian mobiles to split across, as written '
-                               '(tool normalizes +20/0020/spaces to 01XXXXXXXXX). At least 2.',
-            },
-            'total_value': {
-                'type': 'number',
-                'exclusiveMinimum': 0,
-                'description': 'The SINGLE total amount in EGP to divide across the numbers. '
-                               'Whole number — the tool does the division; never pre-divide.',
-            },
-            'source_message_id': {
-                'type': ['string', 'null'],
-                'description': 'UUID of the message holding the split request (from its '
-                               '"[message_id: <uuid>]" marker). It contains all the numbers.',
-            },
-            'clarified': {
-                'type': 'boolean',
-                'default': False,
-                'description': 'Split-vs-each ambiguity gate. False (default) → the tool ASKS the '
-                               'customer (split across, or full to each?) and creates NOTHING '
-                               '(awaiting_clarification). True → execute the split — set True only '
-                               'when the request is explicitly «قسم/وزّع» or the customer just '
-                               'confirmed the split.',
-            },
-            'override_grade_limit': {
-                'type': 'boolean',
-                'default': False,
-            },
-            'notes': {
-                'type': ['string', 'null'],
-            },
-        },
-        'required': ['account_numbers', 'total_value'],
-    },
-)
-def qurtoba_split_transfer(
-    context,
-    account_numbers: List[str],
-    total_value: float,
-    source_message_id: Optional[str] = None,
-    clarified: bool = False,
-    override_grade_limit: bool = False,
-    notes: Optional[str] = None,
-) -> Dict[str, Any]:
-    conv, customer, err = _resolve_conversation_and_customer(context)
-    if err:
-        return err
-
-    # Need at least two numbers to split across.
-    if not isinstance(account_numbers, list) or len(account_numbers) < 2:
-        return {
-            'success': False,
-            'error_type': 'need_two_numbers',
-            'error': 'محتاج رقمين على الأقل عشان أقسم المبلغ عليهم.',
-        }
-
-    # Deterministic amount normalization (Arabic/ASCII digits, separators). The split is in
-    # whole pounds, so the total itself must be a whole number (no fractional split).
-    norm = normalize_amount(total_value)
-    if not norm['ok']:
-        return {'success': False, 'error_type': 'invalid_value', 'error': 'المبلغ يجب أن يكون رقم موجب.'}
-    total = norm['value']
-    if total <= 0:
-        return {'success': False, 'error_type': 'invalid_value', 'error': 'المبلغ يجب أن يكون أكبر من صفر.'}
-    total_int = int(round(total))
-    if total_int != total:
-        return {
-            'success': False,
-            'error_type': 'non_integer_total',
-            'error': 'مبلغ التقسيم لازم يكون رقم صحيح بدون كسور.',
-        }
-
-    n = len(account_numbers)
-    # Each part must be >= 1, so the total can't be smaller than the count.
-    if total_int < n:
-        return {
-            'success': False,
-            'error_type': 'total_too_small',
-            'error': 'المبلغ صغير على التقسيم — لازم يكون على الأقل بعدد الأرقام.',
-        }
-
-    # --- Clarify intent BEFORE creating anything ------------------------------
-    # «حولي الرقمين دول 90001» is AMBIGUOUS: split 90001 ACROSS the numbers, or send
-    # 90001 to EACH? Never guess with money. Unless the agent already confirmed the
-    # intent (clarified=True — explicit «قسم/وزّع», or the customer answered «نعم»),
-    # the TOOL itself asks (quoting the request) and creates NOTHING. The agent then
-    # re-calls with clarified=True once the customer confirms the split.
-    if not clarified:
-        sent = _send_split_clarification(
-            conv, getattr(conv, 'social_partner', None), source_message_id, total_int, n)
-        return {
-            'success': True,
-            'awaiting_clarification': True,
-            'clarification_sent': sent,
-            'split': True,
-            'split_total': total_int,
-            'count': n,
-            'note': 'asked the customer to confirm split-across vs full-to-each; nothing created. '
-                    'Re-call with clarified=True only after the customer confirms the split.',
-        }
-
-    parts = _split_total_evenly(total_int, n)
-
-    # One كاش item per (number, part). Same source_message_id for every item — the request
-    # message contains all the numbers, so each passes _create_one_debt's source check. The
-    # كاش bracket (كاش/كاش(10)/كاش(20)) is picked per part by _validate_debt_item.
-    items = [
-        {
-            'type': 'كاش',
-            'value': part,
-            'account_number': num,
-            'source_message_id': source_message_id,
-            'notes': notes,
-        }
-        for num, part in zip(account_numbers, parts)
-    ]
-
-    batch = _create_debts_batch(conv, customer, items, override_grade_limit, source_message_id)
-    # Augment with the split breakdown (do NOT clobber the batch's own 'total' = item count).
-    batch.update({
-        'split': True,
-        'split_total': total_int,
-        'parts': parts,
-        'per_number': [
-            {'account_number': num, 'value': part}
-            for num, part in zip(account_numbers, parts)
-        ],
-    })
-    return batch
 
 
 # ---------------------------------------------------------------------------

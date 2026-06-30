@@ -199,6 +199,21 @@ class MessageQurtobaExtension(ModelExtension):
     _inherit = 'chat.message'
     _depends = ['base']
 
+    class Meta:
+        # Composite index backing the true-send-order query for inbound WhatsApp
+        # bursts (qurtoba reads social_sent_at + ingest_seq to order them — see
+        # ConversationQurtobaExtension.template_context_extras and tools/planning.py).
+        # Registered Odoo-style via the extension Meta mechanism and materialized by
+        # sync_schema. The name MUST stay 'chat_msg_conv_sent_seq_idx': the identical
+        # index already exists in the DB (created by the now-removed chat migration
+        # 0027), so keeping the name makes sync_schema a no-op rather than a duplicate.
+        indexes = [
+            models.Index(
+                fields=['conversation_id', 'social_sent_at', 'ingest_seq'],
+                name='chat_msg_conv_sent_seq_idx',
+            ),
+        ]
+
     ai_consumed_at = models.DateTimeField(
         null=True, blank=True, db_index=True,
         verbose_name=_('AI Consumed At'),
@@ -210,6 +225,28 @@ class MessageQurtobaExtension(ModelExtension):
         null=True, blank=True,
         related_name='consumed_messages',
         verbose_name=_('Qurtoba Record'),
+    )
+
+    # True message-ordering keys for inbound WhatsApp bursts — moved here from
+    # chat.Message (core) so the qurtoba feature owns its own schema. created_at
+    # stays = arrival/insert time (the agent freshness gate uses it); these capture
+    # the provider's real SEND order instead. Written at webhook receipt; read by the
+    # qurtoba planner and the <unprocessed_transactions> block. Null for old rows /
+    # channels without them — ordering then falls back to created_at. The DB columns
+    # already exist (ex-migration 0027), so sync_schema no-ops on them.
+    social_sent_at = models.DateTimeField(
+        null=True, blank=True, db_index=True,
+        verbose_name=_('Social Sent At'),
+        help_text=_("Provider's true send time (e.g. WhatsApp message timestamp, "
+                    "second-granularity). Null when unavailable; ordering falls "
+                    "back to created_at."),
+    )
+    ingest_seq = models.BigIntegerField(
+        null=True, blank=True,
+        verbose_name=_('Ingest Seq'),
+        help_text=_("Monotonic per-conversation sequence captured at webhook receipt, "
+                    "before concurrent task dispatch. Tiebreaker for same-second "
+                    "forwarded bursts."),
     )
 
     def mark_ai_consumed(self, record=None):

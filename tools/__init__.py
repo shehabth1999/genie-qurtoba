@@ -7,7 +7,6 @@ from .cash_sys import (
 )
 from .transactions import (
     qurtoba_create_new_transactions_bulk,
-    qurtoba_split_transfer,
     qurtoba_register_customer_payment,
     qurtoba_check_transaction_status,
 )
@@ -28,7 +27,6 @@ from .static_reply import (
 __all__ = [
     "cash_sys_create_and_activate",
     "qurtoba_create_new_transactions_bulk",
-    "qurtoba_split_transfer",
     "qurtoba_register_customer_payment",
     "qurtoba_check_transaction_status",
     "qurtoba_plan_transactions",
