@@ -4,7 +4,7 @@
 **Django app label:** `qurtoba`  
 **Type:** External Genie ERP extension  
 **Source verified from:** `E:\Qurtoba\old sys\qurtobaSys_django\` (read directly)  
-**Last updated:** May 2026 (Step 1 complete)
+**Last updated:** July 2026 — added §19 AI Agent Transaction Tools (deterministic burst planning)
 
 ---
 
@@ -26,8 +26,10 @@
 14. [Sync Flow](#14-sync-flow)
 15. [Loop Prevention](#15-loop-prevention)
 16. [Verified Facts from Qurtoba Source](#16-verified-facts-from-qurtoba-source)
-17. [Known Limitations](#17-known-limitations)
-18. [File Map](#18-file-map)
+17. [Cash-SYS Catalog Integration (Pricing Plans Pull)](#17-cash-sys-catalog-integration-pricing-plans-pull)
+18. [Known Limitations](#18-known-limitations)
+19. [AI Agent Transaction Tools (Planning & Amount Normalization)](#19-ai-agent-transaction-tools-planning--amount-normalization)
+20. [File Map](#20-file-map)
 
 ---
 
@@ -594,7 +596,167 @@ Auth token used: `CASH_SYS_TOKEN` (same token used for order posting).
 
 ---
 
-## 18. File Map
+## 19. AI Agent Transaction Tools (Planning & Amount Normalization)
+
+The customer-facing WhatsApp agent (AI Studio) drives all transaction work through a set
+of `@tool`-decorated functions under `tools/`. Importing `qurtoba.tools` registers them
+(see `tools/__init__.py`). This section documents that tool layer and, in particular, the
+**deterministic burst-planning feature** added July 2026.
+
+### 19.1 Registered tools
+
+| Tool | File | Side-effect | Purpose |
+|------|------|:-----------:|---------|
+| `qurtoba_plan_transactions` | `tools/planning.py` | — (read-only) | **NEW.** Pairs phone↔amount across a burst of messages deterministically. Called FIRST, before create. |
+| `qurtoba_create_new_transactions_bulk` | `tools/transactions.py` | yes (creates records) | The single create-transaction tool — one op or many in one call. |
+| `qurtoba_register_customer_payment` | `tools/transactions.py` | yes (review queue) | Register a customer payment (سداد) into the admin review queue. |
+| `qurtoba_check_transaction_status` | `tools/transactions.py` | — | Whether a debt op was executed via the cash app. |
+| `cash_sys_create_and_activate` | `tools/cash_sys.py` | yes | Create + activate a Cash-SYS user account. |
+| `qurtoba_send_customer_balance_to_chat` | `tools/conversation.py` | yes (sends msg) | Push the customer's current balance into the chat. |
+| `alert_qurtoba_human` | `tools/conversation.py` | yes | Escalate to a human operator («لحظة»). |
+| `qurtoba_get_customer_daily_transactions` | `tools/reports.py` | — | Customer's daily transactions report. |
+| `qurtoba_send_static_message` | `tools/static_reply.py` | yes (sends msg) | Send a canned/static reply. |
+
+> `tools/transactions.py` also defines `qurtoba_check_payment_status`, but it is **not** exported
+> from `tools/__init__.py` (`__all__`) and so is not registered for the agent.
+
+### 19.2 The new feature — deterministic burst planning
+
+**Problem it solves.** Customers send a *burst* of WhatsApp messages — phone numbers and
+amounts, interleaved or as two separate lists, sometimes with stray names/labels («حمدي»,
+«محفظه») in between. The agent used to hand-pair these in its head, which mis-aligned the
+whole burst whenever a stray name slipped before a bare amount (a name stole the pending
+slot and every subsequent phone got the wrong amount). It also normalized amounts ("27.460",
+"20الف", Arabic digits) by reasoning, a source of wrong-value transactions.
+
+The feature moves both jobs — **pairing** and **amount normalization** — out of the LLM and
+into deterministic, auditable Python. Two new modules plus a reworked create path:
+
+```
+ burst of inbound messages
+        │
+        ▼
+ qurtoba_plan_transactions        (tools/planning.py)   ── READ-ONLY: proposes, never creates
+   ├─ authoritative DB re-fetch of unprocessed inbound msgs (true send order)
+   ├─ _classify_message → phones / integer amounts / names   (uses normalize_amount)
+   ├─ _pair_events     → FIFO positional pairing, names skipped
+   └─ same-time split guard → needs_resend
+        │  pairs[]  (each already carrying the right phone source_message_id)
+        ▼
+ qurtoba_create_new_transactions_bulk   (tools/transactions.py)  ── side-effect: creates records
+   ├─ _validate_debt_item → normalize_amount  (re-validates EVERY pair independently)
+   └─ consumed_ids_by_source → watermark BOTH the phone AND amount message
+```
+
+Because the create path **re-validates every pair independently**, a wrong plan can never
+commit wrong money — the planner is an aid, not a trusted authority.
+
+#### `qurtoba_plan_transactions` — READ-ONLY planner
+
+The agent must call this **first** for any burst of 2+ messages that look like transactions,
+passing every burst line as `{message_id, text}` in time order.
+
+**Authoritative re-fetch.** When the tool has a conversation handle it does **not** trust the
+list the LLM transcribed (the model can silently drop or reorder a line). It pulls the
+*unprocessed* inbound messages (`ai_consumed_at IS NULL`, within `AI_UNPROCESSED_WINDOW_MIN`)
+straight from the DB ordered by `social_sent_at` (then `ingest_seq`), and uses that as the
+authoritative burst. The LLM-supplied array is a fallback only.
+
+**Pairing algorithm** (`_pair_events`, a two-queue FIFO):
+- Walk events in time order keeping one pending phone-queue and one pending amount-queue.
+- A message holding *phone + amount* together → a complete pair immediately.
+- A lone phone pairs with the oldest pending amount (and vice-versa) — **positional**.
+- A **name/label token is skipped** — it never occupies a slot and never consumes a
+  number or amount. *This is the core fix.*
+- Both customer layouts work: interleaved (`P A P A …`) and parallel lists
+  (`P P P A A A …`, paired by position).
+- A pairing made while **>1** candidate of the opposite kind is waiting is a *list-pattern
+  guess* → that pair gets `confidence: "low"` and `list_pattern` is set true.
+
+**Same-time split guard** (`_same_time_split_mids`). WhatsApp timestamps only to the second
+and does not guarantee order within the same instant. If several transactions arrive in the
+same `AI_SAME_TIME_WINDOW_SEC` window with the phone and amount in **separate** messages
+(a cluster with ≥2 phones AND ≥2 amounts), positional pairing of that cluster is a guess.
+When `AI_SPLIT_RESEND_GUARD` is on and the burst has ≥`AI_SPLIT_RESEND_MIN_TX` pairs, those
+ambiguous pairs are **withheld** from `pairs` and returned under `resend` with
+`needs_resend: true` — the agent executes the safe ones and asks the customer to resend only
+the ambiguous few (each number+amount in one message, or "4-by-4").
+
+**Return shape:**
+
+| Field | Meaning |
+|-------|---------|
+| `pairs[]` | `{account_number, value, type:"كاش", source_message_id, confidence}` — feed straight into the bulk create tool. `source_message_id` is already the **phone** message's id. |
+| `orphans[]` | `{kind:"phone"\|"amount", value, message_id}` — a phone with no amount or vice-versa. Ask ONE short question per orphan; never guess. |
+| `ambiguous[]` | Pairs whose amount had an uncertain `.`/`,` reading — confirm if unsure. |
+| `list_pattern` | `true` when numbers and amounts arrived as two separate lists (paired by position). |
+| `needs_resend` / `resend[]` | Same-time split ambiguity withheld for re-send (see above). |
+| `summary` | `{pairs_count, orphans_count, distinct_phones}`. |
+| `note` | Arabic guidance string for the situation (orphans / list / resend). |
+
+#### `normalize_amount` — deterministic amount parsing (`tools/_amounts.py`)
+
+Single source of truth for "what number did the customer write". Used by **both** the planner
+(`_classify_message`) and the create path (`_validate_debt_item`) so they always agree.
+Returns `{ok, value, ambiguous, reason, raw}` and never raises. Rules:
+
+| Input form | Handling |
+|------------|----------|
+| Arabic-Indic / Persian digits (٠١٢ / ۰۱۲) | → ASCII |
+| Arabic separators ، ٬ ٫ | → `,` `,` `.` respectively |
+| Word multipliers `الف`/`الاف`/… ×1000, `الفين`=2000, `مليون` ×1,000,000, `مليونين`=2,000,000 | spelling-robust (أ/إ/آ→ا, ى→ي, tatweel stripped); a real word like «الفلوس» is **not** ×1000 |
+| Latin `k`/`m` glued to a digit (`20k`, `2.5m`) | ×1000 / ×1,000,000 (only when no Arabic multiplier) |
+| Currency/noise words (`جنيه`, `egp`, `le`, …) | stripped |
+| `27.460`, `1.380`, `200.000` (3 trailing digits) | **thousands** → 27460, 1380, 200000. Egypt has **no fractional amounts** (the `<no_fractions>` business law), so a single `.`/`,` with 3 trailing digits is deterministically a thousands separator — never flagged. |
+| `13.75`, `6.08` (1–2 trailing digits) | a commission tally, not a transfer amount — the planner's classifier drops it as noise |
+| both `.` and `,` present | rightmost separator is the decimal point, the other is thousands |
+
+#### Watermarking — `consumed_ids_by_source` (`tools/planning.py`)
+
+Maps each pair's phone `source_message_id` → **all** inbound message ids it consumed (phone
+*and* amount message of a split pair), via the same fetch/classify/pair path the planner uses.
+`_create_debts_batch` calls it and passes `consumed_message_ids` into each create so **both**
+messages get `ai_consumed_at` stamped. Without this, a split pair's amount message would
+linger as "unprocessed" and leak into the next burst, shifting positional pairing and
+mis-routing amounts.
+
+### 19.3 `qurtoba_create_new_transactions_bulk` — the create tool
+
+The **only** create-transaction tool — one op (a one-item array) or a whole burst in a single
+call. Key behaviours:
+
+- **Cash bracket auto-promotion** — always pass `type="كاش"` for any cash transfer; the tool
+  promotes by amount: `< 10,000` → `كاش`, `10,000–19,999` → `كاش(10)`, `≥ 20,000` → `كاش(20)`.
+  `كاش(5)` is reserved and must not be passed.
+- **Per-item `source_message_id`** — each transaction quotes its OWN phone-number message
+  (the execution receipt replies to exactly that message); never reuse one id across items.
+- **Independent re-validation** — every item goes through `_validate_debt_item` →
+  `normalize_amount`, so the plan is checked again at create time.
+- **Auto-ack** — the tool fires ONE 👍 for the whole batch; on an all-success batch the agent
+  stays silent.
+- **Per-item status** — `created` / `pending_review` (over the credit ceiling → admin queue,
+  not a rejection) / `rejected` / `duplicate` (idempotent — already created on a prior run).
+
+### 19.4 Removed: `qurtoba_split_transfer` (archived 2026-06-29)
+
+The owner decided the AI must **not** divide one total across several numbers. The
+`qurtoba_split_transfer` tool, its helpers, and prompt cases were removed (commit
+*"remove the split tool"*); the agent now escalates such requests via `alert_qurtoba_human`
+(«لحظة»). The "same amount to EACH number" case remains a normal bulk. Full removed code and
+restore instructions are preserved in `ARCHIVE_split_transfer_feature.md`.
+
+### 19.5 Configuration (Django settings)
+
+| Setting | Default | Used by |
+|---------|:-------:|---------|
+| `AI_UNPROCESSED_WINDOW_MIN` | `6` (min) | planner authoritative re-fetch / watermark fetch |
+| `AI_SAME_TIME_WINDOW_SEC` | `5` (sec) | same-time split-cluster detection |
+| `AI_SPLIT_RESEND_GUARD` | `True` | enable the same-time resend guard |
+| `AI_SPLIT_RESEND_MIN_TX` | `5` | min pairs in a burst before the resend guard activates |
+
+---
+
+## 20. File Map
 
 ```
 E:\genie-erp\projects\qurtoba\
@@ -605,9 +767,23 @@ E:\genie-erp\projects\qurtoba\
 ├── urls.py                 All URL patterns
 ├── extensions.py           PartnerQurtobaExtension, ConversationQurtobaExtension,
 │                           check_balance_and_send(), _get_system_partner()
-├── apps.py                 loads extensions on startup
+├── apps.py                 loads extensions + registers tools on startup
 ├── admin.py                Both models registered
+├── tasks.py                Celery tasks — AI agent run loop / inbound handling
+├── ai_inbound_catcher.py   Buffers an inbound burst before the agent runs
+├── tools/                  AI Studio @tool functions (see §19)
+│   ├── __init__.py         Registers all tools (import triggers @tool)
+│   ├── planning.py         qurtoba_plan_transactions + consumed_ids_by_source (NEW)
+│   ├── _amounts.py         normalize_amount — deterministic amount parsing (NEW)
+│   ├── transactions.py     create / payment / status tools + validation
+│   ├── conversation.py     send-balance + alert_qurtoba_human
+│   ├── reports.py          daily transactions report
+│   ├── cash_sys.py         create + activate Cash-SYS account
+│   └── static_reply.py     canned reply tool
+├── prompts/                Agent system prompts (static + dynamic, on/off hours)
+├── services/               AI agent service helpers
 ├── DOCS.md                 This file — technical reference
+├── ARCHIVE_split_transfer_feature.md  Removed qurtoba_split_transfer (see §19.4)
 ├── BUSINESS.md             Business requirements, user stories, business logic
 ├── migrations/
 │   ├── 0001_initial.py

@@ -600,6 +600,42 @@ def _send_reroute_ask(record, fulfilled, reroute_amount):
         logger.exception('[CashSys Notify] reroute ask failed record=%d: %s', record.pk, exc)
 
 
+# Customer-facing notice per full-reversal cancel reason. The debt is already
+# zeroed on the accountant ledger before this is sent, so the wording is truthful:
+#   cancel_request → reassure nothing was recorded.
+#   no_wallet      → ask for a different number (the current one has no wallet).
+_CANCEL_NOTICE_MESSAGES = {
+    'cancel_request': "تم الغاء التحويل\n\nو لم يتم تسجيل العمليه عليك",
+    'no_wallet': "*محتاجين رقم تانى نبعت عليه الرصيد*\n\n*الرقم مش عليه محفظة*",
+}
+
+
+def _send_cancel_notice(record, reason):
+    """Send the WhatsApp notice for a full-reversal cancel (no_wallet /
+    cancel_request), quoting the original transfer-request message. Best-effort;
+    never raises. Unknown reasons send nothing."""
+    text = _CANCEL_NOTICE_MESSAGES.get(reason)
+    if not text:
+        return
+    ctx = _notify_context(record)
+    if not ctx:
+        return
+    try:
+        ctx['svc'].send_and_broadcast(
+            partner=ctx['conv'].social_partner,
+            content={'text': text},
+            message_type='text',
+            conversation=ctx['conv'],
+            system_partner=ctx['system_partner'],
+            reply_to_message_id=ctx['reply_wamid'],
+            reply_to_id=ctx['reply_local_id'],
+            websocket=True,
+        )
+        logger.info('[CashSys Notify] cancel notice sent record=%d reason=%s', record.pk, reason)
+    except Exception as exc:
+        logger.exception('[CashSys Notify] cancel notice failed record=%d: %s', record.pk, exc)
+
+
 # ─────────────────────── Auto service fee (مصاريف خدمه) ─────────────────────
 #
 # Each executed Cash-SYS transfer carries a `fee` (مصاريف الخدمة) shown on the
@@ -850,7 +886,14 @@ def handle_cash_sys_order_canceled(self, data: dict):
         reason = data.get('cancel_reason')
         if data.get('reroute'):
             _apply_reroute(record, data)
+        elif reason in ('no_wallet', 'cancel_request'):
+            # Full-reversal cancel: zero the debt (value→0 on the accountant ledger),
+            # mark canceled, and notify the customer. Only valid on a pristine main
+            # order — Cash-SYS already enforced that before firing this webhook.
+            _apply_zero_cancel(record, reason)
         else:
+            # Plain cancel (customer / agent): mark canceled only — no ledger touch,
+            # no customer message (unchanged behaviour).
             from qurtoba.models import QurtobaRecord
             QurtobaRecord.objects.filter(pk=record.pk).update(
                 cash_sys_state='canceled', cash_sys_canceled_reason=reason,
@@ -924,6 +967,41 @@ def _apply_reroute(record, data: dict):
     images_sent = _send_done_receipts(record)
     _pause_after_receipts(images_sent)   # let the image land before the «تغيير رقم» ask
     _send_reroute_ask(record, fulfilled, reroute_amount)
+
+
+def _apply_zero_cancel(record, reason):
+    """Full-reversal cancel (no_wallet / cancel_request): the order never moved
+    money, so zero the customer's debt entirely and notify them.
+
+    ORDER MATTERS (same as _apply_reroute): edit the accountant ledger (port 6000)
+    to value 0 FIRST, then save the Genie record — QurtobaRecord.save() →
+    recompute_balance() PULLS the corrected Rest from port 6000, so the customer's
+    balance drops by the full value. A failed accountant edit RAISES so the webhook
+    task retries; we never silently leave the customer charged after telling them
+    «لم يتم تسجيل العمليه عليك»."""
+    from qurtoba.utils_sync import edit_qurtoba_record_value
+
+    # Capture the original value once, for reference / audit.
+    if record.cash_sys_original_value is None:
+        record.cash_sys_original_value = record.value
+
+    if record.qurtoba_record_id:
+        err = edit_qurtoba_record_value(record.qurtoba_record_id, 0)
+        if err:
+            logger.error('[CashSys ZeroCancel] accountant edit→0 failed record=%d qid=%s: %s',
+                         record.pk, record.qurtoba_record_id, err)
+            raise RuntimeError(f'accountant zero-edit failed for qid={record.qurtoba_record_id}: {err}')
+
+    # Settle THIS order at 0 and mark it canceled. save() pulls the corrected Rest.
+    record.value = 0
+    record.cash_sys_state = 'canceled'
+    record.cash_sys_canceled_reason = reason
+    record.save()
+
+    logger.info('[CashSys ZeroCancel] record=%d reason=%s original=%s → value 0',
+                record.pk, reason, record.cash_sys_original_value)
+
+    _send_cancel_notice(record, reason)
 
 
 _RETRY_COUNTDOWNS = [5, 15, 30]  # seconds before retry attempt 2, 3, 4

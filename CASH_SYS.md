@@ -257,6 +257,29 @@ Day 28   ── tombstone runs ─────────►  stage: deleted
 
 ---
 
+## Order Cancellation — reasons & effects
+
+When a Cash-SYS order is canceled it fires an `order_canceled` webhook to Genie carrying
+`cancel_reason` (and `reroute`, which is `true` **only** for `number_limit`). Genie reacts per reason:
+
+| `cancel_reason` | Set by | Ledger effect on Genie | WhatsApp to customer |
+|---|---|---|---|
+| `customer` | customer self-cancel (`me/orders/<id>/cancel/`) | none — marked canceled only | none |
+| `agent` | sub-user / agent (`orders/<id>/cancel/`) | none — marked canceled only | none |
+| `number_limit` | system (recipient hit receive limit) | settle at amount **sent**; reroute the remainder | «الرقم تجاوز الحد… محتاجين رقم تانى» |
+| `no_wallet` *(new)* | agent | **value → 0** (full reversal; Rest drops by the full value) | «محتاجين رقم تانى… الرقم مش عليه محفظة» |
+| `cancel_request` *(new)* | agent | **value → 0** (full reversal) | «تم الغاء التحويل… لم يتم تسجيل العمليه عليك» |
+
+**`no_wallet` and `cancel_request` are restricted to a pristine main order** — a chain root with no
+child orders and no transactions (nothing was sent). Cash-SYS rejects them with **HTTP 400** otherwise
+(`apps/customer/services.py` → `_is_pristine_main_order`, enforced in the `cancel` API action). This
+keeps «لم يتم تسجيل العمليه عليك» truthful: the full debt is zeroed on the accountant ledger
+(port 6000) via `edit_qurtoba_record_value(id, 0)`, then the balance is re-pulled from Qurtoba.
+
+Genie handler: `tasks.py` → `handle_cash_sys_order_canceled` → `_apply_zero_cancel` + `_send_cancel_notice`.
+
+---
+
 ## Smoke Test
 
 ```bash
