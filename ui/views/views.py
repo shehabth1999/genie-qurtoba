@@ -46,6 +46,8 @@ qurtoba_customer_list_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "header": {
             "actions": [
                 {
@@ -96,6 +98,8 @@ qurtoba_customer_form_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "header": {
             "actions_list": [
                 {
@@ -260,6 +264,8 @@ qurtoba_record_list_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "tree": {
             "fields": [
                 {"name": "type",                     "widget": "select",   "string": _("Type"),     "options": _ALL_TYPE_OPTIONS},
@@ -288,6 +294,8 @@ qurtoba_record_form_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "sheet": {
             "title": {
                 "fields": [
@@ -370,6 +378,8 @@ qurtoba_debt_list_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "header": {
             "actions": [
                 {
@@ -409,6 +419,8 @@ qurtoba_debt_form_view = {
     "priority": 5,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "sheet": {
             "title": {
                 "fields": [
@@ -489,6 +501,8 @@ qurtoba_collection_list_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "header": {
             "actions": [
                 {
@@ -528,6 +542,8 @@ qurtoba_collection_form_view = {
     "priority": 5,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "sheet": {
             "title": {
                 "fields": [
@@ -611,6 +627,8 @@ qurtoba_quick_debt_form_view = {
     "priority": 5,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "sheet": {
             "title": {
                 "fields": [
@@ -716,6 +734,8 @@ qurtoba_quick_collection_form_view = {
     "priority": 5,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "sheet": {
             "title": {
                 "fields": [
@@ -788,6 +808,8 @@ qurtoba_quick_transaction_form_view = {
     "priority": 5,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "sheet": {
             "title": {
                 "fields": [

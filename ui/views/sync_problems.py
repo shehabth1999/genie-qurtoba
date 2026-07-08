@@ -36,6 +36,8 @@ qurtoba_sync_problem_list_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "header": {
             "actions": [
                 {
@@ -80,6 +82,8 @@ qurtoba_sync_problem_form_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "header": {
             "actions": [
                 {

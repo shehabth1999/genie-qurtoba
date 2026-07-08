@@ -8,6 +8,9 @@ msgstr ""
 "Language: ar\n"
 "Plural-Forms: nplurals=6; plural=n==0 ? 0 : n==1 ? 1 : n==2 ? 2 : n%100>=3 && n%100<=10 ? 3 : n%100>=11 && n%100<=99 ? 4 : 5;\n"
 
+msgid "AI Consumed At"
+msgstr "وقت استهلاك الذكاء الاصطناعي"
+
 msgctxt "ui/views/pending.py"
 msgid "Account #"
 msgstr "رقم الحساب"
@@ -132,6 +135,9 @@ msgctxt "ui/views/sync_problems.py"
 msgid "ID"
 msgstr "المعرف"
 
+msgid "Ingest Seq"
+msgstr "تسلسل الاستقبال"
+
 msgctxt "ui/views/views.py"
 msgid "Is Payment"
 msgstr "سداد"
@@ -222,6 +228,9 @@ msgctxt "ui/views/views.py"
 msgid "Qurtoba Customers"
 msgstr "عملاء قرطبة"
 
+msgid "Qurtoba Record"
+msgstr "سجل قرطبة"
+
 msgctxt "ui/views/views.py"
 msgid "Qurtoba Records"
 msgstr "سجلات قرطبة"
@@ -277,6 +286,9 @@ msgctxt "ui/views/pending.py"
 msgid "Screenshot"
 msgstr "لقطة الشاشة"
 
+msgid "Set when the AI created a Qurtoba transaction from this message."
+msgstr "يُعيَّن عندما ينشئ الذكاء الاصطناعي معاملة قرطبة من هذه الرسالة."
+
 msgctxt "ui/views/views.py"
 msgid "Shop Kind"
 msgstr "نوع المحل"
@@ -284,6 +296,9 @@ msgstr "نوع المحل"
 msgctxt "ui/views/views.py"
 msgid "Shop Name"
 msgstr "اسم المحل"
+
+msgid "Social Sent At"
+msgstr "وقت الإرسال عبر التواصل الاجتماعي"
 
 msgctxt "ui/views/pending.py"
 msgid "Source Phone"
@@ -646,3 +661,4 @@ msgstr "هذه المحادثة غير مرتبطة بعميل قرطبة"
 msgctxt "ui/views/views.py"
 msgid "وقت الإرسال"
 msgstr "وقت الإرسال"
+

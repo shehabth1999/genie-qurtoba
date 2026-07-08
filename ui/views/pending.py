@@ -5,11 +5,13 @@ Review-queue views for the two pending-approval models:
   - QurtobaPendingPayment     (every سداد — screenshot required)
 
 Each model gets:
-  * a list view — bulk approve/deny from the header, a default "pending" filter
-    (overridable via the search view), and the customer's credit limit + balance
-    inline so the reviewer can judge at a glance;
+  * a list view — a default "pending" filter (overridable via the search view),
+    and the customer's credit limit + balance inline so the reviewer can judge at
+    a glance. Payments keep bulk approve/deny in the list header; transactions do
+    NOT — a transaction must be opened in the form to be approved/denied;
   * a form view — payload fields are EDITABLE (the reviewer can correct a misread
-    amount/number before approving), with a credit-status footer;
+    amount/number before approving), with a credit-status footer. Approve/deny
+    buttons live here;
   * a search view — text search + state filters (so the list is no longer locked
     by a menu domain).
 
@@ -131,13 +133,11 @@ qurtoba_pending_transaction_list_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
-        "header": {
-            "actions": _bulk_actions(
-                "action_approve_pending_transaction",
-                "action_deny_pending_transaction",
-                _("اعتماد"),
-            ),
-        },
+        "creatable": False,
+        "deletable": False,
+        # Approve/deny are intentionally NOT exposed on the list header — reviewing
+        # a transaction requires opening the form (the reviewer must be able to
+        # correct a misread amount/number first). The buttons live on the form view.
         "tree": {
             "default_filter": _PENDING_DEFAULT_FILTER,
             "fields": [
@@ -192,6 +192,8 @@ qurtoba_pending_transaction_form_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "header": {
             "actions": _header_actions(
                 "action_approve_pending_transaction",
@@ -259,6 +261,8 @@ qurtoba_pending_payment_list_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "header": {
             "actions": _bulk_actions(
                 "action_approve_pending_payment",
@@ -322,6 +326,8 @@ qurtoba_pending_payment_form_view = {
     "priority": 10,
     "module": "qurtoba",
     "body": {
+        "creatable": False,
+        "deletable": False,
         "header": {
             "actions": _header_actions(
                 "action_approve_pending_payment",

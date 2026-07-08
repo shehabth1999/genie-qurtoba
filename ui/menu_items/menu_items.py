@@ -108,6 +108,14 @@ menu_dict = {
                         "model": "qurtoba.qurtobapendingtransaction",
                         "view_types": "list,form",
                         "sequence": 1,
+                        # Open the queue pre-filtered on "pending" as an OVERRIDABLE
+                        # default (applied as a removable search tag, not a hard
+                        # domain lock) so reviewers can still switch to approved/
+                        # denied. The value must match a filter `name` in the
+                        # search view (qurtoba_pending_transaction_search_view).
+                        "context": {
+                            "default_filter": "pending",
+                        },
                     },
                     "qurtoba_menu_pending_payments": {
                         "name": "سدادات تطلب تقييم",
