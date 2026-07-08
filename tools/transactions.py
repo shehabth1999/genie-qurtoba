@@ -414,6 +414,7 @@ def _create_one_debt(
     account_input: Optional[str] = None,
     ack_state: Optional[dict] = None,
     consumed_message_ids: Optional[List[str]] = None,
+    confirm_repeat: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a single debt record after validation.
@@ -521,6 +522,35 @@ def _create_one_debt(
                 'success': True, 'duplicate': True, 'pending_review': True,
                 'pending_id': dup_pend.pk, 'type': dup_pend.type,
                 'value': dup_pend.value, 'account_number': dup_pend.account_number,
+            }
+
+    # --- Same-day cash repeat check (B5) ---------------------------------------
+    # B4 above only catches an EXACT re-run of the SAME message (same source_message_id).
+    # It misses the far more common real case: the customer resends the transfer as a
+    # brand-new message (new id) minutes later. That must not be silently re-created NOR
+    # silently dropped — the agent needs a DETERMINISTIC signal, not its own judgment call
+    # (relying on the LLM to "notice" a repeat has failed in practice). Deliberately narrow:
+    # كاش family only (كاش/كاش(10)/كاش(20)/كاش(5) — never فورى/أمان/طاير, per product decision),
+    # same account_number + value, and STRICTLY today's calendar day in local time — a match
+    # from yesterday or earlier must NEVER be flagged, no matter how identical the values are.
+    # Bypassed by confirm_repeat=True: the agent sets this ONLY after the customer explicitly
+    # confirmed «تأكيد تكرار العملية؟» — then this same call proceeds to create for real.
+    if is_cash and final_account and not override_grade_limit and not confirm_repeat:
+        from qurtoba.models import QurtobaRecord
+        from django.utils import timezone as _tz
+        _now_local = _tz.localtime(_tz.now())
+        _day_start = _now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        dup_today = QurtobaRecord.objects.filter(
+            customer=customer, type__startswith='كاش',
+            account_number=final_account, value=amount,
+            created_at__gte=_day_start,
+        ).order_by('-id').first()
+        if dup_today is not None:
+            return {
+                'success': True, 'same_day_duplicate': True,
+                'existing_record_id': dup_today.pk, 'type': dup_today.type,
+                'value': dup_today.value, 'account_number': dup_today.account_number,
+                'created_at': dup_today.created_at.isoformat(),
             }
 
     # We're past all rejection gates — a real record (or a review-pending row) is
@@ -695,6 +725,7 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
     rejected_count = 0
     pending_count = 0
     duplicate_count = 0
+    same_day_duplicate_count = 0
     # One 👍 for the whole batch — fired by the first item that actually creates.
     ack_state = {'sent': False}
 
@@ -725,6 +756,7 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
         # Per-item phone-message id — each transaction quotes ITS OWN number message.
         # Fall back to the batch-level id only when the item didn't supply one.
         item_source_message_id = raw_item.get('source_message_id') or source_message_id
+        item_confirm_repeat = bool(raw_item.get('confirm_repeat', False))
 
         validation = _validate_debt_item(type_, value_, account_)
         if not validation['ok']:
@@ -752,10 +784,27 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
             account_input=account_,
             ack_state=ack_state,
             consumed_message_ids=_consumed_map.get(item_source_message_id),
+            confirm_repeat=item_confirm_repeat,
         )
 
         if outcome.get('success'):
-            if outcome.get('duplicate'):
+            if outcome.get('same_day_duplicate'):
+                # Looks like a repeat of a كاش transfer already created TODAY (B5) — NOT
+                # created. The agent must ask «تأكيد تكرار العملية؟» before retrying this
+                # SAME item with confirm_repeat=true (same source_message_id — no need to
+                # guess a different one).
+                same_day_duplicate_count += 1
+                results.append({
+                    'index': index,
+                    'status': 'same_day_duplicate',
+                    'existing_record_id': outcome.get('existing_record_id'),
+                    'type': outcome.get('type'),
+                    'value': outcome.get('value'),
+                    'account_number': outcome.get('account_number'),
+                    'created_at': outcome.get('created_at'),
+                    'input': {'type': type_, 'value': value_, 'account_number': account_},
+                })
+            elif outcome.get('duplicate'):
                 # Already created from this message on a prior run — idempotent
                 # no-op. Don't re-tally balances (none returned for a duplicate).
                 duplicate_count += 1
@@ -825,6 +874,7 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
         'pending_count': pending_count,
         'rejected_count': rejected_count,
         'duplicate_count': duplicate_count,
+        'same_day_duplicate_count': same_day_duplicate_count,
         'final_balance': final_balance,
         'grade_limit': grade_limit,
         'remaining_credit': remaining_credit,
@@ -883,10 +933,19 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
         '- AUTO-ACK: when the first item begins creating, the tool sends ONE instant 👍 to '
         'the chat itself. So on an all-success batch stay SILENT (do NOT send 👍/text). '
         '- The tool ALWAYS returns a results array, one entry per input item, with '
-        'status one of {created, pending_review, rejected}. The response summary contains '
-        'created_count, pending_count, rejected_count. On success stay silent; '
+        'status one of {created, pending_review, rejected, duplicate, same_day_duplicate}. The '
+        'response summary contains created_count, pending_count, rejected_count, '
+        'duplicate_count, same_day_duplicate_count. On success stay silent; '
         'only mention items whose status is "rejected". Number correction is handled by '
         'the tool itself (it replies the corrected number per created item) — never send it. '
+        '- status="same_day_duplicate" (كاش only): a كاش transfer with this EXACT '
+        'account_number + value was already created TODAY for this customer — NOT created '
+        'this call. Ask the customer «تأكيد تكرار العملية؟» before doing anything else. If '
+        'they confirm, retry passing confirm_repeat=true on that SAME item (same '
+        'source_message_id, no need to change it) to actually create the second transaction. '
+        'NEVER say «تم»/success for this item until a retry actually returns status="created". '
+        'This check is كاش-only and same-calendar-day-only by design — a repeat from an '
+        'earlier day, or any فورى/أمان/طاير repeat, is never flagged here. '
         '- The tool returns final_balance, grade_limit, and remaining_credit after the batch. '
         'WHEN TO USE: '
         '- The customer\'s single message contains multiple amounts/lines (e.g. '
@@ -931,6 +990,15 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
                         },
                         'notes': {
                             'type': ['string', 'null'],
+                        },
+                        'confirm_repeat': {
+                            'type': 'boolean',
+                            'default': False,
+                            'description': 'Set true ONLY when retrying THIS SAME item after '
+                                           'the customer explicitly confirmed a '
+                                           '"same_day_duplicate" result (you asked «تأكيد '
+                                           'تكرار العملية؟» and they said yes). Keep the same '
+                                           'source_message_id — do not invent a different one.',
                         },
                     },
                     'required': ['type', 'value'],
@@ -1274,8 +1342,14 @@ def _status_line_for(record) -> str:
         '1) source_message_id (optional) — if the partner REPLIED TO / quoted a specific '
         'earlier transfer message, pass that message id (UUID, from its "[message_id: <uuid>]" '
         'marker). The tool then reports the exact transaction created from THAT message. '
-        'If you do not pass it (the partner asked generally), the tool reports the customer\'s '
-        'most recent transactions today. '
+        'If you do not pass it (the partner asked generally), the tool reports ONLY the '
+        'customer\'s latest 3 transactions today, REGARDLESS of status (not filtered by '
+        'pending/executed) — this is meant for a vague "وصل؟" with nothing specific to check, '
+        'NOT for "which ones didn\'t go through" / "how many are still pending" / any question '
+        'about a SUBSET of today\'s transactions. For that, use '
+        'qurtoba_get_customer_daily_transactions instead and filter its transactions[] by '
+        '`bucket` yourself — this tool\'s 3-record cap will give an incomplete or misleading '
+        'answer whenever more than 3 records are relevant. '
         'OUTPUT: '
         '- pretty_ar: a single ready-to-send Arabic block. Each line reflects the order '
         'state: "✅ تم التنفيذ عبر الكاش" (cash app executed it fully), "⏳ قيد التنفيذ" / '

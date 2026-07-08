@@ -644,6 +644,7 @@ def _send_cancel_notice(record, reason):
 # creates these.
 SERVICE_FEE_TYPE = 'مصاريف خدمه'
 SERVICE_FEE_THRESHOLD = 60000   # total transferred ≤ this → one fee (highest); above → one per transfer
+SERVICE_FEE_010_CAP = 30        # 010 (Vodafone) recipient, total ≤ threshold → summed fee capped at this
 SERVICE_FEE_MESSAGE = "تم اضافه {x} جنيه مصاريف خدمه\n( الرقم عليه محفظه اخرى غير فودافون كاش )"
 
 
@@ -680,9 +681,11 @@ def _service_fee_plan(briefs, recipient=None):
     to create (each an int, fraction dropped, ≥ 2).
       - floor each fee; keep only ≥ 2 (0/1 and 1.9→1 skipped).
       - recipient number starts with «010» (Vodafone) → one fee = the SUM of all
-        transfers' fees, regardless of the total amount.
-      - otherwise: total transferred ≤ 60,000 → one fee = the highest;
-        else → all (one per transfer).
+        transfers' fees. If total transferred ≤ 60,000, that sum is CAPPED at
+        SERVICE_FEE_010_CAP (30) — e.g. a summed fee of 10,000 is charged as 30.
+        Above 60,000, the sum is charged uncapped.
+      - otherwise (non-010): total transferred ≤ 60,000 → one fee = the highest,
+        uncapped; else → all (one per transfer), uncapped.
     """
     fees = []
     total_transferred = 0.0
@@ -696,9 +699,12 @@ def _service_fee_plan(briefs, recipient=None):
             fees.append(ff)
     if not fees:
         return []
-    # 010 (Vodafone) recipient → charge the sum of every transfer's fee.
+    # 010 (Vodafone) recipient → one fee = the SUM of every transfer's fee.
     if _is_010_number(recipient):
-        return [sum(fees)]
+        total_fee = sum(fees)
+        if total_transferred <= SERVICE_FEE_THRESHOLD:
+            total_fee = min(total_fee, SERVICE_FEE_010_CAP)
+        return [total_fee]
     return [max(fees)] if total_transferred <= SERVICE_FEE_THRESHOLD else fees
 
 
@@ -708,9 +714,12 @@ def _create_service_fees(record):
     static fee note (quoting the request message). Rules:
       - floor each transfer's fee; keep only floored fee ≥ 2 (0/1 — and 1.9→1 — skipped).
       - recipient number starts with «010» (Vodafone) → ONE fee record = the SUM of
-        all transfers' fees, regardless of the total amount.
-      - total transferred ≤ 60,000 → ONE fee record = the highest floored fee.
-      - total transferred > 60,000 → ONE fee record per transfer (not summed).
+        all transfers' fees. Total transferred ≤ 60,000 → that sum is CAPPED at 30
+        (SERVICE_FEE_010_CAP); above 60,000 → the sum is charged uncapped.
+      - non-010 recipient, total transferred ≤ 60,000 → ONE fee record = the highest
+        floored fee, uncapped.
+      - non-010 recipient, total transferred > 60,000 → ONE fee record per transfer
+        (not summed, not capped).
     Idempotent via record.cash_sys_service_fee_done. The fee record is a normal
     Genie debt → pushed to the Qurtoba accountant; it is NOT a cash type so it
     never triggers another Cash-SYS order.

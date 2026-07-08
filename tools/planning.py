@@ -163,6 +163,45 @@ def _same_time_split_mids(events, msg_sent, window_s):
     return flagged
 
 
+def _same_time_overflow_mids(events, msg_sent, window_s, max_tx):
+    """Message ids of same-second SPLIT clusters that carry MORE THAN ``max_tx``
+    reorderable transactions — the hard cap.
+
+    Same shape as ``_same_time_split_mids`` (group the split phone-only / amount-only
+    messages into ≤``window_s``-second clusters), but instead of "is this pairing a
+    guess?" it answers "is this burst too big to pair safely AT ALL?". A cluster's
+    transaction count is the number of positional pairings it forces, i.e.
+    ``min(#phones, #amounts)``. When that exceeds ``max_tx`` every id in the cluster
+    is returned so the caller can withhold the WHOLE burst (process none) and ask the
+    customer to resend cleanly.
+
+    Self-contained pairs (number+amount in ONE message) are ``('pair', …)`` events,
+    never enter ``split_items`` here, and so are never counted or blocked — a customer
+    may send any number of complete pairs in the same second and they all process.
+    Noise messages carry no phone/amount, emit no split event, and never count.
+    """
+    split_items = []  # (kind, mid, sent)
+    for ev in events:
+        if ev[0] in ('phone', 'amount'):
+            sent = msg_sent.get(ev[2])
+            if sent is not None:
+                split_items.append((ev[0], ev[2], sent))
+    split_items.sort(key=lambda s: s[2])
+    overflow = set()
+    i = 0
+    while i < len(split_items):
+        start = split_items[i][2]
+        cluster = []
+        while i < len(split_items) and (split_items[i][2] - start).total_seconds() <= window_s:
+            cluster.append(split_items[i])
+            i += 1
+        n_ph = sum(1 for c in cluster if c[0] == 'phone')
+        n_am = sum(1 for c in cluster if c[0] == 'amount')
+        if min(n_ph, n_am) > max_tx:
+            overflow.update(c[1] for c in cluster)
+    return overflow
+
+
 def _build_events(messages, msg_text):
     """Ordered event stream from a message list. Each event is one of:
     ('pair', phone, amount, mid, amb) | ('phone', phone, mid) |
@@ -326,6 +365,12 @@ def consumed_ids_by_source(conv):
         'number next to its amount. The tool pairs them by position (1st→1st, 2nd→2nd); when '
         'list_pattern is true OR a pair is "low", CONFIRM the matching with the customer before '
         'executing — positional pairing is a reasonable guess, not a certainty. '
+        '- needs_resend (bool) + same_time_overflow (bool) + resend: [{account_number, value}] — '
+        'a HARD tool decision you cannot override. Too many transactions (>4) arrived in the same '
+        'second with numbers/amounts in SEPARATE messages, so their order is unsafe to trust. The '
+        'withheld transactions are NOT in `pairs` — do NOT reconstruct or create them. Relay the '
+        '`note` in your own words: ask the customer to resend each number with its amount in one '
+        'message, max 4 at a time. (Self-contained pairs are never withheld — create those.) '
         'KEY RULES the tool applies for you: names/labels (like "حمدي", "محفظه") are '
         'skipped and never steal an amount; "27.460"→27460 (thousands), "13.75" is a '
         'commission tally (ignored), "20الف"→20000, "الفين"→2000, Arabic digits are handled. '
@@ -441,21 +486,47 @@ def qurtoba_plan_transactions(
     window_s = getattr(_dj, 'AI_SAME_TIME_WINDOW_SEC', 5)
     ambiguous_split_mids = _same_time_split_mids(events, msg_sent, window_s)
 
+    # HARD CAP (deterministic, tool-owned — never the LLM): Meta delivers messages
+    # sent in the same second in an unreliable order. When the number and amount are
+    # in SEPARATE messages, a large same-second burst can't be paired safely at all.
+    # If any same-second split cluster carries MORE THAN `AI_SAME_TIME_MAX_TX` (4)
+    # transactions, withhold the WHOLE cluster — process NONE of it — and ask the
+    # customer to resend cleanly. Self-contained pairs (number+amount in one message)
+    # are not split events, never enter a cluster, and are always processed no matter
+    # how many arrive in the same second.
+    max_tx = getattr(_dj, 'AI_SAME_TIME_MAX_TX', 4)
+    overflow_mids = _same_time_overflow_mids(events, msg_sent, window_s, max_tx)
+    blocked_overflow = bool(overflow_mids)
+
     needs_resend = (getattr(_dj, 'AI_SPLIT_RESEND_GUARD', True)
                     and bool(ambiguous_split_mids)
                     and len(pairs) >= getattr(_dj, 'AI_SPLIT_RESEND_MIN_TX', 5))
-    resend: List[Dict[str, Any]] = []
+
+    # Union of every mid we must withhold: the hard-capped overflow cluster(s) plus
+    # the softer same-second ambiguity set. Withheld pairs are never fed to the bulk
+    # tool; they go into `resend` for the agent to ask the customer to re-send.
+    withhold_mids = set(overflow_mids)
     if needs_resend:
+        withhold_mids |= ambiguous_split_mids
+
+    resend: List[Dict[str, Any]] = []
+    if withhold_mids:
         safe_pairs: List[Dict[str, Any]] = []
         for op, mids in zip(pairs, pair_mids):
-            if mids & ambiguous_split_mids:
+            if mids & withhold_mids:
                 resend.append({'account_number': op['account_number'], 'value': op['value']})
             else:
                 safe_pairs.append(op)
-        pairs = safe_pairs   # the ambiguous ones are withheld — never fed to the bulk tool
+        pairs = safe_pairs   # withheld ones are never fed to the bulk tool
 
     note = 'كل رقم متطابق مع مبلغه.'
-    if needs_resend:
+    if blocked_overflow:
+        note = ('وصلت رسائل كتير في نفس اللحظة (أكتر من 4 تحويلات) والأرقام والمبالغ في رسائل '
+                'منفصلة — ترتيب وصولها عندنا مش مضمون، فمش هننفّذ أي تحويل منها عشان ما يحصلش '
+                'خطأ في مطابقة رقم بمبلغ. اطلب من العميل بصياغتك الطبيعية (مش جملة ثابتة) إنه '
+                'يعيد الإرسال: كل رقم ومبلغه في رسالة واحدة، وبحد أقصى 4 تحويلات في المرة، '
+                'ووضّح له السبب باختصار.')
+    elif needs_resend:
         note = ('رسائل وصلت في نفس اللحظة وفيها أرقام ومبالغ في رسائل منفصلة — ترتيب الوصول '
                 'عندنا ممكن يختلف فلا نضمن أي مبلغ لأي رقم. نفّذ الواضح، واطلب من العميل بصياغتك '
                 'الطبيعية (مش جملة ثابتة) يعيد إرسال دي تحديدًا: كل رقم ومبلغه في رسالة واحدة '
@@ -471,7 +542,8 @@ def qurtoba_plan_transactions(
         'orphans': orphans,
         'ambiguous': ambiguous_out,
         'list_pattern': list_pattern,
-        'needs_resend': needs_resend,
+        'needs_resend': bool(needs_resend or blocked_overflow),
+        'same_time_overflow': blocked_overflow,
         'resend': resend,
         'summary': {
             'pairs_count': len(pairs),
