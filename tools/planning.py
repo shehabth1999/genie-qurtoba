@@ -280,7 +280,6 @@ def consumed_ids_by_source(conv):
         from datetime import timedelta
         from django.conf import settings as _dj
         from django.utils import timezone as _tz
-        from django.db.models import F
         from django.db.models.functions import Coalesce
         from modules.chat.models import Message as _M
         _cut = _tz.now() - timedelta(minutes=getattr(_dj, 'AI_UNPROCESSED_WINDOW_MIN', 6))
@@ -289,7 +288,7 @@ def consumed_ids_by_source(conv):
             .filter(conversation=conv, direction='inbound', active=True, type='text',
                     ai_consumed_at__isnull=True, created_at__gte=_cut)
             .annotate(_ord=Coalesce('social_sent_at', 'created_at'))
-            .order_by('_ord', F('ingest_seq').asc(nulls_last=True))
+            .order_by('_ord', 'id')
         )
         messages, msg_text = [], {}
         for r in rows:
@@ -374,14 +373,13 @@ def qurtoba_plan_transactions(
     # DROP or reorder a line (we caught it omitting a phone number, which orphaned an
     # amount and made the agent ask a nonsense question). When we have the conversation,
     # pull the UNPROCESSED inbound messages straight from the DB in true send order
-    # (social_sent_at + the receipt-time ingest_seq) and use THAT as the authoritative
+    # (social_sent_at, created_at fallback, id tiebreak) and use THAT as the authoritative
     # list. The LLM's array stays only as a fallback when there is no conversation handle.
     if conv is not None:
         try:
             from datetime import timedelta
             from django.conf import settings as _dj
             from django.utils import timezone as _tz
-            from django.db.models import F
             from django.db.models.functions import Coalesce
             from modules.chat.models import Message as _M
             _cut = _tz.now() - timedelta(minutes=getattr(_dj, 'AI_UNPROCESSED_WINDOW_MIN', 6))
@@ -390,7 +388,7 @@ def qurtoba_plan_transactions(
                 .filter(conversation=conv, direction='inbound', active=True, type='text',
                         ai_consumed_at__isnull=True, created_at__gte=_cut)
                 .annotate(_ord=Coalesce('social_sent_at', 'created_at'))
-                .order_by('_ord', F('ingest_seq').asc(nulls_last=True))
+                .order_by('_ord', 'id')
             )
             if _rows:
                 messages = [

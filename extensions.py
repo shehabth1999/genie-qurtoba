@@ -199,20 +199,10 @@ class MessageQurtobaExtension(ModelExtension):
     _inherit = 'chat.message'
     _depends = ['base']
 
-    class Meta:
-        # Composite index backing the true-send-order query for inbound WhatsApp
-        # bursts (qurtoba reads social_sent_at + ingest_seq to order them — see
-        # ConversationQurtobaExtension.template_context_extras and tools/planning.py).
-        # Registered Odoo-style via the extension Meta mechanism and materialized by
-        # sync_schema. The name MUST stay 'chat_msg_conv_sent_seq_idx': the identical
-        # index already exists in the DB (created by the now-removed chat migration
-        # 0027), so keeping the name makes sync_schema a no-op rather than a duplicate.
-        indexes = [
-            models.Index(
-                fields=['conversation_id', 'social_sent_at', 'ingest_seq'],
-                name='chat_msg_conv_sent_seq_idx',
-            ),
-        ]
+    # NOTE: `social_sent_at` and its composite index `chat_msg_conv_sent_seq_idx` now live
+    # on core chat.Message (see modules/chat/models.py + migration 0028). `ingest_seq` was
+    # dropped entirely. This extension no longer owns those — it only adds the AI-consumption
+    # watermark below. The true-send-order query still reads `social_sent_at` (core field).
 
     ai_consumed_at = models.DateTimeField(
         null=True, blank=True, db_index=True,
@@ -227,27 +217,10 @@ class MessageQurtobaExtension(ModelExtension):
         verbose_name=_('Qurtoba Record'),
     )
 
-    # True message-ordering keys for inbound WhatsApp bursts — moved here from
-    # chat.Message (core) so the qurtoba feature owns its own schema. created_at
-    # stays = arrival/insert time (the agent freshness gate uses it); these capture
-    # the provider's real SEND order instead. Written at webhook receipt; read by the
-    # qurtoba planner and the <unprocessed_transactions> block. Null for old rows /
-    # channels without them — ordering then falls back to created_at. The DB columns
-    # already exist (ex-migration 0027), so sync_schema no-ops on them.
-    social_sent_at = models.DateTimeField(
-        null=True, blank=True, db_index=True,
-        verbose_name=_('Social Sent At'),
-        help_text=_("Provider's true send time (e.g. WhatsApp message timestamp, "
-                    "second-granularity). Null when unavailable; ordering falls "
-                    "back to created_at."),
-    )
-    ingest_seq = models.BigIntegerField(
-        null=True, blank=True,
-        verbose_name=_('Ingest Seq'),
-        help_text=_("Monotonic per-conversation sequence captured at webhook receipt, "
-                    "before concurrent task dispatch. Tiebreaker for same-second "
-                    "forwarded bursts."),
-    )
+    # `social_sent_at` (the provider's true send time, used to order inbound WhatsApp bursts)
+    # is now a core chat.Message field — no longer declared here. `ingest_seq` was dropped:
+    # its only purpose was to guess sub-second order, which is unrecoverable, so the planner
+    # clusters same-second messages and asks instead of guessing.
 
     def mark_ai_consumed(self, record=None):
         """Best-effort: flag this message as consumed into `record`.
@@ -463,15 +436,15 @@ class ConversationQurtobaExtension(ModelExtension):
             window_min = getattr(dj_settings, 'AI_UNPROCESSED_WINDOW_MIN', 6)
             cutoff = timezone.now() - timedelta(minutes=window_min)
             # Recency window stays on created_at (arrival-based, correct). The SORT key is
-            # the true send order (social_sent_at + ingest_seq, created_at fallback) so a
-            # forwarded burst reaches the planner in the order the customer actually sent.
+            # the true send order (social_sent_at, created_at fallback), id as a deterministic
+            # tiebreak, so a forwarded burst reaches the planner in the order it was sent.
             rows = list(
                 Message.objects_all
                 .filter(conversation=self, direction='inbound', active=True,
                         type='text', ai_consumed_at__isnull=True,
                         created_at__gte=cutoff)
                 .annotate(_ord=Coalesce('social_sent_at', 'created_at'))
-                .order_by(F('_ord').desc(), F('ingest_seq').desc(nulls_last=True))[:40]
+                .order_by(F('_ord').desc(), F('id').desc())[:40]
             )[::-1]  # back to chronological (true send) order
             lines = []
             for m in rows:
