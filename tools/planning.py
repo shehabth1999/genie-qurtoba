@@ -516,12 +516,13 @@ def consumed_ids_by_source(conv):
         'number next to its amount. The tool pairs them by position (1st→1st, 2nd→2nd); when '
         'list_pattern is true OR a pair is "low", CONFIRM the matching with the customer before '
         'executing — positional pairing is a reasonable guess, not a certainty. '
-        '- needs_resend (bool) + same_time_overflow (bool) + resend: [{account_number, value}] — '
-        'a HARD tool decision you cannot override. Too many transactions (>4) arrived in the same '
-        'second with numbers/amounts in SEPARATE messages, so their order is unsafe to trust. The '
-        'withheld transactions are NOT in `pairs` — do NOT reconstruct or create them. Relay the '
-        '`note` in your own words: ask the customer to resend each number with its amount in one '
-        'message, max 3 at a time. (Self-contained pairs are never withheld — create those.) '
+        '- needs_resend / same_time_overflow (bool) + resend: [{account_number, value}] — a HARD '
+        'tool decision you cannot override, and it fires ONLY for a same-second FLOOD (MORE than 3 '
+        'transactions arrived in the same second with numbers/amounts in SEPARATE messages, order '
+        'unsafe). The withheld ones are NOT in `pairs` — do NOT reconstruct or create them; relay '
+        'the `note` (your own words): resend each number with its amount in one message, max 3 at a '
+        'time. A same-second SPLIT of ≤3 is NOT withheld — those come back as normal `pairs`, '
+        'EXECUTE them (no confirmation). Self-contained pairs are never withheld. '
         '- read_amounts: [{message_id, text}] — messages carrying an amount written in Arabic '
         'WORDS that the tool CANNOT convert to a number (e.g. «خمسين الف», «خمسمائة», «ميتين»). '
         'These usually orphan their phone. YOU can read Arabic number words — so READ the value '
@@ -701,37 +702,29 @@ def qurtoba_plan_transactions(
     overflow_mids = _same_time_overflow_mids(events, msg_sent, window_s, max_tx)
     blocked_overflow = bool(overflow_mids)
 
-    needs_resend = (getattr(_dj, 'AI_SPLIT_RESEND_GUARD', True)
-                    and bool(ambiguous_split_mids)
-                    and len(pairs) >= getattr(_dj, 'AI_SPLIT_RESEND_MIN_TX', 5))
-
-    # Union of every mid we must withhold: the hard-capped overflow cluster(s) plus
-    # the softer same-second ambiguity set. Withheld pairs are never fed to the bulk
-    # tool; they go into `resend` for the agent to ask the customer to re-send.
+    # OWNER DECISION (2026-07-12): a same-second SPLIT cluster of ≤max_tx (3) transactions is
+    # EXECUTED directly — trust the positional pairing, do NOT ask «تأكيد». Only a genuine
+    # same-second FLOOD (> max_tx split) is withheld (overflow). The old soft `needs_resend`
+    # (≥5-pair) guard and the 2–3-tx confirmation are removed: they mostly fired on stale/
+    # mixed bursts and annoyed the customer («ليه بتبعت تاكيد»). Overflow(>3) is the ONLY
+    # same-second gate now; self-contained pairs are never gated.
     withhold_mids = set(overflow_mids)
-    if needs_resend:
-        withhold_mids |= ambiguous_split_mids
 
     resend: List[Dict[str, Any]] = []
-    forced_confirm = False
     safe_pairs: List[Dict[str, Any]] = []
     for op, mids in zip(pairs, pair_mids):
         if mids & withhold_mids:
             resend.append({'account_number': op['account_number'], 'value': op['value']})
             continue
-        # A surviving pair drawn from a same-second SPLIT cluster (≥2 phones AND ≥2 amounts
-        # in the same second) is a POSITIONAL guess whose order Meta can't guarantee — even
-        # for just 2–4 transactions (below the resend cap). Don't create it silently at
-        # 'high': downgrade to 'low' and raise list_pattern so the agent CONFIRMS the
-        # matching first. This closes the same-second amount-swap that slipped through when
-        # the cluster was too small to trip the (≥5-pair) resend guard.
+        # Same-second split within the cap → EXECUTE. Force 'high' so a block-arrival 'low'
+        # from _pair_events doesn't make the agent confirm what the owner wants executed.
         if mids & ambiguous_split_mids:
-            op['confidence'] = 'low'
-            forced_confirm = True
+            op['confidence'] = 'high'
         safe_pairs.append(op)
-    pairs = safe_pairs   # withheld ones are never fed to the bulk tool
-    if forced_confirm:
-        list_pattern = True
+    pairs = safe_pairs   # only overflow(>max_tx) clusters are withheld
+    # list_pattern now reflects only genuine positional guesses NOT covered by the same-second
+    # execute rule (e.g. a cross-second "all numbers then all amounts" block) — never same-second ≤3.
+    list_pattern = any(op.get('confidence') == 'low' for op in pairs)
 
     # --- Amounts written in WORDS the parser can't convert → hand them to the LLM ---------
     # «خمسين الف» (50000), «خمسمائة» (500): the deterministic parser refuses these (it would
@@ -764,11 +757,6 @@ def qurtoba_plan_transactions(
                 'خطأ في مطابقة رقم بمبلغ. اطلب من العميل بصياغتك الطبيعية (مش جملة ثابتة) إنه '
                 'يعيد الإرسال: كل رقم ومبلغه في رسالة واحدة، وبحد أقصى 3 تحويلات في المرة، '
                 'ووضّح له السبب باختصار.')
-    elif needs_resend:
-        note = ('رسائل وصلت في نفس اللحظة وفيها أرقام ومبالغ في رسائل منفصلة — ترتيب الوصول '
-                'عندنا ممكن يختلف فلا نضمن أي مبلغ لأي رقم. نفّذ الواضح، واطلب من العميل بصياغتك '
-                'الطبيعية (مش جملة ثابتة) يعيد إرسال دي تحديدًا: كل رقم ومبلغه في رسالة واحدة '
-                'أو 3 ب 3 منظمة، ووضّح له السبب باختصار.')
     elif orphans:
         note = 'بعض الأرقام أو المبالغ بدون مقابل — اسأل عنها قبل التنفيذ.'
     elif list_pattern:
@@ -798,7 +786,6 @@ def qurtoba_plan_transactions(
             read_amounts=[r['text'] for r in read_amounts] or None,
             list_pattern=list_pattern or None,
             overflow=blocked_overflow or None,
-            needs_resend=bool(needs_resend) or None,
             resend=[{'acc': r['account_number'], 'val': r['value']} for r in resend] or None,
         )
     except Exception:
@@ -810,7 +797,7 @@ def qurtoba_plan_transactions(
         'orphans': orphans,
         'ambiguous': ambiguous_out,
         'list_pattern': list_pattern,
-        'needs_resend': bool(needs_resend or blocked_overflow),
+        'needs_resend': blocked_overflow,
         'same_time_overflow': blocked_overflow,
         'resend': resend,
         'read_amounts': read_amounts,

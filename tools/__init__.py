@@ -16,6 +16,7 @@ from .planning import (
 from .conversation import (
     qurtoba_send_customer_balance_to_chat,
     alert_qurtoba_human,
+    qurtoba_clear_pending_transfers,
 )
 from .reports import (
     qurtoba_get_customer_daily_transactions,
@@ -32,6 +33,7 @@ __all__ = [
     "qurtoba_plan_transactions",
     "qurtoba_send_customer_balance_to_chat",
     "alert_qurtoba_human",
+    "qurtoba_clear_pending_transfers",
     "qurtoba_get_customer_daily_transactions",
     "qurtoba_send_static_message",
 ]

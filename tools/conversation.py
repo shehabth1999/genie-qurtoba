@@ -82,6 +82,49 @@ def qurtoba_send_customer_balance_to_chat(context) -> Dict[str, Any]:
 
 
 @tool(
+    name='qurtoba_clear_pending_transfers',
+    display_name='Clear the pending (uncreated) transfer burst',
+    description=(
+        'Call this ONLY when the customer cancels/aborts a whole transfer burst they were '
+        'still sending and NOTHING has been created yet (a general «الغاء/وقف/كنسل/غلط» that '
+        'means "scrap what I just sent"). It marks the recent still-open inbound messages as '
+        'handled so that aborted numbers/amounts do NOT linger and get re-paired or re-created '
+        'when the customer resends fresh. Do NOT call it for a cancel of ONE specific transfer '
+        'among several (just omit that one and create the rest), nor for an already-executed '
+        'transfer (that needs alert_qurtoba_human). After calling, reply «تم الإيقاف…» as usual.'
+    ),
+    category='qurtoba',
+    requires_auth=True,
+    rate_limit=20,
+)
+def qurtoba_clear_pending_transfers(context) -> Dict[str, Any]:
+    """Watermark the recent unconsumed inbound text messages so an aborted burst can't leak
+    into the next planner run. Best-effort; never raises into the tool flow."""
+    conv = getattr(context, 'conversation', None)
+    if conv is None:
+        return {'success': False, 'error_type': 'no_conversation',
+                'error': 'No active conversation in context.'}
+    try:
+        from datetime import timedelta
+        from django.conf import settings as _dj
+        from django.utils import timezone
+        from modules.chat.models import Message
+        window = getattr(_dj, 'AI_UNPROCESSED_WINDOW_MIN', 6)
+        cutoff = timezone.now() - timedelta(minutes=window)
+        rows = Message.objects_all.filter(
+            conversation=conv, direction='inbound', active=True, type='text',
+            ai_consumed_at__isnull=True, created_at__gte=cutoff,
+        )
+        cleared = 0
+        for m in rows:
+            if m.mark_ai_consumed(None):
+                cleared += 1
+        return {'success': True, 'cleared': cleared}
+    except Exception as e:
+        return {'success': False, 'error_type': 'clear_failed', 'error': str(e)}
+
+
+@tool(
     name='alert_qurtoba_human',
     display_name='Alert Qurtoba Human (push only)',
     description=(

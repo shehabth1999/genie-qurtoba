@@ -453,7 +453,17 @@ class ConversationQurtobaExtension(ModelExtension):
                 if not txt:
                     continue
                 lines.append(f"[message_id: {m.id}] {' '.join(str(txt).split())}")
-            return {'unprocessed_transactions': '\n'.join(lines)}
+            if not lines:
+                return {'unprocessed_transactions': ''}
+            # Loud, deterministic priority flag emitted EVERY run there are still-open
+            # inbound lines. In a long, system-message-heavy chat the model has drifted and
+            # answered an OLD courtesy/blessing while a fresh transaction burst sat unhandled
+            # (replied «العفو» to «الله ينور» and ignored the numbers). These lines are the
+            # customer's CURRENT request and outrank any greeting/thanks/blessing in history.
+            header = ('⚠️ رسائل العميل دي لسه متعالجتش وهي طلبه الحالي — عالِجها الأول '
+                      '(شغّل الـplanner/التحويلات) قبل أي رد اجتماعي، ومتردّش على تحية/دعاء '
+                      'قديم بدل ما تعالجها:')
+            return {'unprocessed_transactions': header + '\n' + '\n'.join(lines)}
         except Exception:
             return {'unprocessed_transactions': ''}
 

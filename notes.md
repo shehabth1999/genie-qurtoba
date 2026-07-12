@@ -6,6 +6,36 @@ Newest entry on top.
 
 ---
 
+## 2026-07-12 — same-second split ≤3 EXECUTES (no confirm) + cancel-clear tool + per-conv summary opt-out
+
+Three changes from testing conv 13f58d64 (owner decision via AskUserQuestion + requests):
+
+1. **Same-second SPLIT of ≤3 → EXECUTE, no «تأكيد»** (owner chose "Execute up to 3, no confirm"). Removed F4's
+   forced-confirm and the old `needs_resend` (≥5-pair) soft guard. Now the ONLY same-second gate is overflow
+   (>`AI_SAME_TIME_MAX_TX`=3 split → withhold/resend). Surviving same-second split pairs are forced to 'high';
+   `list_pattern` now reflects only a genuine cross-second block-list guess. planning.py + tool description + note
+   updated. Verified: the 13:51 burst (2 split same-sec + 1 self) → 3 high pairs no confirm; 4-split flood → still blocked.
+   TRADE-OFF (owner-accepted): a scrambled same-second delivery of ≤3 could mis-pair; they chose speed over the confirm.
+
+2. **`qurtoba_clear_pending_transfers` tool** (tools/conversation.py, tool_id 33, added to all 4 agents' selected_tools).
+   ROOT CAUSE it fixes: on a GENERAL cancel («الغاؤ») the AI said «تم الإيقاف» but the cancelled messages were NEVER
+   watermarked → they lingered in the 6-min window and merged with the resent burst → duplicate pairs + spurious resend
+   («resend 01038413738 مع 33750»). Now the cancellation shared role calls this tool to `mark_ai_consumed(None)` the
+   recent open inbound so an aborted burst can't be re-paired/re-created. Wired into core.md CANCELLATION (general
+   whole-burst-not-created case only; NOT one-of-several or already-executed). Needed `./fu.sh` to register the tool.
+
+3. **Summarization DISABLED SYSTEM-WIDE** (owner: "never make summary on this system, all conversations"). Added
+   `settings.AI_SUMMARIZATION_ENABLED` (default **False**). `summarize_conversation` returns False globally when off
+   (no new summaries), AND `get_conversation_history_as_langchain` ignores any EXISTING summary when off (so no stale
+   summary can bias a turn) — every AI turn now works off raw recent history (~25 msgs) only. The per-conversation
+   `AI_SUMMARY_EXCLUDE_CONVERSATIONS` remains but is empty/moot while the global switch governs. Verified summarize→False
+   for multiple conversations. Re-enable with env `AI_SUMMARIZATION_ENABLED=true`.
+
+Also noticed (model-adherence, not fixed here): the AI typed «تم تسجيل 2875 على 01095562656» — a Law-4 break (success
+should be silent ∅). Left as prompt-adherence; flag if it recurs.
+
+---
+
 ## 2026-07-12 — BUG: agent asked confirmation on 11 CLEAN self-contained pairs (conv 13f58d64)
 
 **Symptom:** customer sent 11 messages, each a clean self-contained «رقم\nمبلغ\nاسم\nطهN.NN» pair. Agent replied
@@ -42,6 +72,58 @@ now drops these non-amount numbers deterministically before pairing:
   11 pairs / 0 orphans; the d8bc5e42 name-laden battery (7915/1380/1360/10960/27200/2350/7125/12280) all still extract.
   SAFE DEGRADATION: even an unseen noise pattern that slips through becomes an ORPHAN (the agent asks one question) or is
   re-validated at create — it can never silently become a WRONG transaction.
+
+---
+
+## 2026-07-12 — ROOT CAUSE of over-confirmation: STALE conversation SUMMARY froze the old broken state
+
+**Owner's hunch was right.** The AI kept asking «تأكيد» on clean small bursts (and drifted to old context) because
+`Conversation.summary` was STALE. It was last generated 2026-07-10 09:29 — DURING the old max-4 refusal loop — and
+literally said «طلب النظام … بحد أقصى 4 تحويلات», «الرسائل … غير منظمة», «العناصر المعلقة: توضيح قصد الغاء … أم تأكيدها؟».
+`get_conversation_history_as_langchain(use_summary=True)` prepends «Previous conversation summary: …» to EVERY run, so
+that frozen "messy / must reorganize / pending confirm" narrative primed the model to keep confirming — even though the
+live planner returned clean high pairs (`list_pattern:None`). Summaries are CUMULATIVE (`summarize_conversation` carries
+the previous summary forward), so a transient broken state gets replayed forever.
+
+**Fixes (3):**
+1. Cleared conv 13f58d64's stale summary (summary=None, last_summarized_at=None) → next run rebuilds fresh.
+2. `_shared/core.md`: new 🔴 «SOURCE-OF-TRUTH ORDER — live context BEATS the summary» — the summary is stale-able
+   background; truth = `<unprocessed_transactions>` + newest messages judged fresh; never carry a «توضيح/مخلوط/تأكيد/
+   بحد أقصى N» state out of the summary onto a burst that's clean today; clean high pairs → EXECUTE.
+3. `modules/aistudio/utils/omni_channel_utils.py SUMMARY_SYSTEM_PROMPT` (CORE, all channels): added anti-stale rules —
+   reflect the CURRENT state, DROP resolved/superseded pending items, record concrete OUTCOMES as facts, never imply the
+   user still needs to clarify/confirm something already done. Additive/generic; sales use case unaffected.
+
+Deployed (core.md + extensions restart + core summary prompt). Debug log confirmed the تأكيد came from the model
+(summary bias), NOT the planner (list_pattern:None). Also gave the owner a set of new prompt-engineering rules
+(source-of-truth hierarchy, pre-send self-check, confirmation budget, state-reset, «؟»=missed-reply, cite-the-message).
+
+**Symptom:** customer sent a fresh burst (20250 / 01026385757 / 01108873410 / 9450); AI replied «العفو، تحت أمرك»
+(a "you're welcome" for the OLD «الله ينور» from an hour earlier), did NOT process the transactions, and then never
+answered the follow-up «؟».
+
+**Evidence (DB + ~/qurtoba_agent.log + LangGraph checkpoint):** planner/create NEVER fired for that burst (unconsumed);
+`<unprocessed_transactions>` (6-min window) DID contain the 4 messages, so the model RECEIVED them but drifted;
+LangGraph checkpoint = `current_agent:cash_agent`, `step:1332` — an ENORMOUS chat saturated with cash-app system
+outbound («محتاجين رقم تانى» ×15+, «تم الغاء التحويل»). So: a MODEL-FOCUS failure (answered stale courtesy, ignored the
+live request) driven by context bloat — NOT a tool bug (the burst pairs fine; the chat self-healed at 13:20).
+
+**Fixes (2, deterministic-ish nudges — the tools themselves were already correct):**
+1. `extensions.py template_context_extras`: when `<unprocessed_transactions>` is non-empty it now LEADS with a loud
+   Arabic directive («رسائل العميل دي لسه متعالجتش وهي طلبه الحالي — عالِجها الأول … ومتردّش على تحية/دعاء قديم»). Emitted
+   every run there are open lines, so the model can't drift onto old courtesy.
+2. `_shared/core.md` THINKING: new 🔴 law «ANSWER THE CURRENT REQUEST, NEVER AN OLD MESSAGE» — if the unprocessed block
+   has any phone/amount, process it this turn; never reply «العفو» to a customer who just sent numbers; a bare
+   «؟»/«فين» while transactions are unprocessed = "where's my reply?" → act, never stay silent. Long system-message
+   history is NOISE.
+
+**LIMIT (honest):** this is model behaviour in a 1300-step chat; the nudges make drift far less likely but aren't a
+100% guarantee. If it recurs, the next lever is reducing history noise (collapse repeated «محتاجين رقم تانى»/«تم الغاء»
+system outbound before feeding history to the model). Deployed (extensions.py + core.md restart).
+
+⚠️ PROCESS NOTE: while testing I created+deleted a throwaway inbound Message in the REAL conv to check the header —
+this is FORBIDDEN (can trigger the live AI). No harm this time (no reply sent, accumulator cleared), but NEVER create
+messages in the owner's real chat; test the context builder on data/mocks only. [[qurtoba-testing-workflow]]
 
 ---
 
