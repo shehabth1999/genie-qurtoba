@@ -25,11 +25,10 @@ from modules.aistudio.tools import tool
         'UI). It is the same action as the "فحص الرصيد" button in the conversation panel. '
         'No inputs are required — the customer is resolved automatically from the active '
         'conversation. '
-        'The message contains: customer name, outstanding debt (مديونيات), credit limit '
-        '(الحد الائتماني = grade × 1000), and either the remaining credit (المتاح) or the '
-        'over-limit amount (تجاوز). '
-        'Returns success=True with the customer name, balance, grade_limit, and remaining '
-        'credit. '
+        'The message shows ONLY the outstanding balance/debt — «عليك X جنيه» (owes) / «ليك X '
+        'جنيه» (in credit) / «مفيش مديونية» (nothing owed). It does NOT show the grade, credit '
+        'limit, remaining credit, or any over-limit amount (those are internal — see Law 6). '
+        'Returns success=True with the customer name and balance only. '
         'Do NOT call this tool if the customer is only asking a question that does not '
         'require their balance to be shown. '
         'Do NOT call this tool more than once per request — the message is sent to the '
@@ -70,18 +69,13 @@ def qurtoba_send_customer_balance_to_chat(context) -> Dict[str, Any]:
             'error_type': 'send_failed',
         }
 
-    balance = customer.balance or 0
-    grade_limit = (customer.grade or 0) * 1000
-    remaining = grade_limit - balance if grade_limit else None
-
+    # Return ONLY the balance. grade_limit / remaining / over_limit are internal (Law 6 —
+    # never revealed to the partner), so they are deliberately NOT handed to the model.
     return {
         'success': True,
         'customer_id': customer.pk,
         'customer_name': customer.name,
-        'balance': balance,
-        'grade_limit': grade_limit,
-        'remaining_credit': remaining,
-        'over_limit': remaining is not None and remaining < 0,
+        'balance': customer.balance or 0,
         'conversation_id': conv.pk,
         'note': 'Balance message dispatched to the chat (WhatsApp/Messenger delivery + WebSocket push).',
     }

@@ -377,8 +377,16 @@ def _validate_debt_item(
     if not norm['ok']:
         return {'ok': False, 'error_type': 'invalid_value', 'error': 'المبلغ يجب أن يكون رقم موجب.'}
     amount = norm['value']
-    if amount <= 0:
-        return {'ok': False, 'error_type': 'invalid_value', 'error': 'المبلغ يجب أن يكون أكبر من صفر.'}
+    # Egypt has NO fractional amounts and the minimum transfer is 1 EGP. The planner
+    # already drops non-integers, but the LLM can call create DIRECTLY with a value it
+    # misread off a receipt/tally (13.75, 0.5) or a non-finite number — reject those
+    # here so a fractional / NaN / sub-1 amount can never become a real transfer.
+    import math as _math
+    if not _math.isfinite(amount) or amount != int(amount):
+        return {'ok': False, 'error_type': 'invalid_value',
+                'error': 'المبلغ لازم يكون رقم صحيح بدون كسور.'}
+    if amount < 1:
+        return {'ok': False, 'error_type': 'invalid_value', 'error': 'أقل مبلغ للتحويل جنيه واحد.'}
 
     is_cash = type in CASH_TYPES
     # Promote any cash variant to the correct bracket based on amount
@@ -636,6 +644,12 @@ def _create_one_debt(
         if src else
         f'qurtoba:txn:claim:{conversation_uuid}:{final_account}:{amount:.2f}:{type}'
     )
+    # A human-CONFIRMED repeat («تأكيد تكرار العملية؟» → yes) is a deliberate second
+    # transaction. Give it a distinct claim so it can't be swallowed by the FIRST create's
+    # still-live 900 s in-flight lock (the src-less path shares one key) — otherwise the
+    # confirmed repeat silently returns duplicate_in_flight and never creates.
+    if confirm_repeat:
+        claim_key += ':cr'
     if not cache.add(claim_key, 1, 900):
         return {
             'success': True, 'duplicate': True, 'record_id': None,
@@ -865,6 +879,29 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
     grade_limit = (customer.grade or 0) * 1000
     remaining_credit = grade_limit - final_balance if grade_limit else None
 
+    # Debug log — one line per create batch: exactly what committed vs. was blocked, so a
+    # «تم بدون عملية» / duplicate / wrong-value report can be traced to the tool decision.
+    try:
+        from qurtoba.tools._debuglog import log_event
+        log_event(
+            'create', conversation=conv, customer=customer,
+            n=len(items),
+            created=created_count or None,
+            pending=pending_count or None,
+            rejected=rejected_count or None,
+            dup=duplicate_count or None,
+            same_day_dup=same_day_duplicate_count or None,
+            balance=final_balance,
+            items=[{'st': r.get('status'),
+                    'acc': r.get('account_number') or (r.get('input') or {}).get('account_number'),
+                    'val': r.get('value') or (r.get('input') or {}).get('value'),
+                    'rid': r.get('record_id') or r.get('pending_id') or r.get('existing_record_id'),
+                    'err': r.get('error_type')}
+                   for r in results] or None,
+        )
+    except Exception:
+        pass
+
     return {
         'success': True,
         'customer_id': customer.pk,
@@ -952,7 +989,27 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
         '"01000000001 5000 / 01000000002 3000"). Parse all lines and pass them as one array. '
         '- Do NOT call this tool multiple times for the same set of transactions; one call '
         'handles the whole batch atomically per-item. '
-        '- For a SINGLE transaction, call this same tool with a one-item array.'
+        '- For a SINGLE transaction, call this same tool with a one-item array. '
+        'VALUE — pass a plain positive NUMBER (int), never words/currency/separators: '
+        '"خمسين الف"→pass 50000, "خمسمائة"→500, "ميتين"→200, "ألفين"→2000, "خمسة آلاف"→5000, '
+        '"20الف"→20000, "27.460"/"27,460"→27460, "٥٠٠٠"→5000. You (the model) read Arabic number '
+        'words and separators yourself and pass the resulting integer — the tool does NOT parse '
+        'words, and a spelled amount handed in raw will be rejected. Egypt has NO fractions: '
+        'never send a decimal amount (13.75 is a commission tally, not a transfer). '
+        'WORKED EXAMPLES: '
+        '(1) single: customer «01025294594 3000 كاش» → transactions=[{type:"كاش", value:3000, '
+        'account_number:"01025294594", source_message_id: that msg id}]. '
+        '(2) bulk from a planner burst: planner returned 3 pairs → pass all 3 in ONE array, each '
+        'with ITS OWN source_message_id (the phone message), one call, one 👍. '
+        '(3) spelled amount from read_amounts: «01019525475» + «خمسين الف» → you read 50000 → '
+        'transactions=[{type:"كاش", value:50000, account_number:"01019525475", source_message_id: '
+        'the phone msg id}]. '
+        '(4) reroute/no-wallet: system said «محتاجين رقم تانى», customer sends a new number → pass '
+        'the SAME known amount + the new number as a fresh one-item array. '
+        'RESULT STATUSES per item: created (done), pending_review (over-limit → treat as success, '
+        'stay silent), rejected (state the real reason), duplicate / same_day_duplicate (a كاش '
+        'match already exists today → ask «تأكيد تكرار العملية؟», then retry that item with '
+        'confirm_repeat=true). NEVER say «تم» until an item actually returns status "created".'
     ),
     category='qurtoba',
     requires_auth=True,
@@ -1039,10 +1096,14 @@ def qurtoba_create_new_transactions_bulk(
     # The LLM builds this `transactions` list from the messages and can silently DROP one
     # (caught it omitting 01031170652←1360 → that transfer just vanished, no error). Scan the
     # RECENT unconsumed inbound messages that each contain exactly ONE number + ONE amount —
-    # those are UNAMBIGUOUS, so requiring them is always safe (no positional guessing, no
-    # stale-burst pollution). If any such pair is missing from the LLM's list, reject and NAME
-    # it so the LLM retries with the complete list. Only fires when something is missing;
-    # skipped on admin override (single-item approval path).
+    # those are UNAMBIGUOUS. If any such pair is missing from the LLM's list, surface it in
+    # `possibly_missing` — but DO NOT block the batch. A hard reject here recreated cancelled
+    # money (the LLM re-adds the pair the customer just cancelled) and silently dropped valid
+    # ops (a legitimate subset — cancel / same-day-duplicate hold — got the whole call rejected).
+    # Non-fatal: create what was provided; the agent reconciles `possibly_missing` (add a truly
+    # dropped pair; ignore one it intentionally omitted for cancel/duplicate). Skipped on admin
+    # override (single-item approval path).
+    _possibly_missing: List[Dict[str, Any]] = []
     if not override_grade_limit and conv is not None:
         try:
             from datetime import timedelta as _td
@@ -1077,20 +1138,18 @@ def qurtoba_create_new_transactions_bulk(
             for k, cnt in expected.items():
                 for _ in range(max(0, cnt - provided.get(k, 0))):
                     missing.append({'account_number': k[0], 'value': k[1]})
-            if missing:
-                _names = '، '.join(f"{m['account_number']}←{int(m['value'])}" for m in missing)
-                return {
-                    'success': False,
-                    'error_type': 'incomplete_list',
-                    'missing': missing,
-                    'error': ('القائمة ناقصة — الأرقام دي ليها رقم ومبلغ في نفس الرسالة لكنها مش في '
-                              f'طلبك: {_names}. أعِد إرسال bulk بكل المعاملات مرة واحدة.'),
-                }
+            _possibly_missing = missing
         except Exception:
             logger.warning('bulk completeness check failed; proceeding without it', exc_info=True)
     # --------------------------------------------------------------------------
 
-    return _create_debts_batch(conv, customer, transactions, override_grade_limit, source_message_id)
+    result = _create_debts_batch(conv, customer, transactions, override_grade_limit, source_message_id)
+    # Non-fatal completeness signal: surface any recent self-contained pair the LLM's array
+    # dropped, WITHOUT blocking the created ops. INTERNAL — the agent decides whether to add
+    # a genuinely-dropped pair or ignore one it intentionally left out; never shown verbatim.
+    if _possibly_missing and isinstance(result, dict):
+        result['possibly_missing'] = _possibly_missing
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1133,8 +1192,12 @@ def qurtoba_create_new_transactions_bulk(
         'Attachment.from_chat_attachment (reuses the same file, no re-download). '
         '- It creates one QurtobaPendingPayment row with state="pending" and notifies all '
         'active users. The customer balance does NOT change yet. '
-        '- Returns success=True, pending_review=True, pending_id=<int>. Treat exactly like '
-        'any success — reply 👍. The customer will be informed when an admin approves. '
+        '- Returns success=True, pending_review=True, pending_id=<int>. IMPORTANT: this tool '
+        'does NOT auto-send any acknowledgement (unlike the transfer-create tool). So after a '
+        'successful registration you MUST send a SHORT confirmation yourself (e.g. «وصلني '
+        'الإيصال، تحت المراجعة») — do NOT stay silent, or the customer sees nothing and re-sends. '
+        'May also return duplicate=True (an identical payment is already pending review today) — '
+        'reply that it is already under review; do not treat it as a new one. '
         '- Rejections: error_type one of {invalid_type, invalid_value, invalid_account_number, '
         'missing_confirmation, screenshot_required, screenshot_invalid}. screenshot_required = '
         'no screenshot message id; screenshot_invalid = the id does not exist / is not from '
@@ -1244,6 +1307,30 @@ def qurtoba_register_customer_payment(
             'error_type': 'screenshot_invalid',
             'error': f'تعذّر ربط صورة الإيصال: {exc}',
         }
+
+    # --- Idempotency: same receipt registered twice in quick succession -------
+    # Payment registration is silent (no auto-👍) and admin-reviewed, so a customer who
+    # sees no immediate reply often RE-SENDS the receipt within a minute → a duplicate
+    # review row. Dedupe only a RECENT (≤5 min) identical pending payment — deliberately
+    # NOT all day, so a genuine second same-value payment later in the day is NOT blocked.
+    try:
+        from datetime import timedelta as _td2
+        from qurtoba.models import QurtobaPendingPayment as _QPP
+        from django.utils import timezone as _tz2
+        _recent = _tz2.now() - _td2(minutes=5)
+        _dup_pay = _QPP.objects.filter(
+            customer=customer, type=type, value=amount, account_number=final_account,
+            review_state='pending', created_at__gte=_recent,
+        ).order_by('-id').first()
+        if _dup_pay is not None:
+            return {
+                'success': True, 'duplicate': True, 'pending_review': True,
+                'pending_id': _dup_pay.pk, 'type': _dup_pay.type, 'value': _dup_pay.value,
+                'account_number': _dup_pay.account_number,
+                'note': 'سبق تسجيل نفس السداد وهو تحت المراجعة بالفعل.',
+            }
+    except Exception:
+        logger.warning('qurtoba payment duplicate-check failed; proceeding', exc_info=True)
 
     # --- Create the PendingPayment row + notify ---
     audit_notes = f'[AI سداد] confirmation: {confirmation[:240]}'

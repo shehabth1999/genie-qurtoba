@@ -8,6 +8,7 @@ auditable so the create path and the planning tool agree on one number.
 
 Public API: ``normalize_amount(raw) -> {ok, value, ambiguous, reason, raw}``.
 """
+import math
 import re
 from typing import Any, Dict
 
@@ -71,6 +72,11 @@ def normalize_amount(raw: Any) -> Dict[str, Any]:
     # Common case: the LLM already passed a clean number.
     if isinstance(raw, (int, float)):
         v = float(raw)
+        # Reject NaN/Inf: `nan <= 0` is False, so without this a non-finite value
+        # would sail through every downstream guard and become a garbage amount.
+        if not math.isfinite(v):
+            out['reason'] = 'not_finite'
+            return out
         if v <= 0:
             out['reason'] = 'non_positive'
             return out
@@ -83,6 +89,13 @@ def normalize_amount(raw: Any) -> Dict[str, Any]:
     s = _arabic_normalize(_ar_to_ascii(raw)).strip().lower()
     if not s:
         out['reason'] = 'empty'
+        return out
+
+    # A minus glued to a digit ("-500", "1-6") is never a valid transfer amount —
+    # the later `[^0-9.,]`→space strip would silently swallow the sign and turn
+    # "-500" into 500. Refuse up front.
+    if re.search(r'-\s*\d', s):
+        out['reason'] = 'negative'
         return out
 
     # --- Word multipliers (token-based, spelling-robust) ---
@@ -124,8 +137,16 @@ def normalize_amount(raw: Any) -> Dict[str, Any]:
     s2 = re.sub(r'[^0-9.,]+', ' ', s).strip()
     tokens = s2.split()
     if not tokens:
-        # No digits at all: a standalone multiplier word still carries a value
-        # (الف → 1000, الفين → 2000, مليون → 1,000,000).
+        # No digits at all. A standalone multiplier word carries a value
+        # (الف → 1000, الفين → 2000, مليون → 1,000,000) — BUT only when nothing else
+        # meaningful preceded it. If a SPELLED count word we can't parse is still here
+        # («خمسين الف» = 50,000, but «خمسين» is unreadable to us), returning the bare
+        # multiplier (1000) would be a catastrophic wrong amount (50× under-charge).
+        # Refuse instead → the value is unknown; the caller treats it as no-amount
+        # (orphan → the agent, who CAN read Arabic number words, asks/handles it).
+        if re.search(r'[^\W\d_]', s):   # any leftover letter = an unparsed spelled count
+            out['reason'] = 'spelled_count_unknown'
+            return out
         if implied is not None:
             out.update(ok=True, value=float(implied))
             return out
@@ -167,9 +188,22 @@ def normalize_amount(raw: Any) -> Dict[str, Any]:
                 tok = tok.replace(sep, '')        # 0 or >3 trailing → strip
 
     try:
-        value = float(tok) * multiplier
+        count = float(tok)
     except ValueError:
         out['reason'] = 'parse_failed'
+        return out
+    # Redundant multiplier word: a fully-written count that is ALREADY ≥ the
+    # multiplier's magnitude means the word just restates the unit, it does NOT
+    # scale again. «٢٧٠٠٠ ألف» = 27000 (NOT 27,000,000); «1000 الف» = 1000. Only a
+    # SMALL count scales: «27 ألف» = 27000, «500 ألف» = 500000. This is the documented
+    # business rule (core.md: «ألف» never means million) and the fix for a live 1000×
+    # over-charge the deterministic planner could commit straight to create.
+    if multiplier > 1 and count >= multiplier:
+        value = count
+    else:
+        value = count * multiplier
+    if not math.isfinite(value):
+        out['reason'] = 'not_finite'
         return out
     if value <= 0:
         out['reason'] = 'non_positive'

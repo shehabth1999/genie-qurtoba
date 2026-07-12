@@ -12,7 +12,7 @@ from modules.aistudio.tools import tool
 
 # Default message — out-of-working-hours notice.
 DEFAULT_STATIC_MESSAGE = (
-    'لا يمكنني خدمتك الان خارج ساعات العمل من الساعة 11.45 للساعة للساعة 9 صباحا'
+    'خارج مواعيد العمل حالياً. ساعات العمل من 9 صباحاً حتى 11:50 مساءً — تحت أمرك في أي وقت خلالها.'
 )
 
 
