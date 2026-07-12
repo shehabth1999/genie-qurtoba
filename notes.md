@@ -6,6 +6,28 @@ Newest entry on top.
 
 ---
 
+## 2026-07-12 — FEATURE: 👍 reaction on each phone-number message when its transfer is created
+
+Owner request: keep the batch 👍 text ack as-is, AND additionally react 👍 directly on the customer's phone-number
+message when its transaction is really CREATED. New helper `_react_created_on_source(conversation, source_message_id,
+'👍')` in transactions.py: looks up the source message's WhatsApp id (`Message.social_id`/wamid) + the customer phone
+(`partner.phone`) and calls `account.service.send_reaction(phone, wamid, '👍')` (the proven outbound path — same as
+whatsapp/tasks.py:219). Also records a `MessageReaction` (direction='outbound', system partner) so the internal chat UI
+shows it, and stores the reaction's returned wamid. Wired into `_create_one_debt` right after the watermark block — the
+create path AND the pending-review path — but with DIFFERENT shades so the team can tell them apart at a glance:
+  - genuine CREATE → normal 👍 (U+1F44D)
+  - PENDING (over-limit → review) → DARK 👍🏿 (U+1F44D U+1F3FF, dark skin tone)
+  - rejected / same_day_duplicate / duplicate → no reaction (they return before the ack, consistent with the 👍 text).
+Best-effort: no-ops if the source msg has no social_id or the service lacks send_reaction; never raises into the create
+flow. Verified attribute paths live (partner.phone ✓, service.send_reaction ✓, inbound social_id=wamid ✓) and the dark
+modifier is present in the pending emoji. Deployed (restart).
+
+Also fixed today (separate): the OFF-HOURS agent node had a bogus `api_key='Admin123$%'` baked into its config which
+overrode the valid settings key → every off-hours run 401'd (`invalid x-api-key`) → conv d8bc5e42 got no reply. Removed
+the node key so it falls back to the valid `settings.ANTHROPIC_API_KEY` (tested VALID). Applied on the restart above.
+
+---
+
 ## 2026-07-12 — same-second split ≤3 EXECUTES (no confirm) + cancel-clear tool + per-conv summary opt-out
 
 Three changes from testing conv 13f58d64 (owner decision via AskUserQuestion + requests):

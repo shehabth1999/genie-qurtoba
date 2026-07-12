@@ -19,6 +19,49 @@ from qurtoba.tools._amounts import normalize_amount, _ar_to_ascii
 logger = logging.getLogger(__name__)
 
 
+def _react_created_on_source(conversation, source_message_id, emoji='👍') -> None:
+    """React (👍) on the customer's PHONE-NUMBER message once its transfer is really CREATED.
+
+    This is IN ADDITION to the batch 👍 text ack — a per-transaction confirmation reacting
+    directly on the number the customer sent, fired only on a genuine create (never on
+    pending/duplicate/reject). Best-effort: needs the source message's WhatsApp id (social_id)
+    and the account's send service; silently no-ops if either is missing, and never raises
+    into the create flow. Also records the reaction so the internal chat UI shows it."""
+    try:
+        if conversation is None or not source_message_id:
+            return
+        from modules.chat.models import Message as ChatMessage, MessageReaction
+        msg = ChatMessage.objects_all.filter(id=str(source_message_id).strip()).first()
+        wamid = getattr(msg, 'social_id', None) if msg is not None else None
+        if not wamid:
+            return  # no WhatsApp message id → can't react (the batch text 👍 still fires)
+        account = getattr(conversation, 'social_account', None)
+        partner = getattr(conversation, 'social_partner', None)
+        svc = getattr(account, 'service', None) if account is not None else None
+        phone = getattr(partner, 'phone', None) if partner is not None else None
+        if svc is None or not phone or not hasattr(svc, 'send_reaction'):
+            return
+        # Record for the internal chat UI (best-effort), then send to WhatsApp.
+        reaction = None
+        try:
+            from qurtoba.extensions import _get_system_partner
+            reaction, _ = MessageReaction.objects.get_or_create(
+                message=msg, user=_get_system_partner(conversation),
+                emoji=emoji, direction='outbound',
+            )
+        except Exception:
+            pass
+        resp = svc.send_reaction(phone, wamid, emoji)
+        try:
+            rid = resp.get('message_id') if isinstance(resp, dict) else None
+            if reaction is not None and rid:
+                MessageReaction.objects.filter(id=reaction.id).update(social_id=rid)
+        except Exception:
+            pass
+    except Exception:
+        logger.warning('qurtoba: source-message reaction failed', exc_info=True)
+
+
 def _send_start_ack(conversation) -> None:
     """
     Send an instant 👍 to the chat the moment we begin creating a real transaction
@@ -611,6 +654,11 @@ def _create_one_debt(
             # so account_corrected is false there.)
             if account_corrected:
                 _send_account_correction_reply(conversation, social_partner, correction_src_id, final_account)
+            # React on the phone message here TOO, but with a DARK 👍🏿 (dark-skin-tone thumbs up)
+            # instead of the normal 👍 used on a genuine create — so the team can tell at a glance
+            # which numbers went to REVIEW (pending) vs were created outright. Every accepted
+            # transfer still gets a reaction (no bare/missing one), just a different shade.
+            _react_created_on_source(conversation, src, '👍🏿')
             return {
                 'success': True,
                 'pending_review': True,
@@ -692,6 +740,11 @@ def _create_one_debt(
                 _msg.mark_ai_consumed(record)
     except Exception:
         pass
+
+    # React 👍 directly on the customer's phone-number message now that this transfer is
+    # really CREATED (this is the genuine-create path — pending/duplicate/reject returned
+    # earlier and never reach here). This is IN ADDITION to the batch 👍 text ack.
+    _react_created_on_source(conversation, src, '👍')
 
     # Number correction is confirmed by the TOOL itself (never the LLM): when
     # normalization changed the destination number, reply the corrected number —
