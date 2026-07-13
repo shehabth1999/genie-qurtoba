@@ -191,6 +191,80 @@ def _send_to_cash_sys(qurtoba_record_id: int, record_type: str, value, phone_no:
     threading.Thread(target=_post, daemon=True).start()
 
 
+def resend_cash_sys_order(object_id, payload_str=None) -> str | None:
+    """
+    SYNCHRONOUS re-post of a Cash-SYS order — used by the QurtobaSyncProblem
+    foreground retry (UI "resend"). Returns None on success, an error string on
+    failure. Idempotent: Cash-SYS dedupes on external_ref, so a resend of an
+    order that actually reached Cash-SYS never double-creates a transfer.
+
+    payload_str is the stored problem payload (JSON string with external_ref /
+    phone_number / value / order_type). If it's missing or unparsable we rebuild
+    the payload from the live QurtobaRecord (object_id = Genie record pk).
+    """
+    import json
+    from qurtoba.models import QurtobaRecord
+
+    payload = None
+    if payload_str:
+        try:
+            payload = json.loads(payload_str) if isinstance(payload_str, str) else dict(payload_str)
+        except (TypeError, ValueError):
+            payload = None
+
+    # Rebuild from the record when the stored payload is absent/broken.
+    if not isinstance(payload, dict) or not payload.get('order_type'):
+        rec = QurtobaRecord.objects.filter(pk=int(object_id)).first()
+        if not rec:
+            return f'no Genie record for pk={object_id} — cannot resend Cash-SYS order'
+        if rec.type not in _CASH_TYPES:
+            return f'record type {rec.type!r} is not a Cash-SYS (كاش) type — nothing to resend'
+        phone_str = ''.join(filter(str.isdigit, str(rec.account_number or ''))).strip()
+        if phone_str.startswith('01') and len(phone_str) > 11:
+            phone_str = phone_str[:11]
+        payload = {
+            'external_ref': str(rec.qurtoba_record_id or rec.pk),
+            'phone_number': phone_str,
+            'value':        int(rec.value),
+            'order_type':   rec.type,
+        }
+
+    phone_str = ''.join(filter(str.isdigit, str(payload.get('phone_number') or ''))).strip()
+    if phone_str.startswith('01') and len(phone_str) > 11:
+        phone_str = phone_str[:11]
+    if not phone_str.startswith('01') or len(phone_str) != 11:
+        return f'invalid رقم الحساب {payload.get("phone_number")!r} — Cash-SYS will reject'
+    payload['phone_number'] = phone_str
+
+    cs_base  = getattr(settings, 'CASH_SYS_BASE_URL', '').rstrip('/')
+    cs_token = getattr(settings, 'CASH_SYS_TOKEN', '')
+    if not cs_base or not cs_token:
+        return 'CASH_SYS_BASE_URL / CASH_SYS_TOKEN not configured in Genie'
+
+    hdrs = {'Authorization': f'Token {cs_token}', 'Content-Type': 'application/json'}
+    url  = f'{cs_base}/api/v1/integration/orders/'
+    last_err = None
+    for attempt, delay in enumerate([0, 5, 15]):
+        if delay:
+            import time as _time
+            _time.sleep(delay)
+        try:
+            resp = requests.post(url, json=payload, headers=hdrs, timeout=10)
+            if resp.ok:
+                logger.info('cash_sys order resent from Genie for ref=%s: id=%s',
+                            payload.get('external_ref'), resp.json().get('id') if resp.content else '')
+                return None
+            last_err = f'HTTP {resp.status_code}: {resp.text[:200]}'
+            if resp.status_code == 400:
+                logger.error('cash_sys resend rejected ref=%s: %s', payload.get('external_ref'), last_err)
+                return last_err
+            logger.warning('cash_sys resend attempt %d %s ref=%s', attempt + 1, last_err, payload.get('external_ref'))
+        except Exception as exc:
+            last_err = str(exc)
+            logger.warning('cash_sys resend attempt %d failed ref=%s: %s', attempt + 1, payload.get('external_ref'), exc)
+    return last_err or 'Cash-SYS resend failed'
+
+
 def edit_qurtoba_record_value(qurtoba_record_id: int, new_value) -> str | None:
     """
     Edit an existing record's value on the Qurtoba accountant server (port 6000).

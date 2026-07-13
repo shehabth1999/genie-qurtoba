@@ -1579,7 +1579,11 @@ class QurtobaSyncProblem(BaseModel):
         ordering = ['-created_at']
 
     OPERATION_CHOICES = [
-        ('push_record', 'Push Record'),
+        ('push_record',             'Push Record'),
+        ('cash_sys_order',          'Cash-SYS Order'),
+        ('cash_sys_order_progress', 'Cash-SYS Order Progress'),
+        ('cash_sys_order_done',     'Cash-SYS Order Done'),
+        ('cash_sys_order_canceled', 'Cash-SYS Order Canceled'),
     ]
     STATUS_CHOICES = [
         ('failed', 'فشل'),
@@ -1699,6 +1703,16 @@ class QurtobaSyncProblem(BaseModel):
                 err = push_record_to_qurtoba(int(self.object_id))
             except Exception as exc:
                 err = str(exc)
+        elif self.operation == 'cash_sys_order':
+            from qurtoba.utils_sync import resend_cash_sys_order
+            try:
+                err = resend_cash_sys_order(self.object_id, self.payload)
+            except Exception as exc:
+                err = str(exc)
+        elif self.operation in ('cash_sys_order_progress', 'cash_sys_order_done', 'cash_sys_order_canceled'):
+            # These originate from an inbound Cash-SYS webhook; re-processing the
+            # stored payload replays the original handler idempotently.
+            err = self._replay_cash_sys_webhook()
         else:
             err = f'Unknown operation: {self.operation}'
 
@@ -1715,6 +1729,37 @@ class QurtobaSyncProblem(BaseModel):
         self.error = err
         self.save(update_fields=['error', 'attempts', 'last_attempt_at'])
         return False, err
+
+    def _replay_cash_sys_webhook(self):
+        """Re-dispatch the original inbound Cash-SYS webhook handler from the
+        stored payload. Returns None (re-dispatched) or an error string. The
+        handler is idempotent and re-records its own problem row if it fails
+        again, so we treat a successful re-dispatch as resolution here."""
+        import json
+        event = self.operation[len('cash_sys_'):]  # e.g. 'order_done'
+        try:
+            data = json.loads(self.payload) if isinstance(self.payload, str) else (self.payload or {})
+        except (TypeError, ValueError):
+            return f'stored payload is not valid JSON — cannot replay {event}'
+        if not isinstance(data, dict) or not data:
+            return f'no payload to replay for {event}'
+        from qurtoba.tasks import (
+            handle_cash_sys_order_progress,
+            handle_cash_sys_order_done,
+            handle_cash_sys_order_canceled,
+        )
+        handler = {
+            'order_progress': handle_cash_sys_order_progress,
+            'order_done':     handle_cash_sys_order_done,
+            'order_canceled': handle_cash_sys_order_canceled,
+        }.get(event)
+        if handler is None:
+            return f'no handler for Cash-SYS event {event!r}'
+        try:
+            handler.delay(dict(data))
+        except Exception as exc:
+            return f'failed to re-dispatch {event}: {exc}'
+        return None
 
     @action
     def action_retry_sync(queryset):

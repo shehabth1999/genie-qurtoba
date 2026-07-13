@@ -473,7 +473,11 @@ def consumed_ids_by_source(conv):
             .filter(conversation=conv, direction='inbound', active=True, type='text',
                     ai_consumed_at__isnull=True, created_at__gte=_cut)
             .annotate(_ord=Coalesce('social_sent_at', 'created_at'))
-            .order_by('_ord', 'id')
+            # WhatsApp's social_sent_at is only SECOND-precision, so a burst that lands in
+            # the same second ties on _ord. Break that tie by created_at (Genie's
+            # microsecond arrival time = true order within the second), and only then by id.
+            # Using id alone scrambled same-second phone/amount pairs → wrong money routing.
+            .order_by('_ord', 'created_at', 'id')
         )
         messages, msg_text, msg_sent = [], {}, {}
         for r in rows:
@@ -501,60 +505,31 @@ def consumed_ids_by_source(conv):
     name='qurtoba_plan_transactions',
     display_name='Plan Burst Transactions (phone↔amount pairing)',
     description=(
-        'READ-ONLY planner. Call this FIRST for any burst of 2+ customer messages that '
-        'look like cash transactions, BEFORE qurtoba_create_new_transactions_bulk. Pass '
-        'the burst messages in time order; the tool pairs each phone number with its '
-        'amount deterministically and returns: '
-        '- pairs: [{account_number, value, type, source_message_id, confidence}] — feed '
-        'these straight into the bulk create tool (source_message_id is already the '
-        'PHONE message id for each). '
-        '- orphans: [{kind, value, message_id}] — a phone with no amount or an amount '
-        'with no phone. Ask ONE short question per orphan; never guess. '
-        '- ambiguous: pairs whose amount had an uncertain `.`/`,` reading — confirm if unsure. '
-        '- list_pattern (bool) + per-pair confidence ("high"/"low"): TRUE when the numbers and '
-        'amounts arrived as TWO SEPARATE LISTS (all numbers, then all amounts) rather than each '
-        'number next to its amount. The tool pairs them by position (1st→1st, 2nd→2nd); when '
-        'list_pattern is true OR a pair is "low", CONFIRM the matching with the customer before '
-        'executing — positional pairing is a reasonable guess, not a certainty. '
-        '- needs_resend / same_time_overflow (bool) + resend: [{account_number, value}] — a HARD '
-        'tool decision you cannot override, and it fires ONLY for a same-second FLOOD (MORE than 3 '
-        'transactions arrived in the same second with numbers/amounts in SEPARATE messages, order '
-        'unsafe). The withheld ones are NOT in `pairs` — do NOT reconstruct or create them; relay '
-        'the `note` (your own words): resend each number with its amount in one message, max 3 at a '
-        'time. A same-second SPLIT of ≤3 is NOT withheld — those come back as normal `pairs`, '
-        'EXECUTE them (no confirmation). Self-contained pairs are never withheld. '
-        '- read_amounts: [{message_id, text}] — messages carrying an amount written in Arabic '
-        'WORDS that the tool CANNOT convert to a number (e.g. «خمسين الف», «خمسمائة», «ميتين»). '
-        'These usually orphan their phone. YOU can read Arabic number words — so READ the value '
-        'yourself and create the op (خمسين الف=50000, خمسمائة=500, ميتين=200, ألفين=2000, خمسة '
-        'آلاف=5000). Do NOT ask the customer for an amount that is already there in words, and do '
-        'NOT trust any stray number the tool guessed for those lines. '
-        'FALLBACK (best — never fail): when a message\'s amount is written in Arabic WORDS, read '
-        'the number yourself and pass it on THAT message as `amount` (e.g. {message_id: "...", '
-        'text: "خمسين الف", amount: 50000}). The tool then uses your number as this message\'s '
-        'value and pairs it normally — no orphan, no read_amounts, no second guess. Only messages '
-        'you did NOT supply an amount for come back in read_amounts. Pass `amount` ONLY for '
-        'spelled/worded values; for normal digits leave it out and let the tool read them. '
-        'KEY RULES the tool applies for you: names/labels (like "حمدي", "محفظه", "الحرمين") are '
-        'skipped and never steal an amount; fee-instruction notes ("لو هيخصم 15 اخصمها") are '
-        'skipped and their number is never an amount; "27.460"→27460 and "1.380"→1380 (a dot/comma '
-        'before 3 digits = thousands), "13.75"/"6.08" are commission tallies (ignored, never an '
-        'amount), "20الف"→20000, "30الف"→30000, "الفين"→2000, Arabic-Indic digits (٥٠٠٠→5000) are '
-        'handled, country codes normalize ("+20 12 7318 1841"→01273181841). '
-        'WORKED EXAMPLES: '
-        '(1) «01111568990\\n1370» + «01005161043\\n1370» + «01069411663» + «500 جنيه» → 3 pairs '
-        '(1370→01111568990, 1370→01005161043) and the split 500↔01069411663 auto-paired; execute all. '
-        '(2) «01012745373 / 24200 / 01105430994 / 13450 / 01226086860 / 6760 / الحرمين / لو هيخصم 15 '
-        'اخصمها» → the names + the fee «15» are dropped; returns 3 pairs (24200/13450/6760), '
-        'list_pattern=true → confirm the matching, then execute. '
-        '(3) «01070458397\\nتحويل 30الف\\nلاشين» → one self-contained pair 30000→01070458397. '
-        '(4) «01019525475\\nخمسين الف»: BEST — read 50000 yourself and pass it on that message '
-        '({message_id, text, amount: 50000}); the tool returns the pair 50000→01019525475 ready '
-        'to execute. If you DON\'T pass amount, the phone orphans and read_amounts=[«خمسين الف»] '
-        'tells you to read 50000 and create it. '
-        'INPUT: messages — an array of {message_id, text} in the order received. Always '
-        'include message_id (from each "[message_id: <uuid>]" marker) so the tool reads '
-        'the authoritative text and returns correct source ids.'
+        'READ-ONLY planner. Call FIRST for any burst of 2+ customer messages that look like '
+        'cash transactions, before qurtoba_create_new_transactions_bulk. Pass the burst in time '
+        'order; it pairs each phone with its amount deterministically (skipping names, labels, '
+        'fee-notes, tallies; normalizing separators/codes/Arabic-Indic digits) and returns: '
+        '- pairs: [{account_number, value, type, source_message_id, confidence}] — feed straight '
+        'into the bulk create tool (source_message_id is already each PHONE message id). '
+        '- orphans: [{kind, value, message_id}] — phone with no amount, or amount with no phone. '
+        'Ask ONE short question per orphan; never guess. '
+        '- ambiguous: pairs with an uncertain `.`/`,` reading — confirm if unsure. '
+        '- list_pattern (bool) + per-pair confidence high/low: TRUE when numbers and amounts '
+        'arrived as two SEPARATE lists (all numbers, then all amounts), paired by position. When '
+        'list_pattern OR a pair is "low", CONFIRM the matching before executing. '
+        '- needs_resend / same_time_overflow (bool) + resend[]: a HARD decision you cannot '
+        'override — fires ONLY for a same-second FLOOD (>3 txns in the same second with '
+        'number/amount in SEPARATE messages). Withheld items are NOT in pairs; do NOT reconstruct '
+        'them — relay the `note` (your words: resend each number+amount in one message, ≤3 at a '
+        'time). A same-second split of ≤3 comes back as normal pairs → execute, no confirmation. '
+        '- read_amounts: [{message_id, text}] — amounts written in Arabic WORDS the tool could not '
+        'convert (usually orphan their phone). Read the value yourself and create the op; do NOT '
+        'ask for an amount already present in words, and ignore any stray number for those lines. '
+        'FALLBACK (best): for a worded amount, pass it on THAT message as `amount` '
+        '({message_id, text:"خمسين الف", amount:50000}) — the tool uses your number and pairs it '
+        'normally, no orphan. Pass `amount` ONLY for spelled values; for plain digits leave it out. '
+        'INPUT: messages — array of {message_id, text} in order received; always include the '
+        'message_id from each "[message_id: <uuid>]" marker so source ids are correct.'
     ),
     category='qurtoba',
     requires_auth=True,
@@ -633,7 +608,9 @@ def qurtoba_plan_transactions(
                 .filter(conversation=conv, direction='inbound', active=True, type='text',
                         ai_consumed_at__isnull=True, created_at__gte=_cut)
                 .annotate(_ord=Coalesce('social_sent_at', 'created_at'))
-                .order_by('_ord', 'id')
+                # social_sent_at is second-precision → a same-second burst ties on _ord; break
+                # the tie by created_at (microsecond arrival = true within-second order), then id.
+                .order_by('_ord', 'created_at', 'id')
             )
             if _rows:
                 messages = [

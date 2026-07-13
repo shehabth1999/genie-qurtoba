@@ -444,7 +444,10 @@ class ConversationQurtobaExtension(ModelExtension):
                         type='text', ai_consumed_at__isnull=True,
                         created_at__gte=cutoff)
                 .annotate(_ord=Coalesce('social_sent_at', 'created_at'))
-                .order_by(F('_ord').desc(), F('id').desc())[:40]
+                # social_sent_at is second-precision; a same-second burst ties on _ord, so
+                # break the tie by created_at (microsecond arrival = true within-second order)
+                # before id. id alone is random and scrambled same-second phone/amount pairs.
+                .order_by(F('_ord').desc(), F('created_at').desc(), F('id').desc())[:40]
             )[::-1]  # back to chronological (true send) order
             lines = []
             for m in rows:
