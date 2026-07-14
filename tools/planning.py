@@ -236,16 +236,19 @@ def _classify_message(text: str) -> Dict[str, Any]:
     }
 
 
-def _cluster_split_by_second(events, msg_sent):
-    """Group SPLIT (phone-only / amount-only) events into clusters that share the SAME
-    send-SECOND. Returns a list of clusters, each a list of (kind, mid).
+def _cluster_split_by_second(events, msg_sent, window_s=None):
+    """Group SPLIT (phone-only / amount-only) events into clusters. Returns a list of
+    clusters, each a list of (kind, mid). Events with no known send-time are skipped.
 
-    KEY: Meta only fails to preserve order for messages sent in the SAME second — messages
-    a full second apart ARE reliably ordered. So the genuinely-reorderable unit is ONE second,
-    NOT a multi-second span. (The old 5-second sliding window lumped a legit ~1-msg/second
-    stream — e.g. 7 transfers streamed over 5s — into a single fake "instant" and wrongly
-    blocked the whole batch as overflow.) Truncate each send-time to the second and group by
-    equality. Events with no known send-time are skipped (treated as non-ambiguous)."""
+    Two modes:
+    * window_s falsy → EXACT-second clustering (a cluster = one calendar second).
+    * window_s > 0   → FIXED-WINDOW clustering (OWNER DECISION 2026-07-14, feedback #10):
+      a cluster = all consecutive split messages within `window_s` seconds of the cluster's
+      FIRST message. A forwarded/pasted burst of many transactions arriving within a few
+      seconds is then treated as ONE reorderable unit — WhatsApp can't guarantee order across
+      a rapid paste, so pairing >max_tx of them positionally is unsafe. The window is FIXED
+      from the first message (not a sliding chain), so a genuinely slow stream (a transaction
+      every several seconds) does NOT snowball into one giant cluster."""
     items = []  # (kind, mid, sent)
     for ev in events:
         if ev[0] in ('phone', 'amount'):
@@ -256,11 +259,17 @@ def _cluster_split_by_second(events, msg_sent):
     clusters = []
     i = 0
     while i < len(items):
-        sec = items[i][2].replace(microsecond=0)
         cluster = []
-        while i < len(items) and items[i][2].replace(microsecond=0) == sec:
-            cluster.append((items[i][0], items[i][1]))
-            i += 1
+        if window_s and window_s > 0:
+            start = items[i][2]
+            while i < len(items) and (items[i][2] - start).total_seconds() <= window_s:
+                cluster.append((items[i][0], items[i][1]))
+                i += 1
+        else:
+            sec = items[i][2].replace(microsecond=0)
+            while i < len(items) and items[i][2].replace(microsecond=0) == sec:
+                cluster.append((items[i][0], items[i][1]))
+                i += 1
         clusters.append(cluster)
     return clusters
 
@@ -270,9 +279,10 @@ def _same_time_split_mids(events, msg_sent, window_s=None):
     (same-second), so positional pairing of them is a guess. A same-second cluster holding
     ≥2 phones AND ≥2 amounts is the genuinely-reorderable set → all its ids are returned. A
     lone split (1 phone + 1 amount) in a second has only one pairing, so it is never flagged.
-    (`window_s` is accepted for backward compat but ignored — clustering is per-second now.)"""
+    (`window_s` widens the cluster to a fixed N-second window when set — see
+    `_cluster_split_by_second`.)"""
     flagged = set()
-    for cluster in _cluster_split_by_second(events, msg_sent):
+    for cluster in _cluster_split_by_second(events, msg_sent, window_s):
         n_ph = sum(1 for k, _m in cluster if k == 'phone')
         n_am = sum(1 for k, _m in cluster if k == 'amount')
         if n_ph >= 2 and n_am >= 2:
@@ -290,9 +300,9 @@ def _same_time_overflow_mids(events, msg_sent, window_s, max_tx):
     several seconds (≤``max_tx`` split per second) is NO LONGER blocked — only a genuine
     same-second flood of >``max_tx`` split transactions is. Self-contained pairs are
     ``('pair', …)`` events, never enter a cluster, and are never counted or blocked.
-    (`window_s` accepted for backward compat but ignored.)"""
+    (`window_s` widens the cluster to a fixed N-second window when set — feedback #10.)"""
     overflow = set()
-    for cluster in _cluster_split_by_second(events, msg_sent):
+    for cluster in _cluster_split_by_second(events, msg_sent, window_s):
         n_ph = sum(1 for k, _m in cluster if k == 'phone')
         n_am = sum(1 for k, _m in cluster if k == 'amount')
         if min(n_ph, n_am) > max_tx:
@@ -664,27 +674,28 @@ def qurtoba_plan_transactions(
     # genuinely-reorderable set. A lone split (1 phone + 1 amount) has only one
     # possible pairing, so it is never flagged.
     from django.conf import settings as _dj
-    window_s = getattr(_dj, 'AI_SAME_TIME_WINDOW_SEC', 5)
+    # OWNER DECISION (2026-07-14, feedback #10): "same time" is a fixed WINDOW, not a single
+    # second. A forwarded/pasted burst spreads its split messages across a few seconds (Meta
+    # can't guarantee their order), so cluster split events into `AI_SAME_TIME_WINDOW_SEC`
+    # (default 4s) windows. This reverses the 2026-07-12 exact-second scoping — the accepted
+    # trade-off is that a fast legit split stream of >3 transactions is also asked to slow down.
+    window_s = getattr(_dj, 'AI_SAME_TIME_WINDOW_SEC', 4)
     ambiguous_split_mids = _same_time_split_mids(events, msg_sent, window_s)
 
-    # HARD CAP (deterministic, tool-owned — never the LLM): Meta delivers messages
-    # sent in the same second in an unreliable order. When the number and amount are
-    # in SEPARATE messages, a large same-second burst can't be paired safely at all.
-    # If any same-second split cluster carries MORE THAN `AI_SAME_TIME_MAX_TX` (3)
-    # transactions, withhold the WHOLE cluster — process NONE of it — and ask the
-    # customer to resend cleanly. Self-contained pairs (number+amount in one message)
-    # are not split events, never enter a cluster, and are always processed no matter
-    # how many arrive in the same second.
+    # HARD CAP (deterministic, tool-owned — never the LLM): when the number and amount are in
+    # SEPARATE messages, a burst of many transactions arriving within one `window_s` window
+    # can't be paired safely (order unreliable). If any window-cluster carries MORE THAN
+    # `AI_SAME_TIME_MAX_TX` (3) split transactions, withhold the WHOLE cluster — process NONE of
+    # it — and ask the customer to resend ≤3 at a time. Self-contained pairs (number+amount in
+    # ONE message) are not split events, never enter a cluster, and are always processed.
     max_tx = getattr(_dj, 'AI_SAME_TIME_MAX_TX', 3)
     overflow_mids = _same_time_overflow_mids(events, msg_sent, window_s, max_tx)
     blocked_overflow = bool(overflow_mids)
 
-    # OWNER DECISION (2026-07-12): a same-second SPLIT cluster of ≤max_tx (3) transactions is
-    # EXECUTED directly — trust the positional pairing, do NOT ask «تأكيد». Only a genuine
-    # same-second FLOOD (> max_tx split) is withheld (overflow). The old soft `needs_resend`
-    # (≥5-pair) guard and the 2–3-tx confirmation are removed: they mostly fired on stale/
-    # mixed bursts and annoyed the customer («ليه بتبعت تاكيد»). Overflow(>3) is the ONLY
-    # same-second gate now; self-contained pairs are never gated.
+    # A window SPLIT cluster of ≤max_tx (3) transactions is EXECUTED directly — trust the
+    # positional pairing, do NOT ask «تأكيد» (2026-07-12: confirmation on clean small batches
+    # annoyed the customer). Only a window FLOOD (> max_tx split) is withheld (overflow).
+    # Self-contained pairs are never gated no matter how many arrive together.
     withhold_mids = set(overflow_mids)
 
     resend: List[Dict[str, Any]] = []

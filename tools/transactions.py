@@ -436,6 +436,34 @@ def _source_message_matches_account(source_message_id, final_account, conversati
         return 'unverified'
     if msg is None:
         return 'unverified'
+    # PRIMARY: the authoritative classifier (same one the planner uses) extracts and
+    # NORMALIZES the phone(s) actually written in the message. If final_account is among
+    # them, it's clean. This catches the class where the LLM ALTERED the number — dropped
+    # or added a digit to force 11 (e.g. wrote 011188888099 as 01188888099). The classifier
+    # correctly returns NO phone for a malformed 12-digit run, so an LLM-mangled number is
+    # never among its output. Handles internal spaces / +20 / 0020 / Arabic-Indic digits.
+    try:
+        from qurtoba.tools.planning import _classify_message
+        src_text = _message_text_raw(msg)
+        phones = _classify_message(src_text).get('phones') or []
+        if final_account in phones:
+            return 'ok'
+        # classifier found valid phone(s) but NOT final_account → the LLM cited the wrong
+        # message OR altered the number → mismatch.
+        if phones:
+            return 'mismatch'
+        # classifier found NO valid phone, but the message carries an OVER-LENGTH phone-like
+        # digit run (≥12 digits starting 1/2 after leading zeros) → the LLM truncated a
+        # malformed number into final_account (the 011188888099 → 01188888099 bug) → mismatch.
+        import re as _re
+        for _r in _re.findall(r'\d+', src_text):
+            _stripped = _r.lstrip('0')
+            if len(_r) >= 12 and _stripped[:1] in ('1', '2'):
+                return 'mismatch'
+    except Exception:
+        pass
+    # FALLBACK (classifier unavailable / nothing conclusive): the original subscriber-tail
+    # substring check — permissive, never introduces a new false reject.
     digits = _message_digits(msg)
     subscriber = final_account[1:] if final_account.startswith('0') else final_account
     if subscriber and subscriber in digits:
