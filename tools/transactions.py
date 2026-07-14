@@ -1115,36 +1115,25 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
     side_effect=True,  # mutating: creates debt records — never carry its result forward
     display_name='Create Many Qurtoba Transactions at Once',
     description=(
-        'Register new debt transaction(s) (عملية جديدة) for the current chat customer — ONE or '
-        'MANY in a SINGLE call (single op = one-item array). The ONLY create tool; each item '
-        'raises the balance. Do NOT call twice for the same set. '
-        'CASH BRACKET: always pass type="كاش" for cash; the tool auto-promotes by amount '
-        '(<10,000→كاش, 10,000–19,999→كاش(10), ≥20,000→كاش(20)). Never pass كاش(5). '
-        'INPUT — transactions[] items: type (required: كاش/فورى/أمان/طاير/مصاريف خدمه), '
-        'value (required, positive int — pass a plain integer; YOU read Arabic number words '
-        'yourself, the tool does not; no decimals), account_number (destination phone for cash, '
-        'saved account string for non-cash), source_message_id (UUID of THIS item\'s OWN '
-        'phone-number message, verbatim — never reuse one id across items; the receipt replies '
-        'to it), notes (optional). Also: override_grade_limit (default False); a top-level '
-        'source_message_id as FALLBACK only when an item has none. '
-        'BEHAVIOUR: items run IN ORDER (partial batch possible). AUTO-ACK — the tool sends ONE '
-        '👍 when creation starts, so on an all-success batch STAY SILENT (no 👍/text); number '
-        'correction is auto-replied by the tool too. Returns results[] (one per item) + counts '
-        '(created/pending/rejected/duplicate/same_day_duplicate/high_value). Per-item status: '
-        '  • created — done. '
-        '  • pending_review — over the credit ceiling → queued for admin review; treat as a '
-        'normal SILENT success, never mention review/limit. '
-        '  • rejected — state the real reason; error_type="service_disabled" carries a ready '
-        'Arabic `error` message to quote. '
-        '  • duplicate — already created from this message (idempotent) → done. '
-        '  • same_day_duplicate (كاش only) — same account+value already created TODAY; NOT '
-        'created now. Ask «تأكيد تكرار العملية؟»; on yes retry the SAME item with '
-        'confirm_repeat=true (same source_message_id). '
-        '  • needs_confirmation / high_value — amount over the high-value limit; the tool held '
-        'it (nothing created, no 👍). This is the TOOL\'s call, NOT a rejection you make — ask '
-        'the customer to confirm the large transfer (amount + number); on yes retry the SAME '
-        'item with confirm_high_value=true; on no, drop it. '
-        'NEVER say «تم»/success for any item until a (re)try actually returns status="created".'
+        'Register one OR many new debt transactions (عملية جديدة) in a SINGLE call (single op = '
+        'one-item array). Each item raises the balance; do NOT call twice for the same set. '
+        'CASH BRACKET: pass type="كاش" for cash — the tool auto-promotes by amount (<10,000→كاش, '
+        '10,000–19,999→كاش(10), ≥20,000→كاش(20)); never pass كاش(5). Each item needs its OWN '
+        'source_message_id (its phone message). '
+        'AUTO-ACK: the tool sends ONE 👍 on start → an all-success batch = STAY SILENT (no text); '
+        'number correction is auto-replied too. Returns results[] + counts. Per-item status: '
+        'created (done); '
+        'pending_review (over the credit ceiling → queued for review; a SILENT success, never '
+        'mention review/limit); '
+        'rejected (state the real reason; error_type="service_disabled" carries a ready Arabic '
+        '`error` to quote); '
+        'duplicate (already created from this message — done); '
+        'same_day_duplicate (كاش only — same account+value already created today; ask «تأكيد '
+        'تكرار العملية؟», on yes retry the SAME item with confirm_repeat=true); '
+        'needs_confirmation/high_value (amount over the high-value limit — the TOOL held it, NOT '
+        'a rejection you make; confirm the large transfer with the customer, on yes retry with '
+        'confirm_high_value=true, on no drop it). '
+        'NEVER say «تم» until a (re)try returns status="created".'
     ),
     category='qurtoba',
     requires_auth=True,
@@ -1158,64 +1147,26 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
                 'items': {
                     'type': 'object',
                     'properties': {
-                        'type': {
-                            'type': 'string',
-                            'enum': DEBT_TYPES,
-                            'description': 'Transaction type — one of the 8 debt types.',
-                        },
-                        'value': {
-                            'type': 'number',
-                            'exclusiveMinimum': 0,
-                            'description': 'Amount in EGP, positive number.',
-                        },
-                        'account_number': {
-                            'type': ['string', 'null'],
-                            'description': 'Destination phone for cash types (pass as written; '
-                                           'the tool auto-normalizes +20/0020/20/020/spaces to '
-                                           '01XXXXXXXXX); saved account string for non-cash.',
-                        },
-                        'source_message_id': {
-                            'type': ['string', 'null'],
-                            'description': 'UUID of THIS transaction\'s own phone-number message '
-                                           '(from its "[message_id: <uuid>]" marker). Each item '
-                                           'gets its OWN id — never reuse one id across items.',
-                        },
-                        'notes': {
-                            'type': ['string', 'null'],
-                        },
-                        'confirm_repeat': {
-                            'type': 'boolean',
-                            'default': False,
-                            'description': 'Set true ONLY when retrying THIS SAME item after '
-                                           'the customer explicitly confirmed a '
-                                           '"same_day_duplicate" result (you asked «تأكيد '
-                                           'تكرار العملية؟» and they said yes). Keep the same '
-                                           'source_message_id — do not invent a different one.',
-                        },
-                        'confirm_high_value': {
-                            'type': 'boolean',
-                            'default': False,
-                            'description': 'Set true ONLY when retrying THIS SAME item after '
-                                           'the customer explicitly confirmed a '
-                                           '"needs_confirmation" (high_value) result — i.e. the '
-                                           'amount exceeded the high-value limit, you asked the '
-                                           'customer to confirm, and they said yes. Keep the same '
-                                           'source_message_id. Never set it pre-emptively.',
-                        },
+                        'type': {'type': 'string', 'enum': DEBT_TYPES,
+                                 'description': 'Debt type (كاش for any cash).'},
+                        'value': {'type': 'number', 'exclusiveMinimum': 0,
+                                  'description': 'Amount EGP, positive integer.'},
+                        'account_number': {'type': ['string', 'null'],
+                                           'description': 'Destination phone (cash) or saved account (non-cash); pass as written.'},
+                        'source_message_id': {'type': ['string', 'null'],
+                                              'description': "UUID of THIS item's phone message; never reuse across items."},
+                        'notes': {'type': ['string', 'null']},
+                        'confirm_repeat': {'type': 'boolean', 'default': False,
+                                           'description': 'True ONLY to retry a same_day_duplicate the customer confirmed.'},
+                        'confirm_high_value': {'type': 'boolean', 'default': False,
+                                               'description': 'True ONLY to retry a high_value item the customer confirmed.'},
                     },
                     'required': ['type', 'value'],
                 },
             },
-            'override_grade_limit': {
-                'type': 'boolean',
-                'default': False,
-            },
-            'source_message_id': {
-                'type': ['string', 'null'],
-                'description': 'FALLBACK ONLY — used for an item that lacks a per-item '
-                               'source_message_id. Prefer the per-item field inside each '
-                               'transaction; only set this when all came from one message.',
-            },
+            'override_grade_limit': {'type': 'boolean', 'default': False},
+            'source_message_id': {'type': ['string', 'null'],
+                                  'description': 'Fallback when an item lacks its own.'},
         },
         'required': ['transactions'],
     },
@@ -1306,26 +1257,18 @@ def qurtoba_create_new_transactions_bulk(
     side_effect=True,  # mutating: creates a pending-payment row — never carry its result forward
     display_name='Register Customer Payment (سداد) — Review Queue',
     description=(
-        'Register a payment the customer made TO the merchant (سداد). Does NOT reduce the '
-        'balance directly — it creates a PENDING PAYMENT row for admin review; approval later '
-        'posts the QurtobaRecord (is_down=True). Requires a receipt image. '
-        'INPUTS: type — "شراء كاش" or "شراء فورى" (never "تحصيل"); value — amount EGP (positive); '
-        'customer_confirmation_text — verbatim customer text confirming amount+method (e.g. "نعم '
-        '500 شراء فورى"); screenshot_chat_message_id — UUID of the inbound receipt-image message '
-        '(from its "[message_id: <uuid>]" marker; if none in history, ask «أرسل صورة الإيصال '
-        'أولاً» first — never invent it); account_number — for شراء كاش the phone from the '
-        'receipt (pass as written, tool normalizes). For شراء فورى the tool pins our fixed Fawry '
-        'account 2697418 — only register if the receipt\'s رقم الحساب == 2697418, else tell the '
-        'customer to transfer to 2697418 and do NOT call. '
-        'READ THE RECEIPT: Fawry receipt (فوري logo, «عملية ناجحة», المبلغ الكلي, رقم الحساب) → '
-        '"شراء فورى", value=المبلغ الكلي; a cash/wallet transfer (value → phone) → "شراء كاش" '
-        'with value + that number. '
-        'RESULT: success=True, pending_review=True, pending_id. This tool does NOT auto-ack — '
-        'after a successful registration you MUST send a SHORT confirmation yourself (e.g. «وصلني '
-        'الإيصال، تحت المراجعة»); never stay silent. duplicate=True → an identical payment is '
-        'already under review today (say so, not a new one). Rejections error_type ∈ '
-        '{invalid_type, invalid_value, invalid_account_number, missing_confirmation, '
-        'screenshot_required (no id), screenshot_invalid (id missing / not this partner / no image)}.'
+        'Register a payment the customer made to the merchant (سداد) — creates a PENDING PAYMENT '
+        'row for admin review (does NOT change the balance; approval later posts the record). '
+        'Requires a receipt image. '
+        'Params: type ("شراء كاش" or "شراء فورى", never "تحصيل"); value (amount EGP, positive '
+        'integer); customer_confirmation_text (a short receipt/confirmation summary); '
+        'screenshot_chat_message_id (UUID of the receipt-image message — never invent it); '
+        'account_number (شراء كاش → the recipient phone from the receipt; شراء فورى → our fixed '
+        '2697418). '
+        'This tool does NOT auto-ack → after success=True you MUST send a short «تحت المراجعة» '
+        'confirmation (never silent). duplicate=True → already under review today. Rejections '
+        'error_type ∈ {invalid_type, invalid_value, invalid_account_number, missing_confirmation, '
+        'screenshot_required, screenshot_invalid}.'
     ),
     category='qurtoba',
     requires_auth=True,
@@ -1545,16 +1488,11 @@ def _status_line_for(record) -> str:
     name='qurtoba_check_transaction_status',
     display_name='Check Qurtoba Transaction Status (executed via cash app?)',
     description=(
-        'READ-ONLY. Did a TRANSFER execute via the cash app (وصل؟/تم؟/اتنفذت؟). '
-        'source_message_id (optional): if the partner replied to/quoted a specific transfer, '
-        'pass that UUID → reports the exact transaction from THAT message. Without it (a vague '
-        '"وصل؟"), reports only the latest 3 transactions today REGARDLESS of status. '
-        '🔴 For a SUBSET question ("which didn\'t go through" / "how many still pending") do NOT '
-        'use this — its 3-record cap misleads; use qurtoba_get_customer_daily_transactions and '
-        'filter transactions[] by `bucket` yourself. '
-        'OUTPUT: pretty_ar — a ready Arabic block (✅ تم / ⏳ قيد التنفيذ / 🔄 جزئي—الباقي على رقم '
-        'جديد / ❌ ملغى); send it AS THE WHOLE REPLY, one message, add nothing. Also records[]. '
-        'found=false returns a ready Arabic line — send verbatim; never invent a status.'
+        'READ-ONLY. Did a TRANSFER execute (وصل؟/تم؟/اتنفذت؟). source_message_id (optional): the '
+        'replied/quoted transfer → reports that one; without it, only the latest 3 today. OUTPUT '
+        'pretty_ar = a ready Arabic block (✅ تم / ⏳ قيد التنفيذ / 🔄 جزئي / ❌ ملغى) → send AS THE '
+        'WHOLE REPLY, add nothing; found=false → a ready line, send verbatim, never invent a '
+        'status. (For a "which didn\'t go through" subset use get_daily + `bucket`, not this.)'
     ),
     category='qurtoba',
     requires_auth=True,
@@ -1652,23 +1590,11 @@ def _payment_status_line(p) -> str:
     name='qurtoba_check_payment_status',
     display_name='Check Customer Payment (سداد) Status',
     description=(
-        'Use this tool when the customer asks whether a سداد (payment receipt they sent) '
-        'was accepted/registered yet — e.g. "الإيصال اتقبل؟"، "السداد اتسجّل؟"، "تمام السداد؟"، '
-        '"اعتمدتوا التحويل؟". It looks up the QurtobaPendingPayment created from their receipt '
-        'and reports its review state. '
-        'INPUT: '
-        '1) source_message_id (optional) — the chat message id (UUID) of the RECEIPT IMAGE '
-        'message, taken verbatim from its "[message_id: <uuid>]" marker (use the quoted/replied '
-        'message when the customer replies to their receipt). Omit it to report the customer\'s '
-        'most recent سداد. '
-        'OUTPUT: '
-        '- pretty_ar: a single ready-to-send Arabic line per payment — "⏳ قيد المراجعة" '
-        '(under review), "✅ تم اعتماد السداد" (approved/created), or "❌ تم رفض السداد" with the '
-        'denial reason appended. Send pretty_ar AS THE WHOLE REPLY in ONE message; do not invent '
-        'a status or add anything. '
-        '- Structured: payments[] with {pending_id, type, value, account_number, review_state, '
-        'denial_reason, created_record_id}. '
-        'This tool is READ-ONLY; it never creates, approves, or denies anything.'
+        'READ-ONLY status of a سداد (payment receipt): «الإيصال اتقبل؟»/«السداد اتسجّل؟». '
+        'source_message_id (optional) = the receipt-image message id (the replied one; omit for '
+        'the customer\'s latest payment). OUTPUT pretty_ar = one ready Arabic line per payment '
+        '(⏳ قيد المراجعة / ✅ تم اعتماد السداد / ❌ تم رفض السداد + reason) → send AS THE WHOLE '
+        'REPLY, add nothing, never invent a status. Also payments[] structured.'
     ),
     category='qurtoba',
     requires_auth=True,

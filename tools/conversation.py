@@ -18,21 +18,11 @@ from modules.aistudio.tools import tool
     name='qurtoba_send_customer_balance_to_chat',
     display_name='Send Qurtoba Balance to Current Chat',
     description=(
-        'Use this tool when the customer (or an internal agent) asks to see the current '
-        'Qurtoba outstanding balance for the customer linked to this conversation. The '
-        'tool fetches the live balance and posts a formatted message INTO THE CURRENT '
-        'CHAT (visible to the customer on WhatsApp/Messenger and to the team in the chat '
-        'UI). It is the same action as the "فحص الرصيد" button in the conversation panel. '
-        'No inputs are required — the customer is resolved automatically from the active '
-        'conversation. '
-        'The message shows ONLY the outstanding balance/debt — «عليك X جنيه» (owes) / «ليك X '
-        'جنيه» (in credit) / «مفيش مديونية» (nothing owed). It does NOT show the grade, credit '
-        'limit, remaining credit, or any over-limit amount (those are internal — see Law 6). '
-        'Returns success=True with the customer name and balance only. '
-        'Do NOT call this tool if the customer is only asking a question that does not '
-        'require their balance to be shown. '
-        'Do NOT call this tool more than once per request — the message is sent to the '
-        'customer\'s phone and re-sending will spam them.'
+        'Post the customer\'s current Qurtoba balance INTO the chat (visible to the customer). '
+        'No inputs — the customer is resolved from the active conversation. The tool posts the '
+        'number itself, showing ONLY the debt/credit («عليك X جنيه» / «ليك X جنيه» / «مفيش '
+        'مديونية») — never grade, limit, remaining credit, or over-limit. Call it fresh on a '
+        'balance question; call it at most ONCE per request (re-sending spams the customer).'
     ),
     category='qurtoba',
     requires_auth=True,
@@ -85,13 +75,10 @@ def qurtoba_send_customer_balance_to_chat(context) -> Dict[str, Any]:
     name='qurtoba_clear_pending_transfers',
     display_name='Clear the pending (uncreated) transfer burst',
     description=(
-        'Call this ONLY when the customer cancels/aborts a whole transfer burst they were '
-        'still sending and NOTHING has been created yet (a general «الغاء/وقف/كنسل/غلط» that '
-        'means "scrap what I just sent"). It marks the recent still-open inbound messages as '
-        'handled so that aborted numbers/amounts do NOT linger and get re-paired or re-created '
-        'when the customer resends fresh. Do NOT call it for a cancel of ONE specific transfer '
-        'among several (just omit that one and create the rest), nor for an already-executed '
-        'transfer (that needs alert_qurtoba_human). After calling, reply «تم الإيقاف…» as usual.'
+        'Marks the recent still-open inbound messages as handled — call it when the customer '
+        'aborts a WHOLE not-yet-created transfer burst («الغاء/وقف/غلط» = scrap what I just '
+        'sent), so the aborted numbers/amounts don\'t linger and get re-paired when they resend. '
+        'NOT for cancelling one op among several, nor an already-executed transfer.'
     ),
     category='qurtoba',
     requires_auth=True,
@@ -128,14 +115,9 @@ def qurtoba_clear_pending_transfers(context) -> Dict[str, Any]:
     name='alert_qurtoba_human',
     display_name='Alert Qurtoba Human (push only)',
     description=(
-        'Send a PUSH notification to every team member on this conversation so a human '
-        'steps in. It does NOT disable the AI (the AI keeps handling the chat) and it does '
-        'NOT send anything to the customer. '
-        'Pass `note` with a short, specific reason a human is needed plus context — customer '
-        'name, amount, phone/account number, and exactly what they asked — so the human can '
-        'act without reading the whole chat. '
-        'After calling this tool, reply to the customer with only «لحظة» — never tell the '
-        'customer that a human/colleague will contact them or that you are escalating.'
+        'Silently push a notification to the team so a human steps in — does NOT stop the AI or '
+        'message the customer. `note` = a short specific reason + context (customer, amount, '
+        'phone/account, exactly what they asked).'
     ),
     category='qurtoba',
     requires_auth=True,

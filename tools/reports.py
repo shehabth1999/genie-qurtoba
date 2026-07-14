@@ -145,19 +145,14 @@ def _build_pretty_ar(
     name='qurtoba_get_customer_daily_transactions',
     display_name='Get Customer Qurtoba Transactions for a Day',
     description=(
-        'Daily transactions report (كشف حساب اليوم / تقرير اليوم / حركات اليوم) — every record '
-        'and pending row for the requested day. report_date (optional, ISO YYYY-MM-DD; '
-        'omit=today). '
-        'OUTPUT: pretty_ar — a ready Arabic block grouped into منفذة / قيد التنفيذ / قيد '
-        'المراجعة, each line with time+type+amount+account+fee; plus structured transactions[], '
-        'pending_transactions[], pending_payments[], totals, current_balance, grade_limit. '
-        'USE: "show everything" ask → send pretty_ar AS THE WHOLE REPLY, one message, add '
-        'nothing (grouping/totals/times already inside). '
-        '🔴 FILTERED/subset ask ("which didn\'t go through" / "متمتش" / "how many still pending" '
-        '/ "only the كاش ones") → do NOT paste pretty_ar; read transactions[] yourself — each '
-        'item\'s `bucket` is "executed" (done) or "in_flight" (not done = متمتش) — filter to ALL '
-        'matching items and write your own short reply. (Do not use check_transaction_status '
-        'for this — its 3-record cap misleads.) Never claim "no timestamps"; times are in pretty_ar.'
+        'Daily transactions report (كشف حساب اليوم / تقرير / حركات اليوم). report_date optional '
+        '(ISO YYYY-MM-DD; omit=today). OUTPUT pretty_ar = a ready Arabic block grouped منفذة / '
+        'قيد التنفيذ / قيد المراجعة (each line time+type+amount+account+fee) → for a "show '
+        'everything" ask send it AS THE WHOLE REPLY, add nothing. Also structured transactions[] '
+        '(each `bucket` = "executed"/"in_flight"), totals, current_balance. '
+        '🔴 For a FILTERED/subset ask («اللي متمتش»/«how many still pending») do NOT paste '
+        'pretty_ar — read transactions[], filter by bucket ("in_flight" = متمتش) to ALL matching '
+        'items, write your own short list (check_transaction_status\'s 3-record cap misleads here).'
     ),
     category='qurtoba',
     requires_auth=True,

@@ -553,26 +553,12 @@ def consumed_ids_by_source(conv):
                 'items': {
                     'type': 'object',
                     'properties': {
-                        'message_id': {
-                            'type': ['string', 'null'],
-                            'description': 'UUID from the "[message_id: <uuid>]" marker.',
-                        },
-                        'text': {
-                            'type': ['string', 'null'],
-                            'description': 'The message text (fallback when message_id is absent).',
-                        },
-                        'amount': {
-                            'type': ['number', 'null'],
-                            'description': (
-                                'OPTIONAL fallback amount YOU read for THIS message, as a plain '
-                                'number. Pass it ONLY when the amount is written in Arabic WORDS '
-                                'the tool can\'t convert (e.g. text «خمسين الف» → amount 50000, '
-                                '«خمسمائة» → 500, «ميتين» → 200, «ألفين» → 2000). The tool uses it '
-                                'as the value for this message so nothing is lost. If the amount is '
-                                'already normal digits, leave this out — the tool reads it itself '
-                                'and ignores this field.'
-                            ),
-                        },
+                        'message_id': {'type': ['string', 'null'],
+                                       'description': 'UUID from the "[message_id: <uuid>]" marker.'},
+                        'text': {'type': ['string', 'null'], 'description': 'The message text.'},
+                        'amount': {'type': ['number', 'null'],
+                                   'description': 'OPTIONAL: the number YOU read when the amount is spelled in Arabic '
+                                                  'words («خمسين الف»→50000); omit for plain digits.'},
                     },
                 },
             },
