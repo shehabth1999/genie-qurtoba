@@ -1,7 +1,14 @@
 # Cash-SYS Integration — Genie ERP
 
 **Cash-SYS** is a fully independent system for executing mobile cash transfers (كاش/فورى) via SIM cards.  
-Genie ERP interacts with it through three API calls only. Everything else (payments, plan upgrades, invoicing) is handled inside Cash-SYS itself.
+Genie ERP interacts with it through three API calls only (catalog, create client, activate trial). Everything else (payments, plan upgrades, invoicing) is handled inside Cash-SYS itself.
+
+> **Cash orders are NOT posted by Genie.** Genie pushes the record to Qurtoba
+> (`push_record_to_qurtoba`); **Qurtoba** is the single system that posts the cash
+> order to Cash-SYS (`/api/v1/integration/orders/`), carrying the customer name +
+> `notes_plus`. Genie posting orders too would double-create the physical transfer.
+> Cash-SYS still sends `order_done`/`order_canceled` webhooks back to Genie (resolved
+> via `external_ref == qurtoba_record_id`).
 
 ---
 

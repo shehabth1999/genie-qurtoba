@@ -95,10 +95,12 @@ balances via `GET /transactions/api2/rest-customer/<id>/`. Auth: `**QURTOBA_TOKE
 2. `post_create` → `push_record_to_qurtoba()` → `POST /transactions/api2/record/` on **Q**
   (auth `QURTOBA_TOKEN`) → gets `qurtoba_record_id`, refreshes balance.
    `qurtoba/utils_sync.py:10`.
-3. Because the record is Genie-pushed, **Q does NOT call Cash-SYS** (`if not is_genie`
-  gate). Instead **G** calls it: `_send_to_cash_sys()` → `POST /api/v1/integration/orders/`
-   on **C** with `external_ref = str(qurtoba_record_id)`. Auth `CASH_SYS_TOKEN`.
-   `qurtoba/utils_sync.py:95`.
+3. **Q is the single Cash-SYS order sender.** When Q creates the pushed record it
+  calls `send_to_cash_sys()` itself (for genie records too), with `external_ref =
+  str(record_id)` (== `qurtoba_record_id`), the customer name, and the customer's
+  `notes_plus`. **G no longer posts orders to Cash-SYS** — doing both double-created
+  the physical transfer. (Client onboarding — `create_cash_sys_client` /
+  `activate_cash_sys_trial` — is unrelated and unchanged.)
 4. **C** executes the transfer(s) and fires webhooks back to **G** (HMAC `X-Cash-Signature`,
   header `X-Cash-Event`): `order_progress` (partial), `order_done` (settled),
    `order_canceled` (a part canceled). Lands at `POST /qurtoba/cash-sys/webhook/`
