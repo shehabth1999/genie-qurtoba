@@ -521,6 +521,70 @@ def _validate_debt_item(
     }
 
 
+# ---------------------------------------------------------------------------
+# Deterministic same-day REPEAT confirmation (Python-driven, NOT the LLM).
+# When a كاش transfer matches one already created today, the TOOL — not the
+# agent — asks «تأكيد التكرار؟» (quoted on the number message) and remembers the
+# pending repeat here. The record is created later ONLY from THIS stored state,
+# and ONLY once the customer sends a fresh confirmation in a LATER turn (see
+# qurtoba_confirm_pending_repeats). This removes the LLM's ability to ask, to
+# invent the amount, or to self-confirm a duplicate in the same turn.
+# ---------------------------------------------------------------------------
+
+_REPEAT_PENDING_TTL = 3600  # seconds a pending repeat waits for the customer's «أيوة»
+
+
+def _repeat_pending_key(conversation) -> Optional[str]:
+    cid = str(getattr(conversation, 'id', '') or '') or None
+    return f'qurtoba:repeat_pending:{cid}' if cid else None
+
+
+def _repeat_signature(type_: str, account: Optional[str], amount: float) -> str:
+    return f'{type_}|{account}|{float(amount):.2f}'
+
+
+def _store_repeat_pending(conversation, *, type_, amount, account,
+                          source_message_id, consumed_ids, existing_record_id, asked_ts):
+    """Remember one pending same-day repeat, keyed by (type, account, amount)."""
+    key = _repeat_pending_key(conversation)
+    if not key:
+        return
+    from django.core.cache import cache
+    data = cache.get(key) or {}
+    data[_repeat_signature(type_, account, amount)] = {
+        'type': type_, 'value': float(amount), 'account_number': account,
+        'source_message_id': source_message_id,
+        'consumed_ids': list(consumed_ids or []),
+        'existing_record_id': existing_record_id,
+        'asked_ts': float(asked_ts),
+    }
+    cache.set(key, data, _REPEAT_PENDING_TTL)
+
+
+def _list_repeat_pending(conversation) -> dict:
+    key = _repeat_pending_key(conversation)
+    if not key:
+        return {}
+    from django.core.cache import cache
+    return cache.get(key) or {}
+
+
+def _clear_repeat_pending(conversation, signature: Optional[str] = None):
+    key = _repeat_pending_key(conversation)
+    if not key:
+        return
+    from django.core.cache import cache
+    if signature is None:
+        cache.delete(key)
+        return
+    data = cache.get(key) or {}
+    data.pop(signature, None)
+    if data:
+        cache.set(key, data, _REPEAT_PENDING_TTL)
+    else:
+        cache.delete(key)
+
+
 def _create_one_debt(
     customer,
     social_partner,
@@ -537,6 +601,7 @@ def _create_one_debt(
     consumed_message_ids: Optional[List[str]] = None,
     confirm_repeat: bool = False,
     confirm_high_value: bool = False,
+    _verified_repeat: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a single debt record after validation.
@@ -655,9 +720,11 @@ def _create_one_debt(
     # كاش family only (كاش/كاش(10)/كاش(20)/كاش(5) — never فورى/أمان/طاير, per product decision),
     # same account_number + value, and STRICTLY today's calendar day in local time — a match
     # from yesterday or earlier must NEVER be flagged, no matter how identical the values are.
-    # Bypassed by confirm_repeat=True: the agent sets this ONLY after the customer explicitly
-    # confirmed «تأكيد تكرار العملية؟» — then this same call proceeds to create for real.
-    if is_cash and final_account and not override_grade_limit and not confirm_repeat:
+    # Bypassed ONLY by the internal confirm path (confirm_repeat AND _verified_repeat), which
+    # qurtoba_confirm_pending_repeats uses after verifying a real customer confirmation. The LLM
+    # cannot set _verified_repeat, so it can never self-confirm a repeat in-turn. When flagged,
+    # the TOOL itself asks «تأكيد التكرار؟» and holds the repeat (see the branch below).
+    if is_cash and final_account and not override_grade_limit and not (confirm_repeat and _verified_repeat):
         from qurtoba.models import QurtobaRecord
         from django.utils import timezone as _tz
         _now_local = _tz.localtime(_tz.now())
@@ -684,8 +751,25 @@ def _create_one_debt(
                     'account_number': dup_today.account_number,
                     'note': 'same_burst_already_created',
                 }
+            # DETERMINISTIC repeat handling (Python, NOT the LLM): the TOOL asks
+            # «تأكيد التكرار؟» itself, quoted on the number message, and remembers this
+            # pending repeat. It is created later ONLY from this stored state, once the
+            # customer sends a fresh «أيوة» in a LATER turn (qurtoba_confirm_pending_repeats).
+            # The agent NEVER asks this and NEVER self-confirms.
+            _val = dup_today.value
+            _val_int = int(_val) if float(_val).is_integer() else _val
+            _store_repeat_pending(
+                conversation, type_=type, amount=amount, account=final_account,
+                source_message_id=src, consumed_ids=consumed_message_ids,
+                existing_record_id=dup_today.pk, asked_ts=_tz.now().timestamp(),
+            )
+            _send_quoted_text(
+                conversation, social_partner, src,
+                f'عملية {dup_today.type} بمبلغ {_val_int} جنيه للرقم {final_account} '
+                f'اتنفذت النهارده بالفعل. تحب أكررها؟',
+            )
             return {
-                'success': True, 'same_day_duplicate': True,
+                'success': True, 'repeat_asked': True,
                 'existing_record_id': dup_today.pk, 'type': dup_today.type,
                 'value': dup_today.value, 'account_number': dup_today.account_number,
                 'created_at': dup_today.created_at.isoformat(),
@@ -906,7 +990,7 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
     rejected_count = 0
     pending_count = 0
     duplicate_count = 0
-    same_day_duplicate_count = 0
+    repeat_asked_count = 0
     high_value_count = 0
     # One 👍 for the whole batch — fired by the first item that actually creates.
     ack_state = {'sent': False}
@@ -938,7 +1022,10 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
         # Per-item phone-message id — each transaction quotes ITS OWN number message.
         # Fall back to the batch-level id only when the item didn't supply one.
         item_source_message_id = raw_item.get('source_message_id') or source_message_id
-        item_confirm_repeat = bool(raw_item.get('confirm_repeat', False))
+        # The LLM can NEVER self-confirm a repeat: same-day repeats are held by the tool
+        # and created only by qurtoba_confirm_pending_repeats (deterministic). Any
+        # confirm_repeat the model passes here is ignored.
+        item_confirm_repeat = False
         item_confirm_high_value = bool(raw_item.get('confirm_high_value', False))
 
         validation = _validate_debt_item(type_, value_, account_)
@@ -987,15 +1074,15 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
                     'threshold': outcome.get('threshold'),
                     'input': {'type': type_, 'value': value_, 'account_number': account_},
                 })
-            elif outcome.get('same_day_duplicate'):
-                # Looks like a repeat of a كاش transfer already created TODAY (B5) — NOT
-                # created. The agent must ask «تأكيد تكرار العملية؟» before retrying this
-                # SAME item with confirm_repeat=true (same source_message_id — no need to
-                # guess a different one).
-                same_day_duplicate_count += 1
+            elif outcome.get('repeat_asked'):
+                # Same-day كاش repeat (B5) — NOT created. The TOOL already asked «تأكيد
+                # التكرار؟» itself (Python, quoted on the number) and is holding it. The
+                # agent STAYS SILENT: do not ask, do not set any confirm flag. It is created
+                # from stored state when the customer confirms (qurtoba_confirm_pending_repeats).
+                repeat_asked_count += 1
                 results.append({
                     'index': index,
-                    'status': 'same_day_duplicate',
+                    'status': 'repeat_asked',
                     'existing_record_id': outcome.get('existing_record_id'),
                     'type': outcome.get('type'),
                     'value': outcome.get('value'),
@@ -1075,7 +1162,7 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
             pending=pending_count or None,
             rejected=rejected_count or None,
             dup=duplicate_count or None,
-            same_day_dup=same_day_duplicate_count or None,
+            repeat_asked=repeat_asked_count or None,
             high_value=high_value_count or None,
             balance=final_balance,
             items=[{'st': r.get('status'),
@@ -1097,7 +1184,7 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
         'pending_count': pending_count,
         'rejected_count': rejected_count,
         'duplicate_count': duplicate_count,
-        'same_day_duplicate_count': same_day_duplicate_count,
+        'repeat_asked_count': repeat_asked_count,
         'high_value_count': high_value_count,
         'final_balance': final_balance,
         'grade_limit': grade_limit,
@@ -1128,8 +1215,10 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
         'rejected (state the real reason; error_type="service_disabled" carries a ready Arabic '
         '`error` to quote); '
         'duplicate (already created from this message — done); '
-        'same_day_duplicate (كاش only — same account+value already created today; ask «تأكيد '
-        'تكرار العملية؟», on yes retry the SAME item with confirm_repeat=true); '
+        'repeat_asked (كاش only — same account+value already created today; the TOOL itself has '
+        'ALREADY asked «تأكيد التكرار؟» and is holding it — you STAY SILENT, never ask, never '
+        'set any confirm flag; when the customer later says «أيوة/تمام» call '
+        'qurtoba_confirm_pending_repeats to create it); '
         'needs_confirmation/high_value (amount over the high-value limit — the TOOL held it, NOT '
         'a rejection you make; confirm the large transfer with the customer, on yes retry with '
         'confirm_high_value=true, on no drop it). '
@@ -1156,8 +1245,6 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
                         'source_message_id': {'type': ['string', 'null'],
                                               'description': "UUID of THIS item's phone message; never reuse across items."},
                         'notes': {'type': ['string', 'null']},
-                        'confirm_repeat': {'type': 'boolean', 'default': False,
-                                           'description': 'True ONLY to retry a same_day_duplicate the customer confirmed.'},
                         'confirm_high_value': {'type': 'boolean', 'default': False,
                                                'description': 'True ONLY to retry a high_value item the customer confirmed.'},
                     },
@@ -1246,6 +1333,92 @@ def qurtoba_create_new_transactions_bulk(
     if _possibly_missing and isinstance(result, dict):
         result['possibly_missing'] = _possibly_missing
     return result
+
+
+# ---------------------------------------------------------------------------
+# Confirm held same-day REPEAT(s) — deterministic, Python-driven creation
+# ---------------------------------------------------------------------------
+
+@tool(
+    name='qurtoba_confirm_pending_repeats',
+    side_effect=True,  # mutating: creates the held repeat record(s)
+    display_name='Confirm Held Repeat Transaction(s)',
+    description=(
+        'Create the same-day كاش repeat(s) the create tool is HOLDING after it asked «تأكيد '
+        'التكرار؟» itself. Call this ONLY when the customer answers a repeat question with yes '
+        '(«أيوة/تمام/نعم/اه/ماشي/كرر»). NO inputs — the tool creates from its OWN stored state '
+        '(type/amount/number come from Python, never from you) and creates NOTHING unless the '
+        'customer sent a fresh message AFTER the tool asked (so a repeat can never be '
+        'self-confirmed in the same turn). Returns {created:[...], skipped:[...]}: created → the '
+        'tool 👍 each, STAY SILENT; skipped reason "no_customer_confirmation_yet" → nothing to '
+        'confirm this turn (do NOT re-ask); note "no_pending" → nothing was being held.'
+    ),
+    category='qurtoba',
+    requires_auth=True,
+    rate_limit=20,
+)
+def qurtoba_confirm_pending_repeats(context) -> Dict[str, Any]:
+    conv, customer, err = _resolve_conversation_and_customer(context)
+    if err:
+        return err
+
+    pending = _list_repeat_pending(conv)
+    if not pending:
+        return {'success': True, 'created': [], 'skipped': [], 'note': 'no_pending'}
+
+    social_partner = getattr(conv, 'social_partner', None)
+    from datetime import datetime as _dt, timezone as _dttz
+    from modules.chat.models import Message as _ChatMessage
+
+    created: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for sig, m in list(pending.items()):
+        asked_dt = _dt.fromtimestamp(float(m.get('asked_ts') or 0), tz=_dttz.utc)
+        # DETERMINISTIC anti-self-confirm: create ONLY if the customer sent a fresh inbound
+        # AFTER the tool asked (a LATER turn). A same-turn "confirm" has no such message and
+        # is refused here — the LLM can never self-approve a repeat.
+        has_confirmation = _ChatMessage.objects_all.filter(
+            conversation=conv, direction='inbound', active=True,
+            created_at__gt=asked_dt,
+        ).exists()
+        if not has_confirmation:
+            skipped.append({
+                'type': m.get('type'), 'value': m.get('value'),
+                'account_number': m.get('account_number'),
+                'reason': 'no_customer_confirmation_yet',
+            })
+            continue
+
+        _type = m.get('type')
+        outcome = _create_one_debt(
+            customer=customer,
+            social_partner=social_partner,
+            type=_type,
+            amount=float(m.get('value') or 0),
+            final_account=m.get('account_number'),
+            is_cash=_type in CASH_TYPES,
+            notes=None,
+            override_grade_limit=False,
+            conversation=conv,
+            source_message_id=m.get('source_message_id'),
+            consumed_message_ids=m.get('consumed_ids'),
+            confirm_repeat=True,
+            _verified_repeat=True,
+        )
+        _clear_repeat_pending(conv, sig)
+        if outcome.get('success') and outcome.get('record_id'):
+            created.append({
+                'record_id': outcome.get('record_id'), 'type': outcome.get('type'),
+                'value': outcome.get('value'), 'account_number': outcome.get('account_number'),
+            })
+        else:
+            skipped.append({
+                'type': _type, 'value': m.get('value'),
+                'account_number': m.get('account_number'),
+                'reason': outcome.get('error_type') or outcome.get('note') or 'not_created',
+            })
+
+    return {'success': True, 'created': created, 'skipped': skipped}
 
 
 # ---------------------------------------------------------------------------
