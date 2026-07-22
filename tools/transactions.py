@@ -740,10 +740,10 @@ def _create_one_debt(
             # an overlapping run (or a duplicated bulk item). Treat it as an idempotent DUPLICATE
             # (silent, "already done") instead of `same_day_duplicate` — which would fire a
             # confusing «تأكيد تكرار العملية؟» for a number that was literally just created (and
-            # already got its 👍). A genuine repeat is minutes later, so it still triggers the
-            # confirm flow. Window: AI_SAME_BURST_DEDUP_SEC (default 150s).
-            from django.conf import settings as _djs
-            _grace = getattr(_djs, 'AI_SAME_BURST_DEDUP_SEC', 150)
+            # already got its 👍). A genuine repeat is seconds+ later, so it still triggers the
+            # confirm flow. Window hardcoded to 15s: long enough to swallow a same-turn double
+            # tool-call / overlapping run, short enough that a real resend asks «تحب أكررها؟».
+            _grace = 15  # seconds — same-burst dedup window
             if (_tz.now() - dup_today.created_at).total_seconds() <= _grace:
                 return {
                     'success': True, 'duplicate': True, 'record_id': dup_today.pk,
