@@ -1,3 +1,4 @@
+import datetime as dt
 import logging
 from decimal import Decimal
 
@@ -97,32 +98,103 @@ def pull_cash_sys_catalog_task(self):
 # are grouped by root_external_ref, which maps back to qurtoba_record_id.
 
 
+class AmbiguousWebhookTarget(Exception):
+    """The webhook cannot be tied to exactly one record. Never guess on money."""
+
+
+def _root_id_from_ref(ref) -> int | None:
+    """Parse the chain root out of a Cash-SYS ref ("{root}" or "{root}#partN")."""
+    if ref in (None, ''):
+        return None
+    try:
+        return int(str(ref).split('#')[0].strip())
+    except (ValueError, TypeError):
+        return None
+
+
 def _resolve_root_record(data: dict):
     """
-    Find the Genie QurtobaRecord for a webhook, grouped by the chain root.
-    Cash-SYS children use refs like "{root}#partN"; the root maps to
-    str(qurtoba_record_id). Returns the record or None.
+    Find the ONE Genie QurtobaRecord this webhook is about.
+
+    Every caller of this uses the result to move money — zero a debt, edit a
+    ledger value. Resolving to the wrong record therefore zeroes the wrong
+    customer's transaction, so this function guesses at NOTHING: it either
+    returns exactly one record, or it raises/returns None and the failure is made
+    visible. Two rules enforce that.
+
+    RULE 1 — NO `x or y` FALLBACK BETWEEN ID FIELDS.
+    This used to read `root_external_ref or external_ref`, which silently swapped
+    to a different identifier the moment the first was null or empty. Those two
+    fields do not always denote the same order, so the fallback could resolve a
+    DIFFERENT transaction and zero it. Now: whichever fields are present are each
+    parsed to a root, and if they disagree the webhook is refused rather than
+    resolved to one of them arbitrarily.
+
+    RULE 2 — REFUSE AMBIGUITY.
+    `qurtoba_record_id` is NOT unique in Genie: the pull side has inserted the
+    same Qurtoba row more than once (57 groups / 146 rows observed, up to 4 copies
+    of one id). `.first()` on that lookup, under `Meta.ordering = ['-date','-time']`
+    which ties across copies, picks arbitrarily — i.e. a coin flip over which
+    record gets zeroed. When more than one matches we refuse and raise, so a human
+    resolves it instead of the database picking.
     """
     from qurtoba.models import QurtobaRecord
 
-    ref = data.get('root_external_ref') or data.get('external_ref') or ''
-    root = str(ref).split('#')[0].strip()
-    try:
-        qurtoba_record_id = int(root)
-    except (ValueError, TypeError):
-        logger.error('[CashSys] bad root_external_ref=%r — cannot process', ref)
-        return None
+    # Collect a root from EACH id field that is actually present — no fallback.
+    roots = {}
+    for key in ('root_external_ref', 'external_ref'):
+        if key in data and data.get(key) not in (None, ''):
+            parsed = _root_id_from_ref(data.get(key))
+            if parsed is None:
+                logger.error('[CashSys] unparseable %s=%r order_id=%s — refusing',
+                             key, data.get(key), data.get('order_id'))
+                raise AmbiguousWebhookTarget(
+                    f'unparseable {key}={data.get(key)!r}'
+                )
+            roots[key] = parsed
 
-    record = QurtobaRecord.objects.select_related('customer', 'partner', 'origin_message').filter(
-        qurtoba_record_id=qurtoba_record_id
-    ).first()
-    if not record:
+    if not roots:
+        logger.error('[CashSys] webhook carries NO usable external ref order_id=%s — refusing',
+                     data.get('order_id'))
+        raise AmbiguousWebhookTarget('no root_external_ref / external_ref in payload')
+
+    distinct = set(roots.values())
+    if len(distinct) > 1:
+        # Two ids that point at different orders. Previously the `or` hid this
+        # completely and one of them was used.
+        logger.error('[CashSys] CONFLICTING refs %s order_id=%s — refusing to guess',
+                     roots, data.get('order_id'))
+        raise AmbiguousWebhookTarget(f'conflicting external refs: {roots}')
+
+    qurtoba_record_id = distinct.pop()
+
+    matches = list(
+        QurtobaRecord.objects
+        .select_related('customer', 'partner', 'origin_message')
+        .filter(qurtoba_record_id=qurtoba_record_id)
+    )
+
+    if len(matches) > 1:
+        logger.error(
+            '[CashSys] AMBIGUOUS qurtoba_record_id=%s matches %d Genie records %s '
+            '(order_id=%s) — refusing to act on money',
+            qurtoba_record_id, len(matches), [m.pk for m in matches], data.get('order_id'),
+        )
+        raise AmbiguousWebhookTarget(
+            f'qurtoba_record_id={qurtoba_record_id} matches {len(matches)} Genie '
+            f'records {[m.pk for m in matches]} — duplicate pull; cannot tell which '
+            f'to zero. Resolve the duplicates, then retry from the UI.'
+        )
+
+    if not matches:
         logger.warning(
             '[CashSys] NO RECORD FOUND qurtoba_record_id=%s order_id=%s '
             '— record may not have synced to Genie yet',
             qurtoba_record_id, data.get('order_id'),
         )
-    return record
+        return None
+
+    return matches[0]
 
 
 def _claim_event(record, event: str, order_id, txn_id):
@@ -206,6 +278,60 @@ def _webhook_retry_or_record(task, record, event: str, data: dict, exc):
                          event, getattr(record, 'pk', None), e2)
 
 
+def _require_ledger_id(record, what: str) -> None:
+    """
+    Refuse to proceed with a money change when the record has no ledger id.
+
+    Both callers previously wrapped their accountant call in
+    `if record.qurtoba_record_id:` and then applied the local change regardless.
+    That is the worst possible shape for a money operation: the Qurtoba ledger is
+    left untouched while Genie — and the customer — are told it was applied. Fail
+    here instead, so the webhook retries and, on exhaustion, leaves a visible
+    QurtobaSyncProblem.
+    """
+    if not record.qurtoba_record_id:
+        msg = (
+            f'{what}: record {record.pk} has no qurtoba_record_id, so the ledger '
+            f'cannot be updated. Refusing to apply the change locally — doing so '
+            f'would tell the customer their money moved while the ledger disagrees.'
+        )
+        logger.error('[CashSys] %s', msg)
+        _record_money_api_failure(
+            record, 'push_record', msg,
+            {'intent': what, 'qurtoba_record_id': None,
+             'value': record.value, 'customer_id': record.customer_id},
+        )
+        raise RuntimeError(msg)
+
+
+def _record_money_api_failure(record, operation: str, error: str, payload: dict) -> None:
+    """
+    Make a failed money-affecting API call VISIBLE immediately.
+
+    These calls change what a customer owes. When one does not reach Qurtoba the
+    only previous trace was a log line, and the sync-problem row was written only
+    after every retry had been exhausted — so for the whole retry window the
+    ledger was wrong with nothing in the UI saying so. Best-effort and idempotent:
+    the retries update the same row rather than creating new ones.
+    """
+    try:
+        from qurtoba.models import QurtobaSyncProblem
+        QurtobaSyncProblem.record(record, operation, error, payload=payload)
+    except Exception as exc:
+        logger.error('[CashSys] could not record money-API failure for record=%s: %s',
+                     getattr(record, 'pk', None), exc)
+
+
+def _record_unresolved_webhook(event: str, data: dict, error: str) -> None:
+    """A webhook we could not tie to exactly one record — must never vanish."""
+    try:
+        from qurtoba.models import QurtobaSyncProblem
+        key = data.get('order_id') or data.get('root_external_ref') or data.get('external_ref') or 'unknown'
+        QurtobaSyncProblem.record_orphan(f'cash_sys_{event}', error, key, payload=data)
+    except Exception as exc:
+        logger.error('[CashSys] could not record unresolved webhook %s: %s', event, exc)
+
+
 def _retry_if_unresolved(task, event: str, data: dict) -> None:
     """The QurtobaRecord couldn't be resolved yet — almost always a race where the
     Cash-SYS webhook beat the push/sync that creates it (e.g. the accountant-
@@ -215,11 +341,18 @@ def _retry_if_unresolved(task, event: str, data: dict) -> None:
     a durable error so it's at least visible.
     """
     if task.request.retries >= task.max_retries:
-        logger.error('[CashSys] %s: record unresolved after %d retries — dropping. '
-                     'external_ref=%s order=%s',
-                     event, task.request.retries,
-                     data.get('root_external_ref') or data.get('external_ref'),
-                     data.get('order_id'))
+        # Do NOT just log and drop. This is a real Cash-SYS outcome for a real
+        # order; dropping it leaves the ledger permanently out of step with what
+        # actually happened to the money, with no visible trace.
+        refs = {k: data.get(k) for k in ('root_external_ref', 'external_ref') if k in data}
+        logger.error('[CashSys] %s: record unresolved after %d retries. refs=%s order=%s',
+                     event, task.request.retries, refs, data.get('order_id'))
+        _record_unresolved_webhook(
+            event, data,
+            f'Cash-SYS reported "{event}" for an order that matches no Genie record '
+            f'after {task.request.retries} retries (refs={refs}). The ledger was NOT '
+            f'updated. Investigate and apply manually.',
+        )
         return
     countdown = _RETRY_COUNTDOWNS[min(task.request.retries, len(_RETRY_COUNTDOWNS) - 1)]
     raise task.retry(countdown=countdown)
@@ -787,7 +920,18 @@ def handle_cash_sys_order_progress(self, data: dict):
     """
     from qurtoba.models import QurtobaRecord
 
-    record = _resolve_root_record(data)
+    # A refusal here means the payload cannot be tied to exactly ONE record
+    # (missing/conflicting refs, or a duplicated qurtoba_record_id). Do not retry
+    # — retrying cannot make an ambiguous payload unambiguous. Record it so a
+    # human resolves it, because a real order really did change state.
+    try:
+        record = _resolve_root_record(data)
+    except AmbiguousWebhookTarget as exc:
+        _record_unresolved_webhook(
+            'order_progress', data,
+            f'Refused to act: {exc} — no ledger change was applied.',
+        )
+        return
     if not record:
         _retry_if_unresolved(self, 'order_progress', data)
         return
@@ -824,7 +968,18 @@ def handle_cash_sys_order_done(self, data: dict):
     from django.utils.dateparse import parse_datetime
     from qurtoba.models import QurtobaRecord
 
-    record = _resolve_root_record(data)
+    # A refusal here means the payload cannot be tied to exactly ONE record
+    # (missing/conflicting refs, or a duplicated qurtoba_record_id). Do not retry
+    # — retrying cannot make an ambiguous payload unambiguous. Record it so a
+    # human resolves it, because a real order really did change state.
+    try:
+        record = _resolve_root_record(data)
+    except AmbiguousWebhookTarget as exc:
+        _record_unresolved_webhook(
+            'order_done', data,
+            f'Refused to act: {exc} — no ledger change was applied.',
+        )
+        return
     if not record:
         _retry_if_unresolved(self, 'order_done', data)
         return
@@ -883,7 +1038,18 @@ def handle_cash_sys_order_canceled(self, data: dict):
 
     reroute:false (plain customer/agent cancel) — just mark canceled, no reissue.
     """
-    record = _resolve_root_record(data)
+    # A refusal here means the payload cannot be tied to exactly ONE record
+    # (missing/conflicting refs, or a duplicated qurtoba_record_id). Do not retry
+    # — retrying cannot make an ambiguous payload unambiguous. Record it so a
+    # human resolves it, because a real order really did change state.
+    try:
+        record = _resolve_root_record(data)
+    except AmbiguousWebhookTarget as exc:
+        _record_unresolved_webhook(
+            'order_canceled', data,
+            f'Refused to act: {exc} — no ledger change was applied.',
+        )
+        return
     if not record:
         _retry_if_unresolved(self, 'order_canceled', data)
         return
@@ -894,20 +1060,30 @@ def handle_cash_sys_order_canceled(self, data: dict):
     try:
         reason = data.get('cancel_reason')
         if data.get('reroute'):
+            # Partial fulfilment: settle at the amount actually sent, not zero.
             _apply_reroute(record, data)
-        elif reason in ('no_wallet', 'cancel_request'):
-            # Full-reversal cancel: zero the debt (value→0 on the accountant ledger),
-            # mark canceled, and notify the customer. Only valid on a pristine main
-            # order — Cash-SYS already enforced that before firing this webhook.
-            _apply_zero_cancel(record, reason)
         else:
-            # Plain cancel (customer / agent): mark canceled only — no ledger touch,
-            # no customer message (unchanged behaviour).
-            from qurtoba.models import QurtobaRecord
-            QurtobaRecord.objects.filter(pk=record.pk).update(
-                cash_sys_state='canceled', cash_sys_canceled_reason=reason,
-            )
-            logger.info('[CashSys Canceled] record=%d reason=%s (no reroute)', record.pk, reason)
+            # A cancellation that is NOT a reroute means the transfer did not
+            # happen, so the customer must not owe it. Zero the ledger.
+            #
+            # This used to be an ALLOW-LIST — only 'no_wallet' and 'cancel_request'
+            # zeroed, and every other reason fell into an else that merely marked
+            # the record canceled and explicitly did "no ledger touch". Cash-SYS
+            # also sends 'agent' (an operator cancelling inside the Cash app), and
+            # that reason was not on the list, so those cancellations left the debt
+            # standing at full value on both ledgers — silently, since marking it
+            # canceled looks like success.
+            #
+            # Measured before the fix: 28 agent-cancelled records still carrying
+            # 194,370 EGP across 16 customers, the oldest from 2026-06-17.
+            #
+            # Inverted deliberately: a new reason Cash-SYS invents tomorrow now
+            # defaults to "the money did not move" rather than to "keep charging
+            # the customer". _apply_zero_cancel refuses if anything WAS fulfilled,
+            # and _send_cancel_notice only messages for reasons that have a
+            # template — so 'agent' zeroes the ledger without texting the customer,
+            # exactly as before.
+            _apply_zero_cancel(record, reason)
         _commit_event(record, commit_key)
     except Exception as exc:
         _release_event(cache_key)
@@ -950,12 +1126,25 @@ def _apply_reroute(record, data: dict):
     # first means the save() below pulls the already-corrected Rest → both in sync.
     # Raise on failure so the handler retries instead of settling over an
     # inconsistent ledger / asking the customer for a new number prematurely.
-    if record.qurtoba_record_id:
-        err = edit_qurtoba_record_value(record.qurtoba_record_id, fulfilled)
-        if err:
-            logger.error('[CashSys Reroute] accountant edit FAILED record=%d qid=%s: %s',
-                         record.pk, record.qurtoba_record_id, err)
-            raise RuntimeError(f'accountant edit failed for qid={record.qurtoba_record_id}: {err}')
+    # Same rule as the zero-cancel: a missing ledger id is a hard failure. Skipping
+    # the edit here would settle the order locally at `fulfilled` while the ledger
+    # still carries the FULL original amount — the customer over-charged by the
+    # remainder, silently.
+    _require_ledger_id(record, 'reroute settle')
+    err = edit_qurtoba_record_value(record.qurtoba_record_id, fulfilled)
+    if err:
+        logger.error('[CashSys Reroute] accountant edit FAILED record=%d qid=%s: %s',
+                     record.pk, record.qurtoba_record_id, err)
+        _record_money_api_failure(
+            record, 'cash_sys_order_canceled',
+            f'Ledger edit to {fulfilled} did NOT reach Qurtoba '
+            f'(qid={record.qurtoba_record_id}): {err}. The ledger still holds the '
+            f'original {record.cash_sys_original_value}; the customer is over-charged '
+            f'by the remainder until this is applied.',
+            {'intent': f'set value to {fulfilled}', 'reroute_amount': reroute_amount,
+             'qurtoba_record_id': record.qurtoba_record_id, 'error': err},
+        )
+        raise RuntimeError(f'accountant edit failed for qid={record.qurtoba_record_id}: {err}')
 
     # Settle THIS order at the sent amount and mark it done (state 'rerouted' is just
     # a done-order marker explaining why value < original — cash_sys_done=True is
@@ -990,27 +1179,127 @@ def _apply_zero_cancel(record, reason):
     «لم يتم تسجيل العمليه عليك»."""
     from qurtoba.utils_sync import edit_qurtoba_record_value
 
+    # SPLIT ORDERS: an order may be fulfilled across several partial transfers.
+    # Each one arrives as order_progress and records how much has really gone out
+    # (cash_sys_fulfilled + cash_sys_transactions). If a cancel then lands on the
+    # REMAINDER, zeroing the whole record would erase a transfer that genuinely
+    # happened and hand the customer that money for free.
+    #
+    # Re-read first: order_progress writes with .update(), so the instance loaded
+    # by the webhook can be stale by the time we get here. Two events arriving
+    # back-to-back is exactly when this matters, and reading a stale
+    # cash_sys_fulfilled=None is what would cause the wrongful zero.
+    try:
+        record.refresh_from_db()
+    except Exception as exc:
+        logger.warning('[CashSys ZeroCancel] refresh failed for record=%s: %s', record.pk, exc)
+
+    fulfilled = float(record.cash_sys_fulfilled or 0)
+    txns = record.cash_sys_transactions or []
+    partial = fulfilled > 0 or bool(txns)
+
+    # `fulfilled` can be absent even when transfers exist (a progress event that
+    # omitted it, or briefs merged from a done event). Falling through with
+    # fulfilled=0 while transactions are present would settle at ZERO and wipe
+    # money that really went out, so derive the amount from the transfers instead.
+    if partial and fulfilled <= 0 and txns:
+        derived = 0.0
+        for t in txns:
+            try:
+                derived += float((t or {}).get('value') or 0)
+            except (TypeError, ValueError):
+                derived = 0.0
+                break
+        fulfilled = derived
+
+    # If money demonstrably moved but we cannot establish HOW MUCH, do not guess.
+    # Zeroing would gift the customer the sent amount; picking a number would be
+    # invention. Leave the ledger untouched and let a human settle it.
+    if partial and fulfilled <= 0:
+        msg = (
+            f'Record {record.pk}: cancel (reason={reason}) landed on an order that has '
+            f'transfers recorded ({txns}) but no usable fulfilled amount. Refusing to '
+            f'touch the ledger — zeroing would erase money that already went out. '
+            f'Settle this one by hand.'
+        )
+        logger.error('[CashSys ZeroCancel] %s', msg)
+        _record_money_api_failure(
+            record, 'cash_sys_order_canceled', msg,
+            {'reason': reason, 'value': record.value,
+             'fulfilled': record.cash_sys_fulfilled, 'transactions': txns},
+        )
+        raise RuntimeError(msg)
+
+    # Settle at what ACTUALLY went out — 0 for a pristine order, `fulfilled` for a
+    # partially-sent one. Settling beats refusing here: refusing would leave the
+    # record at its FULL original value, i.e. the customer charged for the whole
+    # transfer when only part of it was sent. That is the worse of the two errors.
+    target = fulfilled if partial else 0.0
+
     # Capture the original value once, for reference / audit.
     if record.cash_sys_original_value is None:
         record.cash_sys_original_value = record.value
 
-    if record.qurtoba_record_id:
-        err = edit_qurtoba_record_value(record.qurtoba_record_id, 0)
-        if err:
-            logger.error('[CashSys ZeroCancel] accountant edit→0 failed record=%d qid=%s: %s',
-                         record.pk, record.qurtoba_record_id, err)
-            raise RuntimeError(f'accountant zero-edit failed for qid={record.qurtoba_record_id}: {err}')
+    if partial:
+        # A partial send normally terminates as reroute=true. Arriving here as a
+        # plain cancel is unusual, so settle correctly AND make it visible.
+        logger.warning(
+            '[CashSys ZeroCancel] record=%d reason=%s arrived as a PLAIN cancel after a '
+            'partial send (fulfilled=%s of %s) — settling at the amount sent, not 0.',
+            record.pk, reason, fulfilled, record.cash_sys_original_value,
+        )
+        _record_money_api_failure(
+            record, 'cash_sys_order_canceled',
+            f'Cancel (reason={reason}) landed on a PARTIALLY SENT order: '
+            f'{fulfilled} of {record.cash_sys_original_value} had already gone out. '
+            f'Settled the ledger at {fulfilled} instead of 0 so the sent money is still '
+            f'owed. Expected this to arrive as reroute=true — worth checking Cash-SYS.',
+            {'reason': reason, 'original_value': record.cash_sys_original_value,
+             'fulfilled': fulfilled, 'settled_at': target,
+             'transactions': record.cash_sys_transactions},
+        )
 
-    # Settle THIS order at 0 and mark it canceled. save() pulls the corrected Rest.
-    record.value = 0
+    # NEVER skip the ledger edit. This used to be `if record.qurtoba_record_id:`,
+    # so a record without one silently bypassed the accountant call and fell
+    # straight through to `record.value = 0` + «و لم يتم تسجيل العمليه عليك» —
+    # telling the customer they were not charged while the debt stayed on the
+    # ledger. A missing id is a hard failure, not a reason to continue.
+    _require_ledger_id(record, 'zero-cancel')
+    err = edit_qurtoba_record_value(record.qurtoba_record_id, target)
+    if err:
+        logger.error('[CashSys ZeroCancel] accountant edit→%s failed record=%d qid=%s: %s',
+                     target, record.pk, record.qurtoba_record_id, err)
+        # Surface it immediately — this is a money-affecting API call that did not
+        # land. Waiting for the retries to run out first leaves a window where the
+        # ledger is wrong and nothing in the UI says so. The upsert is idempotent,
+        # so the retries just bump `attempts` on the same row.
+        _record_money_api_failure(
+            record, 'cash_sys_order_canceled',
+            f'Ledger edit to {target} did NOT reach Qurtoba (qid={record.qurtoba_record_id}): '
+            f'{err}. The customer has NOT been notified and the debt is still on the ledger.',
+            {'intent': f'set value to {target}', 'reason': reason,
+             'qurtoba_record_id': record.qurtoba_record_id, 'error': err},
+        )
+        raise RuntimeError(f'accountant edit to {target} failed for qid={record.qurtoba_record_id}: {err}')
+
+    # Settle THIS order at the amount that really went out and mark it canceled.
+    # save() pulls the corrected Rest back from Qurtoba.
+    record.value = target
     record.cash_sys_state = 'canceled'
     record.cash_sys_canceled_reason = reason
+    if partial:
+        # Part of it really was sent, so the order is finished, not undone.
+        record.cash_sys_done = True
     record.save()
 
-    logger.info('[CashSys ZeroCancel] record=%d reason=%s original=%s → value 0',
-                record.pk, reason, record.cash_sys_original_value)
+    logger.info('[CashSys ZeroCancel] record=%d reason=%s original=%s → value %s%s',
+                record.pk, reason, record.cash_sys_original_value, target,
+                ' (partial: settled at amount sent)' if partial else '')
 
-    _send_cancel_notice(record, reason)
+    # Only a FULL reversal may tell the customer «لم يتم تسجيل العمليه عليك» — that
+    # sentence is false when part of the money did go out.
+    if not partial:
+        _send_cancel_notice(record, reason)
 
 
 _RETRY_COUNTDOWNS = [5, 15, 30]  # seconds before retry attempt 2, 3, 4
@@ -1020,13 +1309,33 @@ _RETRY_COUNTDOWNS = [5, 15, 30]  # seconds before retry attempt 2, 3, 4
 def push_record_to_qurtoba_task(self, record_pk: int):
     from qurtoba.utils_sync import push_record_to_qurtoba, _mark_error
 
-    error = push_record_to_qurtoba(record_pk)
+    # ANY exception here must become a RETURNED error string, never an escaping
+    # raise. The whole failure pipeline below (retry → _mark_error →
+    # QurtobaSyncProblem) hangs off `if error:`, so an exception that propagates
+    # out of this task silently bypasses all three: no retry, qurtoba_sync_error
+    # stays NULL, and nothing appears in the sync-problems UI. That is exactly how
+    # records 22511 (500) and 22470 (28,000) were lost on 2026-08-06/07 — a
+    # `FATAL: too many connections for role "qurtoba"` OperationalError was raised
+    # by the record read inside push_record_to_qurtoba, ~0.35 s after post_create
+    # enqueued this task, and died here without a trace. The money was ack'd to the
+    # customer with 👍 but never reached the Qurtoba ledger or Cash-SYS.
+    # Note this catches only the call itself, NOT self.retry()'s Retry exception.
+    try:
+        error = push_record_to_qurtoba(record_pk)
+    except Exception as exc:
+        error = f'{type(exc).__name__}: {exc}'
     if error:
         countdown = _RETRY_COUNTDOWNS[min(self.request.retries, len(_RETRY_COUNTDOWNS) - 1)]
         try:
             raise self.retry(exc=Exception(error), countdown=countdown)
         except self.MaxRetriesExceededError:
-            _mark_error(record_pk, error)
+            # Best-effort: if the DB is the very thing that's failing, marking the
+            # error can raise too — which would again lose the record silently. The
+            # sweeper (reconcile_unsynced_qurtoba_records) is the backstop for that.
+            try:
+                _mark_error(record_pk, error)
+            except Exception as exc:
+                logger.error('Failed to mark sync error on record %s: %s', record_pk, exc)
             # Retries exhausted → log a sync-problem row + notify admins so the
             # failed push is visible and retryable from the UI (not silently lost).
             try:
@@ -1045,3 +1354,116 @@ def push_record_to_qurtoba_task(self, record_pk: int):
                     )
             except Exception as exc:
                 logger.error('Failed to record QurtobaSyncProblem for record %s: %s', record_pk, exc)
+
+
+def _sync_problem(rec, error: str) -> None:
+    """Best-effort: surface a failed/stuck push as a UI-actionable problem row."""
+    try:
+        from qurtoba.models import QurtobaSyncProblem
+        QurtobaSyncProblem.record(
+            rec, 'push_record', error,
+            payload={
+                'type': rec.type,
+                'value': rec.value,
+                'account_number': rec.account_number,
+                'is_down': rec.is_down,
+                'customer_id': rec.customer_id,
+            },
+        )
+    except Exception as exc:
+        logger.error('Failed to record QurtobaSyncProblem for record %s: %s', rec.pk, exc)
+
+
+@shared_task
+def reconcile_unsynced_qurtoba_records():
+    """
+    Backstop sweeper: find Genie-born records that never reached Qurtoba and push
+    them again.
+
+    WHY THIS EXISTS (beyond the in-task retry): the retry chain only covers a
+    failure the task itself lives to observe. It does NOT cover a task that dies
+    outright, a `.delay()` that never enqueued, a worker killed mid-push, or a
+    connection squeeze that outlasts all three retries (~50 s). Every one of those
+    leaves a record ack'd to the customer with 👍 but absent from the ledger and
+    from Cash-SYS — invisible, because nothing ever wrote an error. Six records
+    were lost that way before this existed (500 and 28,000 EGP among them).
+
+    IT DOES NOT POST. Owner policy, and it is the right one: a transfer that
+    surfaces minutes or hours late is worse than one that never happened. By then
+    the customer has usually been told it failed — record 22470 (28,000) is the
+    proof: the chat already said «تم الغاء التحويل» and «لم يتم تسجيل العمليه عليك»,
+    so auto-pushing it would have invented a 28,000 debt for a transfer the
+    customer had been told did not happen. The in-task retry chain still covers the
+    only window where re-posting is safe: the first ~50 seconds, while the customer
+    is still waiting on the 👍.
+
+    So this task's whole job is VISIBILITY: turn a silent phantom into a
+    QurtobaSyncProblem row an admin can see and decide on (settle by hand, or
+    purge it with `manage.py purge_phantom_qurtoba_records`).
+
+    MIN_AGE keeps it from racing the push's own retries. Set
+    QURTOBA_RECONCILE_AUTOPUSH=True only if you have a deliberate reason to let it
+    move money again.
+    """
+    from django.utils import timezone
+    from django.conf import settings as dj_settings
+    from qurtoba.models import QurtobaRecord
+
+    stats = {'checked': 0, 'surfaced': 0, 'pushed': 0, 'failed': 0}
+
+    if not getattr(dj_settings, 'QURTOBA_RECONCILE_ENABLED', True):
+        logger.info('[Reconcile] disabled via QURTOBA_RECONCILE_ENABLED')
+        return stats
+
+    min_age  = int(getattr(dj_settings, 'QURTOBA_RECONCILE_MIN_AGE_MINUTES', 5))
+    batch    = int(getattr(dj_settings, 'QURTOBA_RECONCILE_BATCH', 25))
+    autopush = bool(getattr(dj_settings, 'QURTOBA_RECONCILE_AUTOPUSH', False))
+    now      = timezone.now()
+
+    # Genie-born (customer_data_qurtoba_id is set only on records that came FROM
+    # Qurtoba) and demonstrably never landed there.
+    stuck = QurtobaRecord.objects.filter(
+        qurtoba_synced=False,
+        qurtoba_record_id__isnull=True,
+        customer_data_qurtoba_id__isnull=True,
+        created_at__lte=now - dt.timedelta(minutes=min_age),
+    ).order_by('created_at')[:batch]
+
+    for rec in stuck:
+        stats['checked'] += 1
+
+        if not autopush:
+            # Default path: report, never move money. QurtobaSyncProblem.record()
+            # is an idempotent upsert, so repeating every 5 min neither duplicates
+            # rows nor re-notifies.
+            stats['surfaced'] += 1
+            _sync_problem(
+                rec,
+                'Created in Genie but never reached Qurtoba (no ledger row, no '
+                'Cash-SYS order) — NOT auto-posted, because a late transfer can '
+                'contradict what the customer was already told. Settle by hand if '
+                'still owed, or purge it.',
+            )
+            continue
+
+        # Opt-in only.
+        from qurtoba.utils_sync import push_record_to_qurtoba, _mark_error
+        try:
+            error = push_record_to_qurtoba(rec.pk)
+        except Exception as exc:
+            error = f'{type(exc).__name__}: {exc}'
+        if error:
+            stats['failed'] += 1
+            logger.warning('[Reconcile] record=%s push failed: %s', rec.pk, error)
+            try:
+                _mark_error(rec.pk, error)
+            except Exception as exc:
+                logger.error('[Reconcile] mark_error failed for %s: %s', rec.pk, exc)
+            _sync_problem(rec, error)
+        else:
+            stats['pushed'] += 1
+            logger.info('[Reconcile] record=%s pushed to Qurtoba successfully', rec.pk)
+
+    if stats['checked']:
+        logger.info('[Reconcile] %s', stats)
+    return stats

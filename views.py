@@ -93,13 +93,56 @@ class QurtobaCustomerDetailView(APIView):
 class QurtobaRecordListView(APIView):
     """
     POST /transactions/api2/record/
-    Receives a new Record (transaction) forwarded from Qurtoba.
-    Always creates; stores raw payload for debugging.
+    Receives a Record (transaction) forwarded from Qurtoba.
+
+    IDEMPOTENT on `_record_id` (Qurtoba's own primary key). It used to "always
+    create", so every retry from Qurtoba — a timeout, a network blip — inserted
+    ANOTHER Genie row for the same ledger entry. That produced 57 groups / 146
+    duplicated `qurtoba_record_id` values, up to 4 copies of one id, arriving
+    seconds apart at exactly retry intervals.
+
+    Those duplicates are dangerous rather than merely untidy: the Cash-SYS webhook
+    resolves its target BY `qurtoba_record_id`, so a duplicated id means several
+    Genie records answer to one webhook and the wrong one could be zeroed. The
+    webhook now refuses that ambiguity outright, and this stops new ones being
+    created at the source.
     """
 
     def post(self, request):
         from django.utils import timezone
+        from django.core.cache import cache
+        from qurtoba.models import QurtobaRecord
+
         data = request.data
+
+        # ── Idempotency guard ────────────────────────────────────────────────
+        raw_record_id = data.get('_record_id')
+        record_id = None
+        if raw_record_id not in (None, ''):
+            try:
+                record_id = int(raw_record_id)
+            except (ValueError, TypeError):
+                record_id = None
+
+        if record_id is not None:
+            existing = QurtobaRecord.objects.filter(qurtoba_record_id=record_id).first()
+            if existing:
+                logger.info(
+                    '[Qurtoba Sync] record _record_id=%s already exists as Genie #%s '
+                    '— treating as a duplicate delivery, not creating another row',
+                    record_id, existing.pk,
+                )
+                return Response({'status': True, 'duplicate': True, 'id': existing.pk},
+                                status=status.HTTP_200_OK)
+
+            # Close the retry race: two deliveries can both read "not found" before
+            # either writes. SETNX is atomic; the loser is told it is a duplicate.
+            claim = f'qurtoba:sync:record:{record_id}'
+            if not cache.add(claim, 1, timeout=120):
+                logger.info('[Qurtoba Sync] _record_id=%s already being ingested — skipping', record_id)
+                return Response({'status': True, 'duplicate': True, 'in_flight': True},
+                                status=status.HTTP_200_OK)
+
         ser = QurtobaRecordSerializer(data=data)
         if ser.is_valid():
             obj = ser.save()
@@ -136,6 +179,12 @@ class QurtobaRecordListView(APIView):
                 )
             return Response({'status': True}, status=status.HTTP_201_CREATED)
 
+        # Nothing was created, so release the in-flight claim — otherwise a
+        # corrected retry would be rejected as a duplicate for the full TTL.
+        if record_id is not None:
+            cache.delete(f'qurtoba:sync:record:{record_id}')
+        logger.warning('[Qurtoba Sync] invalid record payload _record_id=%s: %s',
+                       record_id, ser.errors)
         return Response({'status': False, 'errors': ser.errors}, status=status.HTTP_400_BAD_REQUEST)
 
     @staticmethod

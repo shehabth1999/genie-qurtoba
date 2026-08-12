@@ -1618,6 +1618,52 @@ class QurtobaSyncProblem(BaseModel):
 
     # ---- producer ----------------------------------------------------------
     @classmethod
+    def record_orphan(cls, operation, error, key, payload=None):
+        """
+        Record a problem that has NO resolvable target record.
+
+        A Cash-SYS webhook whose external ref is missing, conflicting, or matches
+        several Genie rows cannot be tied to a record — yet it is precisely the
+        case that must not vanish: it means a real order out there was cancelled
+        or rerouted and we could not apply it. Without a row here the only trace
+        is a log line nobody reads, and the customer's ledger stays wrong.
+
+        `key` (typically the Cash-SYS order id) keeps the upsert idempotent across
+        the webhook's own retries, standing in for the missing object_id.
+        """
+        from django.utils import timezone
+        import json
+        if payload is None or isinstance(payload, str):
+            payload_str = payload
+        else:
+            try:
+                payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError):
+                payload_str = str(payload)
+        problem, _created = cls.objects.update_or_create(
+            content_type=None,
+            object_id=f'unresolved:{key}',
+            operation=operation,
+            status='failed',
+            defaults={
+                'error': error or '',
+                'payload': payload_str,
+                'model_label': 'qurtoba.unresolved',
+                'last_attempt_at': timezone.now(),
+            },
+        )
+        cls.objects.filter(pk=problem.pk).update(attempts=models.F('attempts') + 1)
+        problem.refresh_from_db(fields=['attempts', 'notified'])
+        if not problem.notified:
+            try:
+                problem._notify_admins()
+            except Exception as exc:
+                logger.warning('QurtobaSyncProblem notify failed for %s: %s', problem.pk, exc)
+            cls.objects.filter(pk=problem.pk).update(notified=True)
+            problem.notified = True
+        return problem
+
+    @classmethod
     def record(cls, target, operation, error, payload=None):
         """
         Upsert an OPEN (status='failed') problem row for target+operation and

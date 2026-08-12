@@ -20,10 +20,18 @@ def push_record_to_qurtoba(record_pk: int) -> str | None:
     if not base or not token:
         return 'QURTOBA_BASE_URL / QURTOBA_TOKEN not configured'
 
+    # The POST below is defended by a broad `except Exception -> return str(exc)`;
+    # this read must be too, or the asymmetry loses records. An infrastructure
+    # error here (notably `FATAL: too many connections for role`) used to RAISE
+    # straight through the caller task, skipping its retry/_mark_error/
+    # QurtobaSyncProblem handling entirely — a silent money loss. Returning the
+    # error string instead routes it into that machinery like any other failure.
     try:
         record = QurtobaRecord.objects.select_related('customer').get(pk=record_pk)
     except QurtobaRecord.DoesNotExist:
         return None  # deleted before task ran — nothing to do
+    except Exception as exc:
+        return f'Could not read record {record_pk}: {type(exc).__name__}: {exc}'
 
     # Idempotency: already pushed → never create a duplicate Qurtoba record.
     # This makes it safe for BOTH the async post_create enqueue AND an explicit
