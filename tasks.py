@@ -1657,6 +1657,7 @@ def _unanswered_inbound_ids(conversation_id) -> list:
 def recover_stranded_conversations():
     """Re-trigger conversations whose messages sit behind a dead processing lock."""
     from django.conf import settings as dj_settings
+    from django.core.cache import cache
     from modules.aistudio_whatsapp.tasks import process_workflow_messages
 
     if not hasattr(cache, 'iter_keys'):
