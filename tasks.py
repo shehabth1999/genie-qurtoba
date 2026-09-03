@@ -1704,6 +1704,74 @@ def recover_stranded_conversations():
         process_workflow_messages.apply_async(args=[chat_key, conversation_id], countdown=1)
         stats['recovered'] += 1
 
-    if stats['recovered'] or stats['cleared']:
+    # ── Abdicated transaction messages ───────────────────────────────────
+    # The model sometimes answers a transaction message with nothing usable —
+    # observed shape (sandbox 2026-09-03, scenario E2, ~1 run in 3): a message that
+    # repeats a transfer created minutes earlier gets a bare 👍 and NO tool call,
+    # the gate drops the 👍, and the customer's request simply disappears. Every
+    # correct outcome leaves a trace after the inbound row: a tool_call row (the
+    # create/planner ran), an outbound row (a question, a template, the tool's
+    # 👍), or the watermark. A self-contained transaction message (phone+amount)
+    # that is a minute old with none of those is re-run ONCE; the create tool's
+    # own duplicate/repeat gates make a second run safe.
+    try:
+        stats['abdicated'] = 0
+        for msg in _abdicated_transaction_messages():
+            conversation_id = str(msg.conversation_id)
+            chat_key = f'conversation_{conversation_id}'
+            marker = f'qurtoba:abdication_retry:{msg.id}'
+            if not cache.add(marker, 1, timeout=3600):
+                continue   # already retried once
+            if cache.get(f'pending_task:{chat_key}'):
+                continue   # a run is scheduled or in flight — leave it
+            acc_key = f'accumulated_messages:{chat_key}'
+            waiting = list(cache.get(acc_key, []) or [])
+            if str(msg.id) not in waiting:
+                waiting.append(str(msg.id))
+            cache.set(acc_key, waiting, timeout=_LOCK_TTL_SECONDS)
+            logger.warning(
+                '[StrandedRecovery] %s: transaction message %s got no tool call and no reply — re-running once.',
+                chat_key, str(msg.id)[:8],
+            )
+            process_workflow_messages.apply_async(args=[chat_key, conversation_id], countdown=1)
+            stats['abdicated'] += 1
+    except Exception:
+        logger.exception('[StrandedRecovery] abdication scan failed')
+
+    if stats['recovered'] or stats['cleared'] or stats.get('abdicated'):
         logger.info('[StrandedRecovery] %s', stats)
     return stats
+
+
+def _abdicated_transaction_messages(min_age_s: int = 60, max_age_min: int = 6):
+    """Unconsumed self-contained transaction messages with no trace of handling after them."""
+    from datetime import timedelta
+    from django.utils import timezone
+    from modules.chat.models import Message
+    from qurtoba.tools.planning import _classify_message
+
+    now = timezone.now()
+    rows = (
+        Message.objects_all
+        .filter(direction='inbound', type='text', active=True, ai_consumed_at__isnull=True,
+                created_at__lte=now - timedelta(seconds=min_age_s),
+                created_at__gte=now - timedelta(minutes=max_age_min),
+                conversation__handled_by_ai=True, conversation__type='whatsapp',
+                conversation__social_partner__qurtoba_customer__isnull=False)
+        .order_by('created_at')
+    )
+    out = []
+    for m in rows:
+        txt = m.content.get('text') if isinstance(m.content, dict) else ''
+        if not txt:
+            continue
+        cls = _classify_message(' '.join(str(txt).split()))
+        if len(cls['phones']) != 1 or len(cls['amounts']) != 1:
+            continue
+        handled = Message.objects_all.filter(
+            conversation_id=m.conversation_id, created_at__gt=m.created_at,
+        ).exclude(direction='inbound').exists()
+        if handled:
+            continue
+        out.append(m)
+    return out
