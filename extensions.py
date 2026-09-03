@@ -562,13 +562,44 @@ class ConversationQurtobaExtension(ModelExtension):
                 # before id. id alone is random and scrambled same-second phone/amount pairs.
                 .order_by(F('_ord').desc(), F('created_at').desc(), F('id').desc())[:40]
             )[::-1]  # back to chronological (true send) order
+            # A message that repeats a transfer already created today is the case the
+            # model handles worst: it sees the earlier 👍 in history, decides "duplicate"
+            # on its own and answers with a bare 👍 or nothing — no tool call, so the
+            # tool's «تحب أكررها؟» never fires and the customer gets silence (sandbox
+            # 2026-09-03, scenario E2, twice). A deterministic, message-specific warning
+            # here outranks any general rule in the prompt.
+            repeat_note = ''
+            try:
+                from qurtoba.models import QurtobaRecord
+                from qurtoba.tools.planning import _classify_message
+                customer = getattr(getattr(self, 'social_partner', None), 'qurtoba_customer', None)
+                day_start = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
+
+                def _is_repeat_of_today(text):
+                    if customer is None:
+                        return False
+                    cls = _classify_message(text)
+                    if len(cls['phones']) != 1 or len(cls['amounts']) != 1:
+                        return False
+                    return QurtobaRecord.objects.filter(
+                        customer=customer, account_number=cls['phones'][0],
+                        value=cls['amounts'][0], created_at__gte=day_start,
+                    ).exists()
+                repeat_note = (' ← ⚠️ تكرار لتحويل اتعمل النهارده فعلاً: ابعتها لأداة الإنشاء زي أي طلب '
+                               '(الأداة هي اللي تسأل «تحب أكررها؟»). ممنوع تحكم إنها مكررة بنفسك، '
+                               'ممنوع 👍، ممنوع الصمت.')
+            except Exception:
+                _is_repeat_of_today = lambda text: False  # noqa: E731
+
             lines = []
             for m in rows:
                 c = m.content
                 txt = c.get('text') if isinstance(c, dict) else None
                 if not txt:
                     continue
-                lines.append(f"[message_id: {m.id}] {' '.join(str(txt).split())}")
+                flat = ' '.join(str(txt).split())
+                suffix = repeat_note if repeat_note and _is_repeat_of_today(flat) else ''
+                lines.append(f"[message_id: {m.id}] {flat}{suffix}")
             if not lines:
                 return {'unprocessed_transactions': ''}
             # Loud, deterministic priority flag emitted EVERY run there are still-open

@@ -180,6 +180,16 @@ _NARRATION_RES = [
     re.compile(r'^\s*تم\s+\S*\s*(إنشاء|انشاء|تنفيذ|تسجيل|إرسال|ارسال)\b.*\b(بنجاح|تمام)\b'),
     re.compile(r'^\s*تم\s+(إنشاء|انشاء|تنفيذ|تسجيل)\s+.*\bبنجاح\b'),
     re.compile(r'^\s*لا\s+(حاجة|داعي)\s+(ل|لإ|للـ?)'),
+    # Third-person status about the system/turn, seen in the 2026-09-03 sandbox run:
+    # «اليوم السابق كان فيه تحويل لنفس المبلغ … وفي انتظار رد العميل على سؤال التأكيد اللي النظام بعته»
+    re.compile(r'(في\s+)?انتظار\s+رد'),
+    re.compile(r'النظام\s+(بعت|أرسل|ارسل|هيبعت|هيرسل|رد)'),
+    re.compile(r'^\s*(و)?اليوم\s+السابق'),
+    re.compile(r'^\s*(الدور|التيرن|الجولة)\s+(خلص|انتهى|اكتمل)'),
+    # «لا يوجد تأكيد جديد بعد سؤال التكرار. لا شيء لأكرره هذا الدور.» (sandbox E2)
+    re.compile(r'^\s*(لا|مفيش|ما\s*فيش)\s+(يوجد|توجد|فيه)?\s*(تأكيد|رد|شيء|شئ|حاجة|جديد)'),
+    re.compile(r'^\s*(لا|مفيش)\s+(شيء|شئ|حاجة)\s+(ل|أ|ا|ت)'),
+    re.compile(r'(هذا|في\s+هذا|ده)\s+الدور\b'),
     # English self-reports observed in conversation 13f58d64 (2026-08-25..30):
     # «created. silence.», «Created. The tool sent 👍. Stay silent.», «Done.»
     re.compile(r'^\s*(successfully (created|executed|registered|sent)|no (reply|response) (is )?(needed|required))\b', re.I),
@@ -208,6 +218,47 @@ def is_non_message(output: str) -> bool:
     if not any(ch.isalpha() for ch in text):
         return True
     return False
+
+
+# After a tool already delivered the customer's answer (👍, balance, statement, a
+# quoted question), the agent's own trailing text is redundant ONLY when it is a
+# status claim about that delivery. Text that carries money content — a number,
+# an amount, a question, an instruction — is a second, legitimate message (the
+# rejection of a bad number in a mixed batch; the question about a rerouted
+# remainder) and must go out. Sandbox evaluation 2026-09-03 caught the gate
+# swallowing exactly those.
+_SUCCESS_CLAIM_RE = re.compile(
+    r'(اتنفذ|اتسجل|اتبعت|تم\s+(ال)?تنفيذ|تم\s+استلام|تم\s+(إنشاء|انشاء|تسجيل|إرسال|ارسال)|اكتمل|بنجاح|'
+    r'لا\s+رد|no\s+reply|zero\s+(chars|characters|output)|created|posted|انتظار\s+رد|النظام\s+(بعت|أرسل|ارسل)|'
+    r'nothing\s+(further|else|more)|silent|silence|auto-?ack|👍|✅)',
+    re.I,
+)
+_ARABIC_RE = re.compile(r'[؀-ۿ]')
+_LATIN_RE = re.compile(r'[A-Za-z]')
+
+
+def is_non_arabic(output: str) -> bool:
+    """Text written in Latin script — the agent's laws say Arabic only, so this is
+    never a customer message (it is the model thinking in English). One quoted
+    Arabic word inside an English sentence («…replies «تأكيد»») does not make it
+    Arabic: Latin letters must not outnumber Arabic letters three to one."""
+    text = str(output or '')
+    latin = len(_LATIN_RE.findall(text))
+    arabic = len(_ARABIC_RE.findall(text))
+    if latin == 0:
+        return False
+    return arabic == 0 or latin > 3 * arabic
+
+
+def is_redundant_after_tool_reply(output: str) -> bool:
+    text = str(output or '').strip()
+    if not text:
+        return False
+    if is_self_narration(text) or is_non_message(text) or is_non_arabic(text):
+        return True
+    if _HAS_REAL_CONTENT_RE.search(text):
+        return False
+    return bool(_SUCCESS_CLAIM_RE.search(text))
 
 
 def is_self_narration(output: str) -> bool:
@@ -291,12 +342,55 @@ def is_echo_with_note(output: str, conversation_id) -> bool:
 _DUPLICATE_WINDOW = 30  # seconds
 
 
+_PUNCT_RE = re.compile(r'[\s\.\,،؛:;!\?؟\-—–_*"«»\(\)\[\]]+')
+
+
+def _dedupe_key_text(text: str) -> str:
+    """Punctuation-free form: «تم الإيقاف — النظام ينفّذ» and «تم الإيقاف. النظام ينفّذ»
+    are the same message (the channel's dash normalisation rewrites one into the other)."""
+    return _PUNCT_RE.sub('', _normalize_for_match(text))
+
+
 def _is_duplicate_send(conversation_id, text: str) -> bool:
-    digest = hashlib.sha1(text.strip().encode('utf-8')).hexdigest()[:16]
+    digest = hashlib.sha1(_dedupe_key_text(text).encode('utf-8')).hexdigest()[:16]
     key = f'qurtoba:ai_sent:{conversation_id}:{digest}'
     try:
         # cache.add is SETNX: False means the same text went out moments ago.
         return not cache.add(key, 1, timeout=_DUPLICATE_WINDOW)
+    except Exception:
+        return False
+
+
+# One question per turn. The model sometimes sends its question through the
+# reply tool and then restates it as plain output in other words (sandbox
+# 2026-09-03, J2: «…يتحول على نفس الرقم ده ولا رقم تاني؟» twice). A second
+# agent question within the window is dropped; a second statement is not,
+# because it may carry the registered/problem lines of a structured reply.
+_AGENT_QUESTION_WINDOW = 90  # seconds
+
+
+def _agent_question_key(conversation_id) -> str:
+    return f'qurtoba:ai_question:{conversation_id}'
+
+
+def _is_question(text: str) -> bool:
+    return any(q in text for q in ('؟', '?'))
+
+
+def _note_agent_text(conversation_id, text: str) -> None:
+    if _is_question(text):
+        try:
+            cache.set(_agent_question_key(conversation_id), _dedupe_key_text(text)[:200],
+                      timeout=_AGENT_QUESTION_WINDOW)
+        except Exception:
+            pass
+
+
+def _is_duplicate_question(conversation_id, text: str) -> bool:
+    if not _is_question(text):
+        return False
+    try:
+        return bool(cache.get(_agent_question_key(conversation_id)))
     except Exception:
         return False
 
@@ -327,10 +421,12 @@ def block_reason(content, message_type, conversation, system_partner) -> Optiona
 
     if is_system_template_impersonation(text):
         return 'system_template'
-    if conv_id and reply_already_delivered(conv_id):
+    if conv_id and reply_already_delivered(conv_id) and is_redundant_after_tool_reply(text):
         return 'reply_already_delivered'
     if is_non_message(text):
         return 'non_message'
+    if is_non_arabic(text):
+        return 'non_arabic'
     if is_internal_note(text):
         return 'internal_note'
     if conv_id and is_echo_with_note(text, conv_id):
@@ -339,6 +435,13 @@ def block_reason(content, message_type, conversation, system_partner) -> Optiona
         return 'self_narration'
     if conv_id and _is_duplicate_send(conv_id, text):
         return 'duplicate'
+    if conv_id and _is_duplicate_question(conv_id, text):
+        return 'duplicate_question'
+    # This agent text is going out: remember it so a restated question in the
+    # same turn is caught (recorded here, not in the wrapper, so the sandbox
+    # evaluation — which calls block_reason directly — sees the same behaviour).
+    if conv_id:
+        _note_agent_text(conv_id, text)
     return None
 
 

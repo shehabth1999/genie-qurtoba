@@ -169,7 +169,7 @@ def _send_quoted_text(conversation, social_partner, src_message_id, text) -> boo
                 logger.warning('qurtoba: could not resolve src message %s for quoted reply',
                                src_message_id, exc_info=True)
 
-        from qurtoba.ai_guard import system_send
+        from qurtoba.ai_guard import mark_reply_delivered, system_send
         with system_send():
             OmnichannelSendService().send_and_broadcast(
                 partner=social_partner,
@@ -181,6 +181,14 @@ def _send_quoted_text(conversation, social_partner, src_message_id, text) -> boo
                 reply_to_id=reply_local_id,
                 websocket=True,
             )
+        # The tool's quoted question («تحب أكررها؟») or corrected number IS this
+        # turn's reply — the prompt orders the agent to stay silent after it. Marking
+        # it delivered lets the gate drop any status line the model adds anyway
+        # (2026-09-03 sandbox: «…وفي انتظار رد العميل على سؤال التأكيد اللي النظام بعته»).
+        try:
+            mark_reply_delivered(conversation)
+        except Exception:
+            pass
         return True
     except Exception:
         logger.warning('qurtoba: quoted reply failed', exc_info=True)
