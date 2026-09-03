@@ -461,6 +461,20 @@ def _pair_events(events, msg_sent=None, gap_s=None):
 
 _QUESTION_MARKS = ('؟', '?')
 _CONFIRM_WORDS = ('تأكيد', 'أكمل', 'اكمل', 'نكمل', 'ننفذ', 'ننفّذ')
+_AMOUNT_ONLY_WORDS = ('ج.م', 'جنيه', 'جنية', 'مصري', 'مصرى', 'ج', 'الف', 'ألف', 'آلاف', 'الاف',
+                      'الفين', 'ألفين', 'مليون', 'k', 'egp')
+
+
+def _is_bare_amount(txt: str) -> bool:
+    """True when the message is nothing but a number (plus currency/thousand words).
+
+    «4600», «100 ج», «46 الف» are bare amounts; «أنت بعت 5 ج فقط» is a sentence that
+    happens to contain a number — a complaint, never an amount answer."""
+    s = ' ' + ' '.join(str(txt or '').split()) + ' '
+    for w in _AMOUNT_ONLY_WORDS:
+        s = s.replace(f' {w} ', ' ')
+    s = re.sub(r'[\d٠-٩.,\s]+', '', s)
+    return s == ''
 
 
 def _msg_text(m) -> str:
@@ -482,7 +496,7 @@ def _question_options(q_text: str, exclude_phone: Optional[str]) -> List[float]:
     return opts
 
 
-def _extract_answers(conv, rows):
+def _extract_answers(conv, rows, include_consumed: bool = False):
     """Split the customer's ANSWERS to the agent's own questions out of the unprocessed rows.
 
     Two shapes count as an answer: an inbound that QUOTES an agent/system outbound, or a
@@ -513,6 +527,11 @@ def _extract_answers(conv, rows):
         for r in rows:
             txt = _msg_text(r)
             cls = _classify_message(txt)
+            # A message that carries a phone number is a REQUEST, whatever it
+            # quotes — a customer who answers our question with a new number
+            # and amount wants that transfer, not a conversation.
+            if cls['phones']:
+                continue
             target = None
             quoted = getattr(r, 'reply_to', None)
             if quoted is not None and getattr(quoted, 'direction', None) == 'outbound':
@@ -536,15 +555,16 @@ def _extract_answers(conv, rows):
                 about = None
             about_phone = None
             if about is not None:
-                if getattr(about, 'ai_consumed_at', None):
+                if getattr(about, 'ai_consumed_at', None) and not include_consumed:
                     answer_ids.add(str(r.id))   # its transfer already exists — finished
                     continue
                 ph = _classify_message(_msg_text(about))['phones']
                 about_phone = ph[0] if ph else None
             q_text = ' '.join(_msg_text(target).split())
+            is_question = any(q in q_text for q in _QUESTION_MARKS)
             if any(w in q_text for w in _CONFIRM_WORDS):
                 kind = 'confirmation_reply'
-            elif cls['amounts'] and not cls['phones']:
+            elif cls['amounts'] and is_question and _is_bare_amount(txt):
                 kind = 'amount_reply'
             else:
                 kind = 'reply'
@@ -567,8 +587,13 @@ def _extract_answers(conv, rows):
     return answers, answer_ids
 
 
-def _apply_answers(pairs: List[Dict[str, Any]], answers: List[Dict[str, Any]]) -> None:
-    """Fold each amount answer into the pair it answers (or create that pair)."""
+def _apply_answers(pairs: List[Dict[str, Any]], answers: List[Dict[str, Any]],
+                   orphans: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Fold each amount answer into the pair it answers (or create that pair).
+
+    A phone that was waiting as an orphan («المبلغ لـ N؟») is completed by the
+    answer, so its orphan entry is removed — otherwise the agent would see the
+    finished pair AND the orphan and ask for the amount it just received."""
     for a in answers:
         if a.get('kind') != 'amount_reply' or a.get('value') is None or not a.get('about_phone'):
             continue
@@ -580,6 +605,9 @@ def _apply_answers(pairs: List[Dict[str, Any]], answers: List[Dict[str, Any]]) -
             target = {'account_number': phone, 'value': value, 'type': 'كاش',
                       'source_message_id': a.get('about_message_id'), 'confidence': 'high'}
             pairs.append(target)
+        if orphans is not None:
+            orphans[:] = [o for o in orphans
+                          if not (o.get('kind') == 'phone' and o.get('value') == phone)]
         target['value'] = value
         target['confidence'] = 'high' if matches else 'low'
         target['reason'] = 'answer_to_question' if matches else 'answer_matches_neither_option'
@@ -659,9 +687,9 @@ def consumed_ids_by_source(conv):
         'into the bulk create tool (source_message_id is already each PHONE message id). '
         '- orphans: [{kind, value, message_id}] — phone with no amount, or amount with no phone. '
         'Ask ONE short question per orphan; never guess. '
-        '- ambiguous: pairs with an uncertain `.`/`,` reading — confirm if unsure; reason '
-        'separator_malformed («46,0010») = the amount as written is unreadable → ask for it '
-        'in plain digits, NEVER execute a guess. '
+        '- ambiguous: pairs whose `.`/`,` reading cannot be trusted (reason separator_ambiguous, '
+        'e.g. «46,0010») — the amount as written is unreadable → ask for it in plain digits, '
+        'NEVER execute the guessed value. '
         '- answers: the customer\'s replies to YOUR earlier questions [{message_id, text, kind '
         '(amount_reply / confirmation_reply / reply), value, about_phone, question_text, '
         'question_options, applied_to}]. An amount_reply is already applied to its pair '
@@ -799,7 +827,7 @@ def qurtoba_plan_transactions(
     pairs, pair_mids, orphans, ambiguous_out, list_pattern = _pair_events(events, msg_sent, _gap)
     # An amount the customer sent in answer to our question about a number IS that
     # number's amount — it replaces whatever we had parsed for it and is never an orphan.
-    _apply_answers(pairs, answers)
+    _apply_answers(pairs, answers, orphans)
 
     # --- Same-time split-ambiguity guard ---------------------------------
     # WhatsApp timestamps only to the second and does NOT guarantee order for
@@ -850,7 +878,19 @@ def qurtoba_plan_transactions(
     pairs = safe_pairs   # only overflow(>max_tx) clusters are withheld
     # list_pattern now reflects only genuine positional guesses NOT covered by the same-second
     # execute rule (e.g. a cross-second "all numbers then all amounts" block) — never same-second ≤3.
-    list_pattern = any(op.get('confidence') == 'low' for op in pairs)
+    # A pair that is 'low' because its amount is unreadable (ambiguous separator) or
+    # because the customer's answer matched none of the offered options is NOT a
+    # list-pairing guess — those get their own note, not «راجِع المطابقة».
+    # ambiguous_out carries EVERY low pair with its reason: list_pairing (a positional
+    # guess — that IS the list pattern) vs separator_ambiguous (unreadable amount).
+    _amb_sources = {a.get('source_message_id') for a in ambiguous_out
+                    if a.get('reason') == 'separator_ambiguous'}
+    list_pattern = any(
+        op.get('confidence') == 'low'
+        and op.get('source_message_id') not in _amb_sources
+        and op.get('reason') not in ('answer_matches_neither_option', 'answer_to_question')
+        for op in pairs
+    )
 
     # --- Amounts written in WORDS the parser can't convert → hand them to the LLM ---------
     # «خمسين الف» (50000), «خمسمائة» (500): the deterministic parser refuses these (it would
@@ -885,6 +925,13 @@ def qurtoba_plan_transactions(
                 'ووضّح له السبب باختصار.')
     elif orphans:
         note = 'بعض الأرقام أو المبالغ بدون مقابل — اسأل عنها قبل التنفيذ.'
+    elif any(a.get('reason') == 'separator_ambiguous' for a in ambiguous_out):
+        _unreadable = '، '.join(
+            f"{a['account_number']} (المبلغ كما وصل: «{(msg_text.get(a.get('source_message_id')) or '').strip().splitlines()[-1][:20] if msg_text.get(a.get('source_message_id')) else a['value']}»)"
+            for a in ambiguous_out if a.get('reason') == 'separator_ambiguous'
+        )
+        note = (f'مبلغ متكتب بفاصل مش مقروء: {_unreadable}. نفّذ باقي الأزواج الواضحة في نفس الدور، '
+                'واطلب من العميل يبعت المبلغ ده بالأرقام بس — ما تنفذش القيمة المخمَّنة ولا تأكّدها كمطابقة.')
     elif list_pattern:
         note = ('الأرقام والمبالغ وصلت كقائمتين منفصلتين — تم الربط بالترتيب '
                 '(الأول بالأول). راجِع المطابقة قبل التنفيذ.')
