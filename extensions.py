@@ -81,14 +81,16 @@ def check_balance_and_send(conversation, customer):
 
     system_partner = _get_system_partner(conversation)
 
-    OmnichannelSendService().send_and_broadcast(
-        partner=conversation.social_partner,
-        content={'text': text},
-        message_type='text',
-        conversation=conversation,
-        system_partner=system_partner,
-        websocket=True,
-    )
+    from qurtoba.ai_guard import system_send
+    with system_send():
+        OmnichannelSendService().send_and_broadcast(
+            partner=conversation.social_partner,
+            content={'text': text},
+            message_type='text',
+            conversation=conversation,
+            system_partner=system_partner,
+            websocket=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +183,117 @@ class PartnerQurtobaExtension(ModelExtension):
     def has_qurtoba_customer(self) -> bool:
         """True when this partner is linked to a Qurtoba customer."""
         return self.qurtoba_customer_id is not None
+
+    # -- WhatsApp template variables ---------------------------------------
+    #
+    # A WhatsAppTemplate whose "apply to" (content_type) is base.Partner reads
+    # its {{placeholders}} straight off the record with a bare getattr —
+    # WhatsAppTemplate.get_body_parameters() — so a property is indistinguishable
+    # from a real column and needs no migration.
+    #
+    # Two hard rules for anything exposed here:
+    #   1. NEVER return None or ''. Meta rejects a template whose example value
+    #      is blank, and the examples are read off the newest Partner by pk
+    #      (WhatsAppTemplate.get_example_field_values), which is almost never a
+    #      Qurtoba-linked one. Unlinked partners must still yield a real string.
+    #   2. Read the numbers from qurtoba.services.daily_totals, so the reminder
+    #      can never disagree with the daily statement tool.
+
+    @property
+    def qurtoba_date(self) -> str:
+        """The business day this reminder covers, as «الاثنين 24 اغسطس».
+
+        Named explicitly in the message because the reminder goes out just
+        after midnight — «اليوم» would be ambiguous at 00:10, and the day name
+        makes it unmistakable which day closed.
+        """
+        from qurtoba.services.daily_totals import fmt_day_ar
+        return fmt_day_ar()
+
+    @property
+    def qurtoba_partner_display(self) -> str:
+        """Who we are greeting: the contact name, else their number."""
+        from qurtoba.tools._phone import _normalize_phone
+        name = (self.name or '').strip()
+        if name:
+            return name
+        return _normalize_phone(self.phone) or 'عميلنا'
+
+    @property
+    def qurtoba_phone(self) -> str:
+        """This partner's number in the local 01XXXXXXXXX form the customer reads."""
+        from qurtoba.tools._phone import _normalize_phone
+        return _normalize_phone(self.phone) or (self.phone or '—')
+
+    @property
+    def qurtoba_day_count(self) -> str:
+        """How many transactions THIS number requested on the reported day."""
+        from qurtoba.services.daily_totals import partner_day_totals
+        return str(partner_day_totals(self)['count'])
+
+    @property
+    def qurtoba_total(self) -> str:
+        """Total transferred by THIS number on the reported day — not the customer's."""
+        from qurtoba.services.daily_totals import fmt_amount, partner_day_totals
+        return fmt_amount(partner_day_totals(self)['debit'])
+
+    @property
+    def qurtoba_cust_name(self) -> str:
+        """The Qurtoba account this number belongs to."""
+        customer = self.qurtoba_customer
+        return (getattr(customer, 'name', '') or '').strip() or '—'
+
+    @property
+    def qurtoba_customer_balance(self) -> str:
+        """The whole account's balance — every number on it, not just this one.
+
+        ABSOLUTE value on purpose. The sign carries the direction, and the
+        direction is spelled out separately by qurtoba_balance_state; printing
+        «-5,000 جنيه (ليك)» would show the customer a negative number for money
+        that is owed TO them. Same rule as check_balance_and_send() above.
+        """
+        from qurtoba.services.daily_totals import fmt_amount
+        customer = self.qurtoba_customer
+        return fmt_amount(abs(getattr(customer, 'balance', 0) or 0))
+
+    @property
+    def qurtoba_balance_state(self) -> str:
+        """Which way the balance runs, as the customer-facing word.
+
+        Computed here rather than written into the WhatsApp template, because a
+        template is one fixed string for everybody — it cannot say «عليك» to one
+        customer and «ليك» to another. Mirrors check_balance_and_send():
+            balance > 0  ⇒ the customer owes us            ⇒ عليك
+            balance < 0  ⇒ the customer has credit with us ⇒ ليك
+            balance == 0 ⇒ nothing outstanding             ⇒ خالص
+        Never returns '' — a blank example value gets the template rejected by
+        Meta, and «(  )» would read as a rendering fault.
+        """
+        balance = getattr(self.qurtoba_customer, 'balance', 0) or 0
+        if balance > 0:
+            return 'عليك'
+        if balance < 0:
+            return 'ليك'
+        return 'خالص'
+
+    @property
+    def qurtoba_balance(self) -> str:
+        """The account balance as one ready sentence: «عليك 412,907 جنيه».
+
+        The direction word has to lead — Arabic puts «عليك»/«ليك» before the
+        amount, not after it in brackets — and a zero balance needs different
+        words entirely rather than «خالص 0 جنيه». Neither fits a fixed template
+        string with the number slotted in, so the whole phrase is built here.
+        Wording matches check_balance_and_send() so the nightly summary and the
+        on-demand balance reply never word the same fact differently.
+        """
+        from qurtoba.services.daily_totals import fmt_amount
+        balance = getattr(self.qurtoba_customer, 'balance', 0) or 0
+        if balance > 0:
+            return f'عليك {fmt_amount(abs(balance))} جنيه'
+        if balance < 0:
+            return f'ليك {fmt_amount(abs(balance))} جنيه'
+        return 'مفيش مديونية'
 
 
 # ---------------------------------------------------------------------------

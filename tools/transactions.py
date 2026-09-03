@@ -15,6 +15,9 @@ from typing import Any, Dict, List, Optional
 from modules.aistudio.tools import tool
 
 from qurtoba.tools._amounts import normalize_amount, _ar_to_ascii
+# _normalize_phone lives in _phone.py so the reporting tools can reuse it;
+# re-exported here because this module has always been its import site.
+from qurtoba.tools._phone import _normalize_phone  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -123,14 +126,16 @@ def _send_start_ack(conversation) -> None:
         if svc is None or partner is None:
             return
         from qurtoba.extensions import _get_system_partner
-        svc.send_and_broadcast(
-            partner=partner,
-            content='👍',
-            message_type='text',
-            conversation=conversation,
-            system_partner=_get_system_partner(conversation),
-            websocket=True,
-        )
+        from qurtoba.ai_guard import system_send
+        with system_send():
+            svc.send_and_broadcast(
+                partner=partner,
+                content='👍',
+                message_type='text',
+                conversation=conversation,
+                system_partner=_get_system_partner(conversation),
+                websocket=True,
+            )
     except Exception:
         logger.warning('qurtoba: start-ack 👍 failed', exc_info=True)
 
@@ -163,16 +168,18 @@ def _send_quoted_text(conversation, social_partner, src_message_id, text) -> boo
                 logger.warning('qurtoba: could not resolve src message %s for quoted reply',
                                src_message_id, exc_info=True)
 
-        OmnichannelSendService().send_and_broadcast(
-            partner=social_partner,
-            content={'text': str(text)},
-            message_type='text',
-            conversation=conversation,
-            system_partner=_get_system_partner(conversation),
-            reply_to_message_id=reply_wamid,
-            reply_to_id=reply_local_id,
-            websocket=True,
-        )
+        from qurtoba.ai_guard import system_send
+        with system_send():
+            OmnichannelSendService().send_and_broadcast(
+                partner=social_partner,
+                content={'text': str(text)},
+                message_type='text',
+                conversation=conversation,
+                system_partner=_get_system_partner(conversation),
+                reply_to_message_id=reply_wamid,
+                reply_to_id=reply_local_id,
+                websocket=True,
+            )
         return True
     except Exception:
         logger.warning('qurtoba: quoted reply failed', exc_info=True)
@@ -285,44 +292,6 @@ def _resolve_conversation_and_customer(context):
             'partner_phone': getattr(partner, 'phone', None),
         }
     return conv, customer, None
-
-
-def _normalize_phone(raw: Optional[str]) -> Optional[str]:
-    """
-    Normalize an Egyptian mobile to the canonical local form 01XXXXXXXXX (11 digits).
-
-    Accepts and converts the common country-code / formatted variants:
-      +20 1038857982   00201038857982   201038857982   0201038857982
-      with spaces, '+', dashes — anything; only digits are kept.
-
-    Egypt's country code is 20 and local mobiles are 11 digits starting with 01,
-    so the +20 / 0020 / 20 / 020 forms all map to a leading 0 + the 10-digit
-    subscriber number. Returns the 11-digit local form, or None if the input
-    cannot be turned into a valid Egyptian mobile (caller asks for a correct one).
-    """
-    if not raw:
-        return None
-    d = ''.join(ch for ch in str(raw) if ch.isdigit())
-    if not d:
-        return None
-
-    # International dialing prefix: 00 20 ...  ->  20 ...
-    if d.startswith('00'):
-        d = d[2:]
-    # Country code, with or without a single leading 0 before it:
-    #   020 1038857982  ->  1038857982
-    #   20  1038857982  ->  1038857982   (only when long enough to be CC + mobile)
-    if d.startswith('020'):
-        d = d[3:]
-    elif d.startswith('20') and len(d) >= 12:
-        d = d[2:]
-    # Subscriber number without the leading 0 (10 digits starting with 1) -> add 0
-    if len(d) == 10 and d.startswith('1'):
-        d = '0' + d
-    # NOTE: we deliberately do NOT trim an over-length 01-number (e.g. a 12-digit
-    # typo). Chopping a digit off a money-transfer destination is unsafe — let it
-    # fail validation so the partner is asked for a correct number instead.
-    return d or None
 
 
 def _message_text_raw(msg) -> str:
@@ -709,6 +678,31 @@ def _create_one_debt(
                 'success': True, 'duplicate': True, 'pending_review': True,
                 'pending_id': dup_pend.pk, 'type': dup_pend.type,
                 'value': dup_pend.value, 'account_number': dup_pend.account_number,
+            }
+
+    # --- Recently-failed number (no wallet) ------------------------------------
+    # 2026-08-29: a reroute was sent to a number that had itself been cancelled
+    # for «مش عليه محفظة» minutes earlier, and failed the same way. A number the
+    # Cash office rejected for having no wallet will not grow one within the day;
+    # refuse it deterministically so the agent asks for another number instead
+    # of re-queueing the same failure.
+    if is_cash and final_account and not override_grade_limit:
+        from datetime import timedelta as _td
+        from django.utils import timezone as _tz
+        from qurtoba.models import QurtobaRecord
+        failed = QurtobaRecord.objects.filter(
+            customer=customer, account_number=final_account,
+            cash_sys_canceled_reason='no_wallet',
+            updated_at__gte=_tz.now() - _td(hours=24),
+        ).order_by('-id').first()
+        if failed is not None:
+            return {
+                'success': False,
+                'error_type': 'number_has_no_wallet',
+                'error': (f'الرقم {final_account} اترفض قبل كده — مفيش عليه محفظة كاش. '
+                          'من فضلك ابعت رقم تاني عليه محفظة.'),
+                'failed_record_id': failed.pk,
+                'failed_at': failed.updated_at.isoformat(),
             }
 
     # --- Same-day cash repeat check (B5) ---------------------------------------
@@ -1332,6 +1326,27 @@ def qurtoba_create_new_transactions_bulk(
     # a genuinely-dropped pair or ignore one it intentionally left out; never shown verbatim.
     if _possibly_missing and isinstance(result, dict):
         result['possibly_missing'] = _possibly_missing
+
+    # A completely clean batch — every item created, the 👍 sent by this tool —
+    # needs no words from the agent; anything it types now is narration and the
+    # outbound gate drops it. Anything less (a rejection, a repeat question, a
+    # high-value hold, a possibly-dropped pair) keeps the agent's voice.
+    if isinstance(result, dict) and result.get('success'):
+        total = int(result.get('total') or 0)
+        clean = (
+            total > 0
+            and int(result.get('created_count') or 0) == total
+            and not any(result.get(k) for k in (
+                'pending_count', 'rejected_count', 'duplicate_count',
+                'repeat_asked_count', 'high_value_count',
+            ))
+            and all(r.get('status') in ('created', None) for r in result.get('results') or [])
+            and not _possibly_missing
+        )
+        result['reply_fully_handled'] = clean
+        if clean:
+            from qurtoba.ai_guard import mark_reply_delivered
+            mark_reply_delivered(conv)
     return result
 
 
@@ -1418,7 +1433,14 @@ def qurtoba_confirm_pending_repeats(context) -> Dict[str, Any]:
                 'reason': outcome.get('error_type') or outcome.get('note') or 'not_created',
             })
 
-    return {'success': True, 'created': created, 'skipped': skipped}
+    # Every confirmed repeat was created and acknowledged with the tool's own 👍;
+    # anything the agent adds now is narration. A skipped one keeps its voice.
+    fully_handled = bool(created) and not skipped
+    if fully_handled:
+        from qurtoba.ai_guard import mark_reply_delivered
+        mark_reply_delivered(conv)
+    return {'success': True, 'created': created, 'skipped': skipped,
+            'reply_fully_handled': fully_handled}
 
 
 # ---------------------------------------------------------------------------
@@ -1695,7 +1717,10 @@ def qurtoba_check_transaction_status(
         from django.utils import timezone
         records = list(
             QurtobaRecord.objects
-            .filter(customer=customer, date=timezone.localdate(), is_down=False)
+            # value__gt=0: an accountant's ledger correction (a negative or zero
+            # row) is internal bookkeeping — on 2026-08-29 one was shown to a
+            # customer as «كاش -19».
+            .filter(customer=customer, date=timezone.localdate(), is_down=False, value__gt=0)
             .order_by('-time', '-id')[:3]
         )
 

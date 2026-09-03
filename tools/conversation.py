@@ -51,7 +51,10 @@ def qurtoba_send_customer_balance_to_chat(context) -> Dict[str, Any]:
 
     try:
         from qurtoba.extensions import check_balance_and_send
+        from qurtoba.ai_guard import mark_reply_delivered
         check_balance_and_send(conv, customer)
+        # The balance line IS the reply; the agent must add nothing after it.
+        mark_reply_delivered(conv)
     except Exception as e:
         return {
             'success': False,

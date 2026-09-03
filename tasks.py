@@ -454,6 +454,27 @@ def _resolve_origin_message(record, conv):
     return best
 
 
+class _SystemSender:
+    """OmnichannelSendService whose sends are the system's own voice.
+
+    Every Cash-SYS notice, receipt and reroute ask goes out through the
+    ``svc`` in _notify_context; wrapping it here marks all of them for the
+    outbound gate (qurtoba.ai_guard) in one place, so a real cancel notice is
+    never mistaken for the agent replaying one.
+    """
+
+    def __init__(self, service):
+        self._service = service
+
+    def send_and_broadcast(self, *args, **kwargs):
+        from qurtoba.ai_guard import system_send
+        with system_send():
+            return self._service.send_and_broadcast(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._service, name)
+
+
 def _notify_context(record):
     """
     Resolve the send context for a record: (conv, system_partner, reply_wamid,
@@ -495,7 +516,7 @@ def _notify_context(record):
         'system_partner': _get_system_partner(conv),
         'reply_wamid': reply_wamid,
         'reply_local_id': reply_local_id,
-        'svc': OmnichannelSendService(),
+        'svc': _SystemSender(OmnichannelSendService()),
     }
 
 
@@ -1466,4 +1487,222 @@ def reconcile_unsynced_qurtoba_records():
 
     if stats['checked']:
         logger.info('[Reconcile] %s', stats)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# End-of-day reminder — one short WhatsApp template per phone that asked us
+# for a transaction during the day that just closed.
+# ---------------------------------------------------------------------------
+
+# Meta name of the approved template this task sends. Kept as a setting so the
+# template can be renamed or swapped without a code change.
+# v2, not the original: Meta refuses to edit an approved template (subcode
+# 2388039 'you can only delete or add templates'), and the first version was
+# approved with parameter names over Meta's 20-char send-time limit, so it can
+# never actually send. Overridable via settings.
+QURTOBA_DAILY_REMINDER_TEMPLATE = 'qurtoba_daily_summary_v2'
+
+
+@shared_task(bind=True, max_retries=0)
+def send_qurtoba_daily_reminder(self, report_date=None, dry_run=False):
+    """
+    Post the end-of-day summary to every number that requested a transaction
+    through Genie on the business day that just ended.
+
+    Audience is deliberately narrow — only chat-born records carry a `partner`,
+    so a customer whose day was keyed into Qurtoba by an accountant is not
+    messaged: nobody asked us for anything from a phone. See
+    qurtoba.services.daily_totals.partners_active_on.
+
+    Runs just after midnight Cairo, so `report_date` defaults to the day that
+    has just CLOSED, not today. Pass an ISO date to re-run for a specific day,
+    or dry_run=True to see who would receive it without sending.
+
+    max_retries=0 on purpose: a retry would re-send template messages that
+    already went out, and there is no per-recipient idempotency key here.
+    """
+    import datetime as _dt
+
+    from modules.base.models import Partner
+    from modules.whatsapp.models import WhatsAppTemplate
+    from qurtoba.services.daily_totals import partners_active_on, reporting_day
+
+    day = _dt.date.fromisoformat(report_date) if report_date else reporting_day()
+
+    template_name = getattr(
+        settings, 'QURTOBA_DAILY_REMINDER_TEMPLATE', QURTOBA_DAILY_REMINDER_TEMPLATE,
+    )
+    template = (
+        WhatsAppTemplate.objects
+        .filter(template_name=template_name, status='approved')
+        .first()
+    )
+    if template is None:
+        logger.warning(
+            '[Qurtoba Daily] no APPROVED template named %r — nothing sent for %s. '
+            'Create it and get Meta approval first.', template_name, day,
+        )
+        return {'sent': 0, 'reason': 'template_not_approved', 'report_date': str(day)}
+
+    partner_ids = partners_active_on(day)
+    if not partner_ids:
+        logger.info('[Qurtoba Daily] no phone requested a transaction on %s — nothing to send', day)
+        return {'sent': 0, 'reason': 'empty_audience', 'report_date': str(day)}
+
+    # A partner with no Qurtoba link would render «—» for the account name and
+    # a zero balance, which reads as broken. Skip rather than send that.
+    sendable = list(
+        Partner.objects
+        .filter(id__in=partner_ids, qurtoba_customer__isnull=False)
+        .values_list('id', flat=True)
+    )
+    skipped = len(partner_ids) - len(sendable)
+    if skipped:
+        logger.info('[Qurtoba Daily] skipped %d unlinked partner(s) for %s', skipped, day)
+
+    if not sendable:
+        return {'sent': 0, 'reason': 'no_linked_partners', 'report_date': str(day)}
+
+    if dry_run:
+        logger.info('[Qurtoba Daily] DRY RUN for %s — would send to %s', day, sendable)
+        return {'sent': 0, 'reason': 'dry_run', 'report_date': str(day),
+                'would_send_to': sendable, 'skipped_unlinked': skipped}
+
+    sender_partner = _reminder_sender_partner(template)
+    if sender_partner is None:
+        logger.error('[Qurtoba Daily] no sender partner resolvable for account %s — nothing sent',
+                     template.whatsapp_account_id)
+        return {'sent': 0, 'reason': 'no_sender_partner', 'report_date': str(day)}
+
+    from modules.whatsapp.tasks import process_bulk_whatsapp_template_sending
+    process_bulk_whatsapp_template_sending.delay(
+        template_id=template.id,
+        contact_ids=sendable,
+        sender_partner_id=sender_partner.id,
+    )
+    logger.info('[Qurtoba Daily] queued %d reminder(s) for %s', len(sendable), day)
+    return {'sent': len(sendable), 'report_date': str(day), 'skipped_unlinked': skipped}
+
+
+def _reminder_sender_partner(template):
+    """The internal Partner the reminder is sent 'from'.
+
+    The bulk sender needs one to attribute the outbound message to. There is no
+    interactive user behind a beat job, so fall back through the account's own
+    partner, then any staff partner.
+    """
+    from modules.base.models import Partner
+
+    account = template.whatsapp_account
+    for candidate in (
+        getattr(account, 'partner', None),
+        getattr(template, 'created_by', None) and getattr(template.created_by, 'partner', None),
+    ):
+        if candidate is not None:
+            return candidate
+    return Partner.objects.filter(user__isnull=False).order_by('pk').first()
+
+
+# ───────────────── Stranded-conversation recovery (extension-owned) ─────────
+#
+# The channel task claims a conversation with `pending_task:<chat_key>` and
+# parks later messages in `accumulated_messages:<chat_key>` for the running
+# task to collect. If that task dies before collecting them — killed worker,
+# OOM, revoke — the marker outlives it (300 s) and every later message parks
+# behind it too, until the accumulator TTL discards the batch. Nothing raises;
+# the customer is simply ignored, transactions included (incident 2026-08-07).
+#
+# Core writes its markers with no timestamp, so age is read off the key's
+# remaining TTL (core always sets 300 s). A run that died MID-task had already
+# consumed its batch from the cache, so the parked ids are re-derived from the
+# chat: inbound messages newer than the last outbound. Recovery is bounded to
+# recent messages — a stale batch must never be answered late.
+
+_LOCK_TTL_SECONDS = 300
+_LOCK_SENTINELS = ('processing', 're-triggered', 'retrying')
+_RECOVER_MAX_AGE_MINUTES = 30
+_RECOVER_MIN_QUIET_SECONDS = 15
+
+
+def _unanswered_inbound_ids(conversation_id) -> list:
+    """Inbound message ids (newest 25) that nothing has answered yet."""
+    from datetime import timedelta
+    from django.utils import timezone as _tz
+    from modules.chat.models import Conversation, Message
+
+    conv = Conversation.objects.filter(id=conversation_id).only('id', 'handled_by_ai').first()
+    if conv is None or not conv.handled_by_ai:
+        return []
+    now = _tz.now()
+    last_out = (
+        Message.objects_all.filter(conversation_id=conversation_id, direction='outbound', active=True)
+        .order_by('-created_at').values_list('created_at', flat=True).first()
+    )
+    qs = Message.objects_all.filter(
+        conversation_id=conversation_id, direction='inbound', active=True,
+        created_at__gte=now - timedelta(minutes=_RECOVER_MAX_AGE_MINUTES),
+    )
+    if last_out is not None:
+        qs = qs.filter(created_at__gt=last_out)
+    rows = list(qs.order_by('created_at').values_list('id', 'created_at')[:25])
+    if not rows:
+        return []
+    if (now - rows[-1][1]).total_seconds() < _RECOVER_MIN_QUIET_SECONDS:
+        return []   # still typing — normal batching will collect it
+    return [str(r[0]) for r in rows]
+
+
+@shared_task
+def recover_stranded_conversations():
+    """Re-trigger conversations whose messages sit behind a dead processing lock."""
+    from django.conf import settings as dj_settings
+    from modules.aistudio_whatsapp.tasks import process_workflow_messages
+
+    if not hasattr(cache, 'iter_keys'):
+        return {'skipped': 'cache backend has no iter_keys'}
+
+    stale_after = int(getattr(dj_settings, 'AI_LOCK_STALE_SECONDS', 180))
+    stats = {'checked': 0, 'recovered': 0, 'cleared': 0}
+    try:
+        keys = list(cache.iter_keys('pending_task:conversation_*'))
+    except Exception:
+        logger.exception('[StrandedRecovery] key scan failed')
+        return stats
+
+    for key in keys:
+        stats['checked'] += 1
+        chat_key = key[len('pending_task:'):]
+        conversation_id = chat_key[len('conversation_'):]
+        acc_key = f'accumulated_messages:{chat_key}'
+        try:
+            lock = cache.get(key)
+            ttl = cache.ttl(key)
+            waiting = cache.get(acc_key, []) or []
+        except Exception:
+            continue
+        if lock is None:
+            continue
+        age = (_LOCK_TTL_SECONDS - ttl) if isinstance(ttl, int) and ttl > 0 else None
+        if age is None or age < stale_after:
+            continue   # fresh, or unknowable — leave it to the running task
+        if lock not in _LOCK_SENTINELS and not waiting:
+            continue   # a scheduled task id with nothing parked: harmless
+        if not waiting:
+            waiting = _unanswered_inbound_ids(conversation_id)
+            if not waiting:
+                cache.delete(key)
+                stats['cleared'] += 1
+                continue
+            cache.set(acc_key, waiting, timeout=_LOCK_TTL_SECONDS)
+        logger.warning(
+            '[StrandedRecovery] %s: %d message(s) behind stale lock %r (age %ss). Re-triggering.',
+            chat_key, len(waiting), lock, age,
+        )
+        cache.delete(key)
+        process_workflow_messages.apply_async(args=[chat_key, conversation_id], countdown=1)
+        stats['recovered'] += 1
+
+    if stats['recovered'] or stats['cleared']:
+        logger.info('[StrandedRecovery] %s', stats)
     return stats

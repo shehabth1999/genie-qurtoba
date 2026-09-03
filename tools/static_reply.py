@@ -55,15 +55,19 @@ def qurtoba_send_static_message(
     try:
         from modules.chat.services.omnichannel_send_service import OmnichannelSendService
         from qurtoba.extensions import _get_system_partner
+        from qurtoba.ai_guard import mark_reply_delivered, system_send
 
-        OmnichannelSendService().send_and_broadcast(
-            partner=conv.social_partner,
-            content={'text': text},
-            message_type='text',
-            conversation=conv,
-            system_partner=_get_system_partner(conv),
-            websocket=True,
-        )
+        with system_send():
+            OmnichannelSendService().send_and_broadcast(
+                partner=conv.social_partner,
+                content={'text': text},
+                message_type='text',
+                conversation=conv,
+                system_partner=_get_system_partner(conv),
+                websocket=True,
+            )
+        # The static message IS the reply for this turn.
+        mark_reply_delivered(conv)
     except Exception as e:
         return {
             'success': False,
