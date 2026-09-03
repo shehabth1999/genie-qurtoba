@@ -89,7 +89,21 @@ class QurtobaConfig(AppConfig):
         from django.conf import settings as dj_settings
 
         try:
+            from zoneinfo import ZoneInfo
             from celery.schedules import crontab
+
+            class CairoCrontab(crontab):
+                """A crontab django_celery_beat stores in Africa/Cairo, not the app tz.
+
+                CELERY_TIMEZONE is UTC, so a plain crontab(hour=21, minute=10) is
+                00:10 Cairo in summer and 23:10 in winter (DST ends late October)
+                — and the end-of-day reminder would go out before the day ended.
+                django_celery_beat reads ``schedule.tz`` when it persists the row.
+                """
+
+                @property
+                def tz(self):
+                    return ZoneInfo('Africa/Cairo')
 
             schedule = getattr(dj_settings, 'CELERY_BEAT_SCHEDULE', None)
             if schedule is None:
@@ -102,7 +116,8 @@ class QurtobaConfig(AppConfig):
                 },
                 'qurtoba-daily-reminder': {
                     'task': 'qurtoba.tasks.send_qurtoba_daily_reminder',
-                    'schedule': crontab(hour=21, minute=10),
+                    # Just after midnight Cairo time, every day of the year.
+                    'schedule': CairoCrontab(hour=0, minute=10),
                 },
                 'recover-stranded-conversations': {
                     'task': 'qurtoba.tasks.recover_stranded_conversations',
