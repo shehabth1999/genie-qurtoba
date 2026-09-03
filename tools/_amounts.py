@@ -161,6 +161,7 @@ def normalize_amount(raw: Any) -> Dict[str, Any]:
     tok = tokens[0]
 
     ambiguous = False
+    malformed = False
     has_dot, has_comma = '.' in tok, ',' in tok
     if has_dot and has_comma:
         # Rightmost separator is the decimal point; the other is thousands.
@@ -184,8 +185,18 @@ def normalize_amount(raw: Any) -> Dict[str, Any]:
                 # 13.75-style: a name-attached commission tally, filtered out as noise
                 # by the planner's classifier — not a real transfer amount.
                 tok = head + '.' + tail
+            elif len(tail) >= 4:
+                # A single separator followed by 4+ digits («46,0010», «1,00000»)
+                # cannot be a thousands grouping — it is a typo whose intended
+                # value is unknowable (46,010? 460,010? 4,600?). Return the
+                # stripped reading as a best guess but flag it, so the planner
+                # emits a LOW-confidence pair and the agent asks instead of
+                # executing (2026-09-03: 460010 went to the create tool as
+                # 'high' and only the high-value gate stopped it).
+                tok = tok.replace(sep, '')
+                malformed = True
             else:
-                tok = tok.replace(sep, '')        # 0 or >3 trailing → strip
+                tok = tok.replace(sep, '')        # 0 trailing → strip
 
     try:
         count = float(tok)
@@ -209,6 +220,7 @@ def normalize_amount(raw: Any) -> Dict[str, Any]:
         out['reason'] = 'non_positive'
         return out
 
-    out.update(ok=True, value=value, ambiguous=ambiguous,
-               reason=('separator_ambiguous' if ambiguous else None))
+    out.update(ok=True, value=value, ambiguous=(ambiguous or malformed),
+               reason=('separator_malformed' if malformed
+                       else 'separator_ambiguous' if ambiguous else None))
     return out

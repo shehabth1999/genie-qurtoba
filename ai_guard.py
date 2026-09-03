@@ -226,6 +226,66 @@ def is_self_narration(output: str) -> bool:
     return True
 
 
+# ── Internal notes and echoes ────────────────────────────────────────────────
+#
+# 2026-09-03 13:22, conversation 13f58d64: the customer asked «الحساب كام» and
+# the agent's whole reply was «الحساب كام (معلومة المدير، مش للعميل)» — the
+# customer's own words echoed back with the model's private annotation (a
+# paraphrase of the live-context comment marking the balance as internal).
+# No narration pattern matched, it has letters, it is not a template — the
+# gate let it through. Two narrow rules close that shape:
+#   • a phrase that can only be a note to the operator, anywhere in the text;
+#   • the customer's last inbound message repeated back with nothing after it
+#     but a parenthetical.
+# Both are blocked outright: neither can ever be a real answer.
+
+_INTERNAL_NOTE_RE = re.compile(
+    r'(مش\s+لل?عميل|معلوم[ةه]\s+المدير|للمدير\s+(فقط|بس)|ملاحظ[ةه]\s+داخلي[ةه]|'
+    r'داخلي[ةه]?\s+(فقط|بس)|internal\s+(only|note|use)|\(\s*internal\s*\)|'
+    r'not\s+for\s+the\s+customer|note\s+to\s+self|for\s+the\s+manager\s+only)',
+    re.I,
+)
+
+_TRAILING_PAREN_RE = re.compile(r'^[\(（\[].{1,120}[\)）\]]$', re.DOTALL)
+
+
+def is_internal_note(output: str) -> bool:
+    """A phrase that only ever addresses the operator, never the customer."""
+    text = str(output or '')
+    return bool(text.strip()) and bool(_INTERNAL_NOTE_RE.search(text))
+
+
+def _last_inbound_text(conversation_id) -> Optional[str]:
+    try:
+        from modules.chat.models import Message
+        content = (
+            Message.objects.filter(conversation_id=conversation_id, direction='inbound')
+            .order_by('-created_at')
+            .values_list('content', flat=True)
+            .first()
+        )
+    except Exception:
+        logger.exception('ai_guard: last-inbound lookup failed for %s', conversation_id)
+        return None
+    return _text_of(content)
+
+
+def is_echo_with_note(output: str, conversation_id) -> bool:
+    """The customer's last message repeated back, followed only by a parenthetical."""
+    text = str(output or '').strip()
+    if not text or not conversation_id:
+        return False
+    inbound = (_last_inbound_text(conversation_id) or '').strip()
+    if len(inbound) < 3:
+        return False
+    norm_out = _normalize_for_match(text)
+    norm_in = _normalize_for_match(inbound)
+    if not norm_in or not norm_out.startswith(norm_in):
+        return False
+    rest = text[len(inbound):].strip() if text.startswith(inbound) else norm_out[len(norm_in):].strip()
+    return bool(rest) and bool(_TRAILING_PAREN_RE.match(rest))
+
+
 # ── Duplicate suppression ────────────────────────────────────────────────────
 
 _DUPLICATE_WINDOW = 30  # seconds
@@ -271,6 +331,10 @@ def block_reason(content, message_type, conversation, system_partner) -> Optiona
         return 'reply_already_delivered'
     if is_non_message(text):
         return 'non_message'
+    if is_internal_note(text):
+        return 'internal_note'
+    if conv_id and is_echo_with_note(text, conv_id):
+        return 'echo_with_note'
     if is_self_narration(text):
         return 'self_narration'
     if conv_id and _is_duplicate_send(conv_id, text):

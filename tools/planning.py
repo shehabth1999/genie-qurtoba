@@ -459,6 +459,134 @@ def _pair_events(events, msg_sent=None, gap_s=None):
     return pairs, pair_mids, orphans, ambiguous_out, list_pattern
 
 
+_QUESTION_MARKS = ('؟', '?')
+_CONFIRM_WORDS = ('تأكيد', 'أكمل', 'اكمل', 'نكمل', 'ننفذ', 'ننفّذ')
+
+
+def _msg_text(m) -> str:
+    c = getattr(m, 'content', None)
+    return (c.get('text') if isinstance(c, dict) and isinstance(c.get('text'), str) else '') or ''
+
+
+def _question_options(q_text: str, exclude_phone: Optional[str]) -> List[float]:
+    """Numbers offered in an agent question («تقصد 46010 ولا 460010؟») — phones excluded."""
+    opts: List[float] = []
+    for raw in re.findall(r'[\d٠-٩][\d٠-٩,\.]*', q_text or ''):
+        r = normalize_amount(raw)
+        if not r.get('ok'):
+            continue
+        digits = re.sub(r'\D', '', raw)
+        if len(digits) >= 10 or (exclude_phone and digits.endswith(exclude_phone[-9:])):
+            continue
+        opts.append(float(r['value']))
+    return opts
+
+
+def _extract_answers(conv, rows):
+    """Split the customer's ANSWERS to the agent's own questions out of the unprocessed rows.
+
+    Two shapes count as an answer: an inbound that QUOTES an agent/system outbound, or a
+    bare amount (no phone) whose nearest preceding outbound is an agent question quoted on
+    a phone message — with no other phone message from the customer in between.
+
+    Why: 2026-09-03 — the agent asked «تقصد 46010 ولا 460010؟» about 01012180747; the
+    customer's «4600» came back with no quote, the planner filed it as an orphan amount,
+    the agent re-asked twice and then pushed 460010 to create. An answer is never an orphan.
+
+    Returns (answers, answer_ids). Answers whose phone message is already consumed (the
+    transfer was created since) are dropped — they are finished. Best-effort: ({}, set())
+    on any error, so planning never fails because of this."""
+    answers: List[Dict[str, Any]] = []
+    answer_ids: set = set()
+    if conv is None or not rows:
+        return answers, answer_ids
+    try:
+        from modules.chat.models import Message as _M
+        earliest = min(r.created_at for r in rows)
+        outs = list(
+            _M.objects_all
+            .filter(conversation=conv, direction='outbound', type='text', active=True,
+                    created_at__gte=earliest - __import__('datetime').timedelta(minutes=15))
+            .select_related('reply_to')
+            .order_by('-created_at')[:40]
+        )
+        for r in rows:
+            txt = _msg_text(r)
+            cls = _classify_message(txt)
+            target = None
+            quoted = getattr(r, 'reply_to', None)
+            if quoted is not None and getattr(quoted, 'direction', None) == 'outbound':
+                target = quoted
+            elif cls['amounts'] and not cls['phones']:
+                prev = next((o for o in outs if o.created_at < r.created_at), None)
+                if prev is not None and any(q in _msg_text(prev) for q in _QUESTION_MARKS) \
+                        and getattr(prev, 'reply_to', None) is not None \
+                        and getattr(prev.reply_to, 'direction', None) == 'inbound' \
+                        and _classify_message(_msg_text(prev.reply_to))['phones']:
+                    between = _M.objects_all.filter(
+                        conversation=conv, direction='inbound', type='text', active=True,
+                        created_at__gt=prev.created_at, created_at__lt=r.created_at,
+                    )
+                    if not any(_classify_message(_msg_text(b))['phones'] for b in between):
+                        target = prev
+            if target is None:
+                continue
+            about = getattr(target, 'reply_to', None)
+            if about is not None and getattr(about, 'direction', None) != 'inbound':
+                about = None
+            about_phone = None
+            if about is not None:
+                if getattr(about, 'ai_consumed_at', None):
+                    answer_ids.add(str(r.id))   # its transfer already exists — finished
+                    continue
+                ph = _classify_message(_msg_text(about))['phones']
+                about_phone = ph[0] if ph else None
+            q_text = ' '.join(_msg_text(target).split())
+            if any(w in q_text for w in _CONFIRM_WORDS):
+                kind = 'confirmation_reply'
+            elif cls['amounts'] and not cls['phones']:
+                kind = 'amount_reply'
+            else:
+                kind = 'reply'
+            answers.append({
+                'message_id': str(r.id),
+                'text': ' '.join(txt.split())[:120],
+                'kind': kind,
+                'value': float(cls['amounts'][0]) if cls['amounts'] else None,
+                'question_message_id': str(target.id),
+                'question_text': q_text[:200],
+                'question_options': _question_options(q_text, about_phone),
+                'about_message_id': str(about.id) if about is not None else None,
+                'about_phone': about_phone,
+            })
+            answer_ids.add(str(r.id))
+    except Exception:
+        logger.warning('planner: answer extraction failed; treating all rows as requests',
+                       exc_info=True)
+        return [], set()
+    return answers, answer_ids
+
+
+def _apply_answers(pairs: List[Dict[str, Any]], answers: List[Dict[str, Any]]) -> None:
+    """Fold each amount answer into the pair it answers (or create that pair)."""
+    for a in answers:
+        if a.get('kind') != 'amount_reply' or a.get('value') is None or not a.get('about_phone'):
+            continue
+        phone, value = a['about_phone'], float(a['value'])
+        options = a.get('question_options') or []
+        matches = (not options) or any(abs(value - o) < 0.5 for o in options)
+        target = next((p for p in pairs if p.get('account_number') == phone), None)
+        if target is None:
+            target = {'account_number': phone, 'value': value, 'type': 'كاش',
+                      'source_message_id': a.get('about_message_id'), 'confidence': 'high'}
+            pairs.append(target)
+        target['value'] = value
+        target['confidence'] = 'high' if matches else 'low'
+        target['reason'] = 'answer_to_question' if matches else 'answer_matches_neither_option'
+        target['answer_message_id'] = a['message_id']
+        a['applied_to'] = phone
+
+
 def consumed_ids_by_source(conv):
     """{phone source_message_id -> [all inbound message ids consumed by that pair]}
     for the conversation's CURRENT unprocessed inbound burst, via the SAME
@@ -489,6 +617,14 @@ def consumed_ids_by_source(conv):
             # Using id alone scrambled same-second phone/amount pairs → wrong money routing.
             .order_by('_ord', 'created_at', 'id')
         )
+        # Same filter as the planner: the customer's answers to our questions are
+        # not requests, so they must not take part in the pairing here either.
+        _answers, _answer_ids = _extract_answers(conv, rows)
+        rows = [r for r in rows if str(r.id) not in _answer_ids]
+        for a in _answers:
+            # An applied amount answer belongs to its number's pair: watermark it too.
+            if a.get('about_message_id') and a.get('kind') == 'amount_reply':
+                out.setdefault(a['about_message_id'], set()).add(a['message_id'])
         messages, msg_text, msg_sent = [], {}, {}
         for r in rows:
             mid = str(r.id)
@@ -523,7 +659,15 @@ def consumed_ids_by_source(conv):
         'into the bulk create tool (source_message_id is already each PHONE message id). '
         '- orphans: [{kind, value, message_id}] — phone with no amount, or amount with no phone. '
         'Ask ONE short question per orphan; never guess. '
-        '- ambiguous: pairs with an uncertain `.`/`,` reading — confirm if unsure. '
+        '- ambiguous: pairs with an uncertain `.`/`,` reading — confirm if unsure; reason '
+        'separator_malformed («46,0010») = the amount as written is unreadable → ask for it '
+        'in plain digits, NEVER execute a guess. '
+        '- answers: the customer\'s replies to YOUR earlier questions [{message_id, text, kind '
+        '(amount_reply / confirmation_reply / reply), value, about_phone, question_text, '
+        'question_options, applied_to}]. An amount_reply is already applied to its pair '
+        '(applied_to) — create it, do not re-ask. A pair with reason '
+        'answer_matches_neither_option → confirm ONCE. A confirmation_reply that is not a '
+        'clear yes/no → ask ONCE, clearly, inside your single reply. '
         '- list_pattern (bool) + per-pair confidence high/low: TRUE when numbers and amounts '
         'arrived as two SEPARATE lists (all numbers, then all amounts), paired by position. When '
         'list_pattern OR a pair is "low", CONFIRM the matching before executing. '
@@ -585,6 +729,7 @@ def qurtoba_plan_transactions(
             if fb is not None:
                 msg_fallback[str(m['message_id']).strip()] = fb
 
+    answers: List[Dict[str, Any]] = []
     # SMARTER PLANNER — don't trust the list the LLM transcribed. The model can silently
     # DROP or reorder a line (we caught it omitting a phone number, which orphaned an
     # amount and made the agent ask a nonsense question). When we have the conversation,
@@ -609,6 +754,10 @@ def qurtoba_plan_transactions(
                 .order_by('_ord', 'created_at', 'id')
             )
             if _rows:
+                # The customer's answers to OUR questions are not new requests:
+                # keep them out of the pairing and hand them back as `answers`.
+                answers, _answer_ids = _extract_answers(conv, _rows)
+                _rows = [r for r in _rows if str(r.id) not in _answer_ids]
                 messages = [
                     {'message_id': str(r.id),
                      'text': (r.content.get('text') if isinstance(r.content, dict) else '') or ''}
@@ -648,6 +797,9 @@ def qurtoba_plan_transactions(
     _gap = getattr(_dj0, 'AI_BURST_GAP_SEC', 45)
     events = _build_events(messages, msg_text, msg_fallback)
     pairs, pair_mids, orphans, ambiguous_out, list_pattern = _pair_events(events, msg_sent, _gap)
+    # An amount the customer sent in answer to our question about a number IS that
+    # number's amount — it replaces whatever we had parsed for it and is never an orphan.
+    _apply_answers(pairs, answers)
 
     # --- Same-time split-ambiguity guard ---------------------------------
     # WhatsApp timestamps only to the second and does NOT guarantee order for
@@ -744,6 +896,16 @@ def qurtoba_plan_transactions(
                 '«خمسمائة»=500، «ألفين»=2000) اقراها وحط قيمتها الرقمية في التحويل بنفسك من غير ما '
                 'تسأل العميل. لكن لو الكلمة اسم شخص (زي «سمية»/«سامية»/«حلمية») تجاهلها — دي مش مبلغ. ' + note)
 
+    if answers:
+        _ans = '؛ '.join(
+            f"«{a['text']}» رد على سؤالك «{a['question_text'][:60]}»"
+            + (f" — اتطبّق على {a['applied_to']}" if a.get('applied_to') else '')
+            for a in answers
+        )
+        note = (f'فيه ردود من العميل على أسئلتك (answers): {_ans}. دي إجابات مش طلبات جديدة — '
+                'ما تسألش نفس السؤال تاني. لو الرد مش واضح (مش أيوة/لأ ومش مبلغ يطابق) اسأل مرة '
+                'واحدة بصيغة واضحة جوه رسالتك الواحدة. ' + note)
+
     # Debug log — one line capturing exactly what the planner decided for this burst.
     try:
         from qurtoba.tools._debuglog import log_event
@@ -775,6 +937,7 @@ def qurtoba_plan_transactions(
         'same_time_overflow': blocked_overflow,
         'resend': resend,
         'read_amounts': read_amounts,
+        'answers': answers,
         'summary': {
             'pairs_count': len(pairs),
             'orphans_count': len(orphans),

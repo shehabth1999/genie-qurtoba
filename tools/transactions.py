@@ -740,6 +740,20 @@ def _create_one_debt(
             # tool-call / overlapping run, short enough that a real resend asks «تحب أكررها؟».
             _grace = 15  # seconds — same-burst dedup window
             if (_tz.now() - dup_today.created_at).total_seconds() <= _grace:
+                # Watermark the copy's messages as consumed by the record that
+                # already exists. A same-burst duplicate is FINISHED — the
+                # customer's client re-sent the same text (2026-09-03: three
+                # identical forwards in 2 s). Left unconsumed, the planner
+                # re-fetched the copies on the next run and the create tool
+                # then asked «تحب أكررها؟» twice for a transfer that was never
+                # requested twice.
+                try:
+                    from modules.chat.models import Message as _ChatMessage
+                    _wm = {x for x in ([src] + list(consumed_message_ids or [])) if x}
+                    for _m in _ChatMessage.objects_all.filter(id__in=_wm):
+                        _m.mark_ai_consumed(dup_today)
+                except Exception:
+                    pass
                 return {
                     'success': True, 'duplicate': True, 'record_id': dup_today.pk,
                     'type': dup_today.type, 'value': dup_today.value,
@@ -782,6 +796,26 @@ def _create_one_debt(
     # (override_grade_limit) — an admin already approved.
     _hv_threshold = _high_value_threshold()
     if amount >= _hv_threshold and not confirm_high_value and not override_grade_limit:
+        # The hold remembers that it was already put to the customer, so a
+        # re-run (a new message restarts the batch and the planner re-fetches
+        # the same unconsumed number) reports `already_asked` instead of
+        # prompting the agent to ask the identical question again. On
+        # 2026-09-03 the same «تأكيد تحويل 100000 …؟» went out twice and the
+        # customer's reply in between («100 ج») was treated as a new amount.
+        _already_asked = False
+        _asked_at = None
+        try:
+            from django.core.cache import cache as _hv_cache
+            from django.utils import timezone as _hv_tz
+            _conv_id = getattr(conversation, 'id', None)
+            _hv_key = f'qurtoba:hv_asked:{_conv_id}:{final_account}:{int(amount)}'
+            _asked_at = _hv_cache.get(_hv_key)
+            if _asked_at:
+                _already_asked = True
+            else:
+                _hv_cache.set(_hv_key, _hv_tz.now().isoformat(), timeout=6 * 3600)
+        except Exception:
+            pass
         return {
             'success': True,
             'needs_confirmation': True,
@@ -791,6 +825,8 @@ def _create_one_debt(
             'value': amount,
             'account_number': final_account,
             'threshold': _hv_threshold,
+            'already_asked': _already_asked,
+            'asked_at': _asked_at,
             'error': None,
         }
 
