@@ -24,6 +24,7 @@ class QurtobaConfig(AppConfig):
         except Exception:
             logger.exception('qurtoba: ai_inbound_catcher failed to register')
 
+        self._apply_business_settings()
         self._install_ai_guard()
         self._takeover_celery_config()
 
@@ -32,6 +33,21 @@ class QurtobaConfig(AppConfig):
         # before the DB is ready.
         if os.environ.get('RUN_MAIN') or os.environ.get('CELERY_WORKER_RUNNING'):
             self._schedule_catalog_pull()
+
+    @staticmethod
+    def _apply_business_settings():
+        """Tenant business rules that core reads from settings, owned here.
+
+        AI_HIGH_VALUE_CONFIRM_THRESHOLD — a single transfer at or above this
+        amount (EGP) is never placed automatically: the create tool holds it,
+        the customer must confirm, and only then is it created. Raised from the
+        tool's 200,000 default to 100,000 on 2026-09-03 at the office's request.
+        """
+        from django.conf import settings as dj_settings
+        try:
+            dj_settings.AI_HIGH_VALUE_CONFIRM_THRESHOLD = 100_000
+        except Exception:
+            logger.exception('qurtoba: could not apply AI_HIGH_VALUE_CONFIRM_THRESHOLD')
 
     @staticmethod
     def _install_ai_guard():

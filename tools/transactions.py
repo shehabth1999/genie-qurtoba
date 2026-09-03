@@ -23,9 +23,10 @@ logger = logging.getLogger(__name__)
 
 
 def _high_value_threshold() -> float:
-    """Amount (EGP) above which a transaction is NOT placed automatically: the
-    customer must explicitly confirm first, and it NEVER gets the 👍 reaction.
-    Overridable via settings.AI_HIGH_VALUE_CONFIRM_THRESHOLD (default 200,000)."""
+    """Amount (EGP) at or above which a transaction is NOT placed automatically:
+    the customer must explicitly confirm first, and it NEVER gets the 👍 reaction.
+    Read from settings.AI_HIGH_VALUE_CONFIRM_THRESHOLD, which qurtoba.apps sets
+    (100,000); the 200,000 here is only the fallback if that setting is absent."""
     try:
         from django.conf import settings as _djs
         return float(getattr(_djs, 'AI_HIGH_VALUE_CONFIRM_THRESHOLD', 200000))
@@ -770,15 +771,17 @@ def _create_one_debt(
             }
 
     # --- High-value confirmation gate -----------------------------------------
-    # Any transaction whose value exceeds the high-value threshold (default
-    # 200,000 EGP) is NOT placed automatically. It is NOT created, NOT queued to
-    # pending review, and gets NO 👍 reaction. The TOOL decides this directly —
-    # the LLM must NEVER reject a big amount on its own; it only relays this
-    # confirmation request to the customer and, once the customer explicitly
-    # confirms, retries the SAME item with confirm_high_value=true. Bypassed on
-    # the admin-approval path (override_grade_limit) — an admin already approved.
+    # Any transaction whose value is AT OR ABOVE the high-value threshold
+    # (settings.AI_HIGH_VALUE_CONFIRM_THRESHOLD, set by the extension; the
+    # office asked for 100,000 EGP) is NOT placed automatically. It is NOT
+    # created, NOT queued to pending review, and gets NO 👍 reaction. The TOOL
+    # decides this directly — the LLM must NEVER reject a big amount on its own;
+    # it only relays this confirmation request to the customer and, once the
+    # customer explicitly confirms, retries the SAME item with
+    # confirm_high_value=true. Bypassed on the admin-approval path
+    # (override_grade_limit) — an admin already approved.
     _hv_threshold = _high_value_threshold()
-    if amount > _hv_threshold and not confirm_high_value and not override_grade_limit:
+    if amount >= _hv_threshold and not confirm_high_value and not override_grade_limit:
         return {
             'success': True,
             'needs_confirmation': True,
