@@ -4,9 +4,11 @@ WhatsApp utility templates for the Cash-SYS notices the webhook flow sends.
 Inside the 24-hour customer-service window the notices go out as free-form text
 (fast, no approval needed, quoted on the customer's message). Outside that
 window WhatsApp refuses free-form sends (error 131047), so each notice has an
-approved *utility* template twin here, sent with the same quote (``context``)
-so it still lands under the customer's message. From 2026-10-01 Meta bills both
-kinds the same inside the window, so this is purely a delivery guarantee.
+approved *utility* template twin here. The send carries the same ``context``
+(quote) as the direct notice, but VERIFIED 2026-09-05 on the test line: WhatsApp
+accepts the field and renders NO quoted bubble for template messages — a
+template notice arrives unquoted. From 2026-10-01 Meta bills both kinds the
+same inside the window, so this is purely a delivery guarantee.
 
 Kinds (one template each, account-scoped, Arabic ar_EG):
 
