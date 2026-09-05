@@ -9,9 +9,11 @@ the create tool's validation, the outbound gate. What is sandboxed:
   * inbound rows are inserted WITHOUT a WhatsApp id, so chat.Message.post_create
     never schedules the Celery batching task (the run is driven in-process);
   * every WhatsApp send (text, media, reaction, template) is captured instead of
-    delivered — the capture still asks the outbound gate for its verdict and
-    still writes the outbound chat row, so multi-turn scenarios see the agent's
-    own previous question exactly as production would;
+    delivered — the capture still asks the outbound gate for its verdict
+    (``ai_guard.decide`` → send / block / forward-as-a-quote, or the older
+    ``block_reason`` while ``decide`` is not deployed) and still writes the
+    outbound chat row, so multi-turn scenarios see the agent's own previous
+    question exactly as production would;
   * the Qurtoba push task and the human-alert notification are stubbed;
   * ledger rows created for the sandbox customer are deleted after each scenario.
 
@@ -52,9 +54,11 @@ class Capture:
     pushes: List[int] = field(default_factory=list)
     counter: int = 0
 
+    def agent_sends(self) -> List[Dict[str, Any]]:
+        return [s for s in self.sends if _is_agent_send(s)]
+
     def agent_texts(self) -> List[str]:
-        return [s['text'] for s in self.sends
-                if s['kind'] == 'text' and s['by_ai'] and not s['system_send'] and not s['blocked']]
+        return [s['text'] for s in self.agent_sends()]
 
     def tool_texts(self) -> List[str]:
         return [s.get('text') or s.get('caption') or '' for s in self.sends
@@ -62,6 +66,32 @@ class Capture:
 
     def blocked(self) -> List[Dict[str, Any]]:
         return [s for s in self.sends if s['blocked']]
+
+
+def _is_agent_send(s: Dict[str, Any]) -> bool:
+    """A customer-visible AGENT text: written by the AI partner outside a tool's
+    ``system_send()`` and let through by the gate — delivered as-is ('send') or
+    re-attached by the gate as a quote on the customer's message ('forward')."""
+    return (s.get('kind') == 'text' and s.get('by_ai') and not s.get('system_send')
+            and s.get('action', 'block' if s.get('blocked') else 'send') in ('send', 'forward'))
+
+
+def _gate_verdict(content, message_type, conversation, system_partner, *, reply_to_id=None, reply_to_message_id=None) -> Dict[str, Any]:
+    """Ask the outbound gate. Prefers the new ``ai_guard.decide`` contract
+    ({'action': 'send'|'block'|'forward', 'reason', 'forward_to'}); falls back to the
+    older ``block_reason`` while that contract is not deployed yet."""
+    from qurtoba import ai_guard
+    decide = getattr(ai_guard, 'decide', None)
+    if callable(decide):
+        verdict = decide(content, message_type, conversation, system_partner,
+                         reply_to_id=reply_to_id, reply_to_message_id=reply_to_message_id) or {}
+        action = verdict.get('action') or 'send'
+        if action not in ('send', 'block', 'forward'):
+            action = 'send'
+        return {'action': action, 'reason': verdict.get('reason'), 'forward_to': verdict.get('forward_to'),
+                'contract': 'decide'}
+    reason = ai_guard.block_reason(content, message_type, conversation, system_partner)
+    return {'action': 'block' if reason else 'send', 'reason': reason, 'forward_to': None, 'contract': 'block_reason'}
 
 
 @contextlib.contextmanager
@@ -83,18 +113,30 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
         'push_async': push_record_to_qurtoba_task.apply_async,
     }
 
-    def _record_send(content, message_type, system_partner, reply_to_id, caption, filename):
+    def _record_send(content, message_type, system_partner, reply_to_id, caption, filename, reply_to_message_id=None):
         capture.counter += 1
         text = content.get('text') if isinstance(content, dict) else (content if isinstance(content, str) else None)
         by_ai = bool(getattr(system_partner, 'ai_agent', False))
         system_send = ai_guard.in_system_send()
-        blocked = ai_guard.block_reason(content, message_type, conversation, system_partner)
+        verdict = _gate_verdict(content, message_type, conversation, system_partner,
+                                reply_to_id=reply_to_id, reply_to_message_id=reply_to_message_id)
+        action = verdict['action']
+        forward_to = verdict.get('forward_to') if action == 'forward' else None
+        if action == 'forward' and forward_to is None:
+            # the gate said "quote it on the customer's message" but named none —
+            # nothing to attach to, so it goes out as it was
+            action = 'send'
+        blocked = verdict.get('reason') if action == 'block' else None
+        forwarded = action == 'forward'
+        quoted = bool(reply_to_id or reply_to_message_id) or forwarded
         entry = {
             'n': capture.counter, 'kind': 'text' if message_type == 'text' else message_type,
             'text': text, 'caption': caption, 'filename': filename,
             'url': content.get('url') if isinstance(content, dict) else None,
-            'by_ai': by_ai, 'system_send': system_send, 'blocked': blocked,
-            'reply_to_id': str(reply_to_id) if reply_to_id else None,
+            'by_ai': by_ai, 'system_send': system_send,
+            'action': action, 'blocked': blocked, 'forwarded': forwarded, 'quoted': quoted,
+            'gate_reason': verdict.get('reason'), 'gate_contract': verdict.get('contract'),
+            'reply_to_id': str(forward_to.id) if forwarded else (str(reply_to_id) if reply_to_id else None),
             'sender': getattr(system_partner, 'name', None),
         }
         capture.sends.append(entry)
@@ -102,7 +144,10 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
         if not blocked:
             try:
                 from django.contrib.contenttypes.models import ContentType
-                reply_to = Message.objects_all.filter(id=reply_to_id).first() if reply_to_id else None
+                if forwarded:
+                    reply_to = forward_to
+                else:
+                    reply_to = Message.objects_all.filter(id=reply_to_id).first() if reply_to_id else None
                 sa = conversation.social_account
                 row = Message.objects_all.create(
                     conversation=conversation, sender=system_partner or ai_partner,
@@ -125,7 +170,8 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
     def fake_sab(self, partner, content, *, message_type='text', caption=None, filename=None,
                  reply_to_message_id=None, reply_to_id=None, preview_url=False, conversation=None,
                  system_partner=None, websocket=True, skip_bridge=False):
-        return _record_send(content, message_type, system_partner, reply_to_id, caption, filename)
+        return _record_send(content, message_type, system_partner, reply_to_id, caption, filename,
+                            reply_to_message_id=reply_to_message_id)
 
     def fake_text(self, partner, text, *args, **kwargs):
         return _record_send({'text': text}, 'text', ai_partner, None, None, None)
@@ -140,7 +186,8 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
     def fake_tmpl(self, template, partner, *args, **kwargs):
         capture.counter += 1
         capture.sends.append({'n': capture.counter, 'kind': 'template', 'text': getattr(template, 'template_name', '?'),
-                              'by_ai': False, 'system_send': True, 'blocked': None, 'caption': None, 'filename': None})
+                              'by_ai': False, 'system_send': True, 'blocked': None, 'action': 'send', 'forwarded': False,
+                              'quoted': False, 'reply_to_id': None, 'caption': None, 'filename': None})
         return {'message_id': f'wamid.sandbox.{capture.counter}', 'display_data': {}}
 
     def fake_alert(self, notify_dm=True, notify_push=True, mark_favorite=True, message=None):
@@ -412,12 +459,25 @@ def _contains_kv(obj, key, value) -> bool:
     return False
 
 
-def score_turn(turn: Dict[str, Any], expect: Dict[str, Any]) -> List[Dict[str, Any]]:
+# Wording that lists what went right. The tool's 👍 already says it; an agent text
+# that recites the registered items is the old "one combined message" habit.
+SUCCESS_LIST_FORBID = ['اتسجّل', 'اتسجل عندنا', 'اتسجلت', 'اتنفذت', 'اتنفّذت', 'تم تسجيل', 'تم التنفيذ',
+                       'تم تنفيذ', 'باقي التحويلات', 'باقى التحويلات']
+
+
+def score_turn(turn: Dict[str, Any], expect: Dict[str, Any],
+               inbound_ids: Optional[Dict[int, str]] = None) -> List[Dict[str, Any]]:
+    """``inbound_ids`` maps a SCENARIO turn index → that inbound row's id (all turns,
+    not only this batch), so ``quoted_on`` can name a message from an earlier batch."""
     checks = []
     sends = turn['sends']
-    agent_texts = [s['text'] or '' for s in sends if s['kind'] == 'text' and s['by_ai'] and not s['system_send'] and not s['blocked']]
+    agent_sends = [s for s in sends if _is_agent_send(s)]
+    agent_texts = [s['text'] or '' for s in agent_sends]
     tool_texts = [(s.get('text') or s.get('caption') or '') for s in sends if s['system_send'] and not s['blocked']]
     blocked = [s for s in sends if s['blocked']]
+    unquoted = [s for s in agent_sends if s.get('action') == 'send' and not s.get('quoted')]
+    quoted_sends = [s for s in agent_sends if s.get('quoted')]
+    inbound_ids = inbound_ids or {}
     agent_blob = '\n'.join(agent_texts)
     tool_blob = '\n'.join(tool_texts)
     called = [tc['name'] for tc in turn['tool_calls']]
@@ -475,6 +535,23 @@ def score_turn(turn: Dict[str, Any], expect: Dict[str, Any]) -> List[Dict[str, A
         add('agent text free of forbidden phrases', True, '')
     for s in expect.get('tool_texts_contain', []):
         add(f'tool-sent text contains «{s}»', s in tool_blob, f'tool_texts={tool_texts}')
+    if 'quoted_replies' in expect:
+        n = expect['quoted_replies']
+        add(f'exactly {n} quoted agent reply(ies)', len(quoted_sends) == n,
+            f"quoted={[((q['text'] or '')[:60], q['reply_to_id'], 'fwd' if q.get('forwarded') else 'tool') for q in quoted_sends]} agent_texts={agent_texts}")
+    for ti in expect.get('quoted_on', []):
+        target = inbound_ids.get(int(ti))
+        hit = bool(target) and any(q.get('reply_to_id') == target for q in quoted_sends)
+        add(f'an agent reply is quoted on turn {ti}\'s message', hit,
+            f"target={target} quoted_on={[q['reply_to_id'] for q in quoted_sends]} agent_texts={agent_texts}")
+    if expect.get('no_success_list'):
+        hits = [w for w in SUCCESS_LIST_FORBID if w in agent_blob]
+        add('no success list in agent text (the 👍 already says it)', not hits, f'hits={hits} agent_texts={agent_texts}')
+    # GLOBAL: since 2026-09-05 nothing the agent writes reaches the customer unquoted —
+    # only the reply tool (or the gate re-attaching a greeting to the customer's
+    # message) delivers. A plain 'send' of agent text is a protocol breach.
+    add('no unquoted agent text delivered', not unquoted,
+        f"unquoted={[((u['text'] or '')[:80]) for u in unquoted]}" if unquoted else '')
     if blocked:
         add('gate blocked an agent text (system caught a leak — the model still produced it)', False,
             f"blocked={[(b['blocked'], (b['text'] or '')[:80]) for b in blocked]}")
@@ -541,11 +618,12 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
             report['turns'].append(res)
 
         expect = scn.get('expect') or {}
+        inbound_ids = {i: str(r.id) for i, r in rows_by_turn.items()}
         for ti, turn in enumerate(report['turns']):
             key = str(ti)
             exp = expect.get(key) or (expect.get('final') if ti == len(report['turns']) - 1 else None)
             if exp:
-                for c in score_turn(turn, exp):
+                for c in score_turn(turn, exp, inbound_ids):
                     c['turn'] = ti
                     report['checks'].append(c)
     except Exception as e:

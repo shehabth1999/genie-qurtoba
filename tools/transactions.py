@@ -689,30 +689,35 @@ def _create_one_debt(
                 'value': dup_pend.value, 'account_number': dup_pend.account_number,
             }
 
-    # --- Recently-failed number (no wallet) ------------------------------------
-    # 2026-08-29: a reroute was sent to a number that had itself been cancelled
-    # for «مش عليه محفظة» minutes earlier, and failed the same way. A number the
-    # Cash office rejected for having no wallet will not grow one within the day;
-    # refuse it deterministically so the agent asks for another number instead
-    # of re-queueing the same failure.
+    # --- Recently-bounced number (no wallet) — INFORMATIONAL ONLY ---------------
+    # History: 2026-08-29 a reroute went to a number that had itself just been
+    # cancelled for «مش عليه محفظة», so on 2026-09-03 this became a hard refusal
+    # (error_type=number_has_no_wallet, 24 h window). REVERSED 2026-09-05 on the
+    # office's instruction: «الرقم مش عليه محفظة لما الرقم بيجي تاني الاجينت بيرفضه
+    # قبل ما يسجل العملية». Customers routinely activate the wallet and resend the
+    # same number minutes later; refusing it in the agent lost real transfers.
+    # The transfer is REGISTERED normally — Cash-SYS is the one that decides
+    # whether the wallet exists now. We keep the cheap lookup and only surface it
+    # as `bounced_today` / `bounced_at` on the item result. It never changes
+    # `success`, never rejects, never makes the agent speak.
+    bounced_today = False
+    bounced_at = None
     if is_cash and final_account and not override_grade_limit:
-        from datetime import timedelta as _td
-        from django.utils import timezone as _tz
-        from qurtoba.models import QurtobaRecord
-        failed = QurtobaRecord.objects.filter(
-            customer=customer, account_number=final_account,
-            cash_sys_canceled_reason='no_wallet',
-            updated_at__gte=_tz.now() - _td(hours=24),
-        ).order_by('-id').first()
-        if failed is not None:
-            return {
-                'success': False,
-                'error_type': 'number_has_no_wallet',
-                'error': (f'الرقم {final_account} اترفض قبل كده — مفيش عليه محفظة كاش. '
-                          'من فضلك ابعت رقم تاني عليه محفظة.'),
-                'failed_record_id': failed.pk,
-                'failed_at': failed.updated_at.isoformat(),
-            }
+        try:
+            from django.utils import timezone as _tz
+            from qurtoba.models import QurtobaRecord
+            _day_start = _tz.localtime(_tz.now()).replace(hour=0, minute=0, second=0, microsecond=0)
+            _bounced = QurtobaRecord.objects.filter(
+                customer=customer, account_number=final_account,
+                cash_sys_canceled_reason='no_wallet',
+                updated_at__gte=_day_start,
+            ).order_by('-id').only('id', 'updated_at').first()
+            if _bounced is not None:
+                bounced_today = True
+                bounced_at = _bounced.updated_at.isoformat() if _bounced.updated_at else None
+        except Exception:
+            # Purely informational — a lookup failure must never block a create.
+            bounced_today, bounced_at = False, None
 
     # --- Same-day cash repeat check (B5) ---------------------------------------
     # B4 above only catches an EXACT re-run of the SAME message (same source_message_id).
@@ -905,6 +910,8 @@ def _create_one_debt(
                 'account_input': _raw_in or None,
                 'pending_qurtoba_push': False,
                 'pending_cash_sys': False,
+                'bounced_today': bounced_today,
+                'bounced_at': bounced_at,
             }
         except Exception as exc:
             # If pending creation itself fails, fall back to the old hard-reject
@@ -1012,12 +1019,27 @@ def _create_one_debt(
         'source_unverified': source_unverified,
         'pending_qurtoba_push': True,
         'pending_cash_sys': is_cash,
+        # Informational: same number was cancelled for no_wallet earlier today.
+        'bounced_today': bounced_today,
+        'bounced_at': bounced_at,
     }
 
 
 # ---------------------------------------------------------------------------
 # Shared batch creator — used by the bulk tool AND the split tool
 # ---------------------------------------------------------------------------
+def _bounced_flags(outcome: Dict[str, Any]) -> Dict[str, Any]:
+    """Informational `bounced_today`/`bounced_at` for an item result — only when set.
+
+    The same number was cancelled by Cash-SYS for no_wallet earlier today. The
+    transfer is still registered (office decision 2026-09-05 — Cash-SYS decides);
+    a fresh number gets no key at all so the result stays byte-identical to before.
+    """
+    if not outcome.get('bounced_today'):
+        return {}
+    return {'bounced_today': True, 'bounced_at': outcome.get('bounced_at')}
+
+
 def _create_debts_batch(conv, customer, items, override_grade_limit, source_message_id=None):
     """Create each item in `items` via _create_one_debt; return the batch summary.
 
@@ -1156,8 +1178,11 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
                     'account_corrected': outcome.get('account_corrected', False),
                     'account_input': outcome.get('account_input'),
                     'input': {'type': type_, 'value': value_, 'account_number': account_},
+                    **_bounced_flags(outcome),
                 })
             else:
+                # NOTE: a `bounced_today` item is still a clean 'created' — it counts in
+                # created_count and does not disturb reply_fully_handled (informational only).
                 created_count += 1
                 results.append({
                     'index': index,
@@ -1171,6 +1196,7 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
                     'previous_balance': outcome['previous_balance'],
                     'new_balance': outcome['new_balance'],
                     'pending_cash_sys': outcome['pending_cash_sys'],
+                    **_bounced_flags(outcome),
                 })
         else:
             rejected_count += 1
@@ -1263,7 +1289,10 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
         'needs_confirmation/high_value (amount over the high-value limit — the TOOL held it, NOT '
         'a rejection you make; confirm the large transfer with the customer, on yes retry with '
         'confirm_high_value=true, on no drop it). '
-        'NEVER say «تم» until a (re)try returns status="created".'
+        'NEVER say «تم» until a (re)try returns status="created". '
+        'A created/pending item may carry bounced_today=true (same number was cancelled for '
+        'no-wallet earlier today): INFORMATIONAL ONLY — the transfer IS registered and Cash-SYS '
+        'decides; it is never a rejection and you do not mention it.'
     ),
     category='qurtoba',
     requires_auth=True,

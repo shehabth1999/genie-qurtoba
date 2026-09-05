@@ -829,6 +829,26 @@ def _is_010_number(raw):
     return d.startswith('010')
 
 
+def _executed_briefs(briefs):
+    """
+    Keep only the transfer briefs that represent money that actually went out
+    (a positive `value`). Briefs reach `cash_sys_transactions` only through
+    order_progress / order_done, i.e. for executed transfers, but a reroute or
+    cancel settles the record at the amount SENT and must never charge a fee for
+    a part that did not move — so the fee plan is fed executed briefs only.
+    `sent` is deliberately not used here: it marks the receipt as delivered, and a
+    failed receipt delivery does not make the fee any less owed.
+    """
+    out = []
+    for b in (briefs or []):
+        try:
+            if float((b or {}).get('value') or 0) > 0:
+                out.append(b)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _service_fee_plan(briefs, recipient=None):
     """
     Pure decision: given the transfer briefs, return the list of مصاريف خدمه amounts
@@ -882,11 +902,15 @@ def _create_service_fees(record):
         return
     from qurtoba.models import QurtobaRecord
 
+    # Executed transfers only (see _executed_briefs): called from the done path
+    # AND from the reroute / partial-cancel settlement, where the record was
+    # settled at the amount sent and only that part may carry a fee.
+    executed = _executed_briefs(record.cash_sys_transactions)
     recipient = record.account_number or next(
-        (b.get('transfer_to') for b in (record.cash_sys_transactions or []) if b.get('transfer_to')),
+        (b.get('transfer_to') for b in executed if b.get('transfer_to')),
         None,
     )
-    chosen = _service_fee_plan(record.cash_sys_transactions or [], recipient=recipient)
+    chosen = _service_fee_plan(executed, recipient=recipient)
 
     # Mark done up-front so a webhook retry / companion event never double-charges.
     QurtobaRecord.objects.filter(pk=record.pk).update(cash_sys_service_fee_done=True)
@@ -1185,6 +1209,12 @@ def _apply_reroute(record, data: dict):
     record.refresh_from_db()
     images_sent = _send_done_receipts(record)
     _pause_after_receipts(images_sent)   # let the image land before the «تغيير رقم» ask
+    # Office report 2026-09-05: a split order that ends as partial + reroute
+    # settled at the amount sent but never recorded «مصاريف خدمه» for the part
+    # that DID go out — the fee was only ever posted from order_done. Post it
+    # here for the executed briefs (same machinery, same message); the
+    # cash_sys_service_fee_done flag keeps a later order_done from charging twice.
+    _create_service_fees(record)
     _send_reroute_ask(record, fulfilled, reroute_amount)
 
 
@@ -1316,6 +1346,13 @@ def _apply_zero_cancel(record, reason):
     logger.info('[CashSys ZeroCancel] record=%d reason=%s original=%s → value %s%s',
                 record.pk, reason, record.cash_sys_original_value, target,
                 ' (partial: settled at amount sent)' if partial else '')
+
+    if partial:
+        # Office report 2026-09-05: settling a partially-sent order at the amount
+        # sent must also record «مصاريف خدمه» for the executed part (previously
+        # only order_done did). Idempotent via cash_sys_service_fee_done.
+        record.refresh_from_db()
+        _create_service_fees(record)
 
     # Only a FULL reversal may tell the customer «لم يتم تسجيل العمليه عليك» — that
     # sentence is false when part of the money did go out.

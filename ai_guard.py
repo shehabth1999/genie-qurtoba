@@ -10,26 +10,60 @@ did not author itself. Everything the extension sends on purpose (the 👍 ack,
 the balance, the statement, Cash-SYS notices, receipts) is wrapped in
 ``system_send()`` and passes through untouched.
 
-Four layers, in order — a hit on any of them drops the message:
+The rules, in order — ``decide()`` returns the first one that fires:
 
-  1. system-only templates   — the 👍/👍🏿 ack and the Cash-SYS outcome notices
+  1. system_template         — the 👍/👍🏿 ack and the Cash-SYS outcome notices
                                are statements of fact about money; only the
                                system may send them (incident 2026-08-06).
-  2. reply already delivered — a tool answered this turn (it said so via
-                               ``mark_reply_delivered``); whatever the agent
-                               types afterwards is narration («Created. Stay
+  2. reply_already_delivered — a tool answered this turn (it said so via
+                               ``mark_reply_delivered``) and this text is a
+                               status claim about that delivery («Created. Stay
                                silent.» — conversation 13f58d64, 2026-08-29).
-  3. non-message / narration — «(لا رد)», a lone «.», «Done.», «تم التنفيذ»:
-                               nothing a customer could read as a reply.
-  4. duplicate               — the identical text to the same conversation
+  3. non_message             — «(لا رد)», a lone «.»: nothing a customer could
+                               read as a reply.
+  4. non_arabic              — Latin-script text is the model thinking, not a
+                               customer message.
+  5. internal_note           — «(مش للعميل)», «internal only»: a note to the operator.
+  6. echo_with_note          — the customer's last message repeated back with a
+                               parenthetical.
+  7. self_narration          — «تم التنفيذ», «Done.»: the agent reporting on itself.
+  8. duplicate               — the identical text to the same conversation
                                within a few seconds (a re-run that already sent).
+  9. duplicate_question (C)  — a second agent reply that QUOTES THE SAME inbound
+                               message as an earlier agent reply within 90 s (a
+                               restated question). Replies quoting different
+                               inbounds — one per fault in a batch — all pass.
+ 10. unquoted_agent_text (A) — office rule 2026-09-05: the agent must answer
+                               through the reply tool, never through its final
+                               output. An AI text with no ``reply_to_id`` and no
+                               ``reply_to_message_id`` is NEVER delivered as-is.
+                               (B) If it passed every rule above, the newest
+                               inbound is not a transaction message (no phone,
+                               no amount) and no quoted agent reply has gone out
+                               since that inbound, the gate FORWARDS it as a
+                               quoted reply on that inbound so a courtesy turn
+                               («السلام عليكم», «شكراً») is not left silent.
+                               Otherwise it is dropped — on a transaction turn
+                               the sweeper re-runs the abdicated message.
 
-Layer 2 is turn-scoped, not time-scoped: the tool's mark counts only if no
+Rule 2 is turn-scoped, not time-scoped: the tool's mark counts only if no
 inbound message arrived after it, so a lingering flag can never eat the answer
 to the customer's NEXT message.
 
-When in doubt the message is SENT. Any exception inside the gate is logged and
-the send proceeds — a swallowed answer is a customer left waiting.
+Contract (shared with the sandbox evaluation, which calls it directly)::
+
+    decide(content, message_type, conversation, system_partner, *,
+           reply_to_id=None, reply_to_message_id=None)
+        -> {'action': 'send' | 'block' | 'forward',
+            'reason': str | None,          # rule name; set for block AND forward
+            'forward_to': Message | None}  # the inbound to quote, for forward
+    block_reason(...same arguments...) -> str | None
+        # the reason only when decide() says block; None for send AND forward,
+        # so callers written against the old gate behave as before.
+
+When in doubt about CONTENT the message is SENT; when in doubt about WHERE an
+unquoted text belongs it is DROPPED (money must not be answered by guesswork).
+Any exception inside the gate is logged and the send proceeds as written.
 """
 import contextvars
 import hashlib
@@ -361,38 +395,121 @@ def _is_duplicate_send(conversation_id, text: str) -> bool:
         return False
 
 
-# One question per turn. The model sometimes sends its question through the
-# reply tool and then restates it as plain output in other words (sandbox
-# 2026-09-03, J2: «…يتحول على نفس الرقم ده ولا رقم تاني؟» twice). A second
-# agent question within the window is dropped; a second statement is not,
-# because it may carry the registered/problem lines of a structured reply.
-_AGENT_QUESTION_WINDOW = 90  # seconds
+# ── Quoted-reply bookkeeping (rules C and B) ─────────────────────────────────
+#
+# One agent reply per quoted inbound per turn. The model sometimes sends its
+# question through the reply tool and then restates it in other words (sandbox
+# 2026-09-03, J2: «…يتحول على نفس الرقم ده ولا رقم تاني؟» twice). Since
+# 2026-09-05 every delivered agent text is a quoted reply, so the marker is keyed
+# by the QUOTED inbound id: a second reply on the same inbound within the window
+# is dropped, while per-fault replies quoting different inbounds all pass.
+#
+# A per-conversation "last quoted agent reply at" timestamp is kept alongside
+# so rule B can tell whether the turn already produced a quoted reply without a
+# database write — the sandbox evaluation calls decide() without sending.
+_QUOTED_REPLY_WINDOW = 90  # seconds
 
 
-def _agent_question_key(conversation_id) -> str:
-    return f'qurtoba:ai_question:{conversation_id}'
+def _quoted_key(conversation_id, quoted_id) -> str:
+    return f'qurtoba:ai_quoted:{conversation_id}:{quoted_id}'
 
 
-def _is_question(text: str) -> bool:
-    return any(q in text for q in ('؟', '?'))
+def _quoted_at_key(conversation_id) -> str:
+    return f'qurtoba:ai_quoted_at:{conversation_id}'
 
 
-def _note_agent_text(conversation_id, text: str) -> None:
-    if _is_question(text):
-        try:
-            cache.set(_agent_question_key(conversation_id), _dedupe_key_text(text)[:200],
-                      timeout=_AGENT_QUESTION_WINDOW)
-        except Exception:
-            pass
-
-
-def _is_duplicate_question(conversation_id, text: str) -> bool:
-    if not _is_question(text):
-        return False
+def _note_quoted_reply(conversation_id, quoted_id) -> None:
+    """An agent reply quoting ``quoted_id`` is going out now."""
     try:
-        return bool(cache.get(_agent_question_key(conversation_id)))
+        now = time.time()
+        cache.set(_quoted_key(conversation_id, quoted_id), now, timeout=_QUOTED_REPLY_WINDOW)
+        cache.set(_quoted_at_key(conversation_id), now, timeout=_QUOTED_REPLY_WINDOW)
+    except Exception:
+        pass
+
+
+def _already_quoted(conversation_id, quoted_id) -> bool:
+    try:
+        return bool(cache.get(_quoted_key(conversation_id, quoted_id)))
     except Exception:
         return False
+
+
+def _quoted_id_of(reply_to_id, reply_to_message_id) -> Optional[str]:
+    """The chat Message id a send quotes, or None when it quotes nothing.
+
+    The core reply tool passes both ids; a caller that passes only the WhatsApp
+    id is still a quoted reply — resolve it, and fall back to the WhatsApp id
+    itself as the marker key when the row is not ours."""
+    if reply_to_id:
+        return str(reply_to_id)
+    if reply_to_message_id:
+        try:
+            from modules.chat.models import Message
+            mid = (Message.objects_all.filter(social_id=str(reply_to_message_id))
+                   .values_list('id', flat=True).first())
+            return str(mid) if mid else str(reply_to_message_id)
+        except Exception:
+            return str(reply_to_message_id)
+    return None
+
+
+def _newest_inbound(conversation_id):
+    """The conversation's most recent inbound chat Message (None when there is none)."""
+    try:
+        from modules.chat.models import Message
+        return (
+            Message.objects.filter(conversation_id=conversation_id, direction='inbound')
+            .order_by('-created_at')
+            .first()
+        )
+    except Exception:
+        logger.exception('ai_guard: newest-inbound lookup failed for %s', conversation_id)
+        return None
+
+
+def _is_transaction_message(text: Optional[str]) -> bool:
+    """A message carrying at least one phone or one amount is a transaction
+    request — the planner's own classifier decides. Unreadable → treated as a
+    transaction: forwarding a guessed text onto money is the worse failure."""
+    if not text or not str(text).strip():
+        return False
+    try:
+        from qurtoba.tools.planning import _classify_message
+        cls = _classify_message(str(text))
+        return bool(cls.get('phones')) or bool(cls.get('amounts'))
+    except Exception:
+        logger.exception('ai_guard: message classification failed')
+        return True
+
+
+def _quoted_reply_since(conversation_id, inbound) -> bool:
+    """Has any quoted agent reply gone out since ``inbound`` arrived?
+
+    Three sources, cheapest first: the per-inbound marker, the per-conversation
+    "last quoted at" stamp, and the outbound rows themselves (a tool's quoted
+    question sent inside ``system_send`` leaves no marker but IS the reply)."""
+    if _already_quoted(conversation_id, str(inbound.id)):
+        return True
+    arrived = getattr(inbound, 'created_at', None)
+    arrived_ts = arrived.timestamp() if arrived is not None else None
+    try:
+        last_quoted = cache.get(_quoted_at_key(conversation_id))
+        if last_quoted and arrived_ts is not None and float(last_quoted) > arrived_ts:
+            return True
+    except Exception:
+        pass
+    if arrived is None:
+        return False
+    try:
+        from modules.chat.models import Message
+        return Message.objects.filter(
+            conversation_id=conversation_id, direction='outbound',
+            reply_to__isnull=False, created_at__gt=arrived,
+        ).exists()
+    except Exception:
+        logger.exception('ai_guard: outbound lookup failed for %s', conversation_id)
+        return True
 
 
 # ── The gate ─────────────────────────────────────────────────────────────────
@@ -406,43 +523,99 @@ def _text_of(content) -> Optional[str]:
     return None
 
 
-def block_reason(content, message_type, conversation, system_partner) -> Optional[str]:
-    """Why this send must be dropped, or None to let it through."""
+def _send():
+    return {'action': 'send', 'reason': None, 'forward_to': None}
+
+
+def _block(reason: str, detail: Optional[str] = None):
+    return {'action': 'block', 'reason': reason, 'forward_to': None, 'detail': detail}
+
+
+def decide(content, message_type, conversation, system_partner, *,
+           reply_to_id=None, reply_to_message_id=None) -> dict:
+    """What to do with this send.
+
+    Returns ``{'action', 'reason', 'forward_to'}`` (plus an informational
+    ``'detail'`` on some blocks):
+
+    * ``send``    — deliver as written.
+    * ``block``   — drop; ``reason`` names the rule.
+    * ``forward`` — an unquoted agent text that deserves delivery: send it as a
+      quoted reply on ``forward_to`` (the newest inbound chat Message);
+      ``reason`` is ``'unquoted_agent_text'``.
+
+    The quoted-reply markers (rule C) are recorded HERE for send/forward — not
+    in the wrapper — so the sandbox evaluation, which calls decide() without
+    sending, sees exactly the production behaviour.
+    """
     if in_system_send():
-        return None
+        return _send()
     if message_type != 'text':
-        return None
+        return _send()
     if not getattr(system_partner, 'ai_agent', False):
-        return None
+        return _send()
     text = _text_of(content)
     if not text or not text.strip():
-        return None
+        return _send()
     conv_id = getattr(conversation, 'id', None)
 
+    # ── Content rules: what the text IS, whoever it quotes ──────────────────
     if is_system_template_impersonation(text):
-        return 'system_template'
+        return _block('system_template')
     if conv_id and reply_already_delivered(conv_id) and is_redundant_after_tool_reply(text):
-        return 'reply_already_delivered'
+        return _block('reply_already_delivered')
     if is_non_message(text):
-        return 'non_message'
+        return _block('non_message')
     if is_non_arabic(text):
-        return 'non_arabic'
+        return _block('non_arabic')
     if is_internal_note(text):
-        return 'internal_note'
+        return _block('internal_note')
     if conv_id and is_echo_with_note(text, conv_id):
-        return 'echo_with_note'
+        return _block('echo_with_note')
     if is_self_narration(text):
-        return 'self_narration'
+        return _block('self_narration')
     if conv_id and _is_duplicate_send(conv_id, text):
-        return 'duplicate'
-    if conv_id and _is_duplicate_question(conv_id, text):
-        return 'duplicate_question'
-    # This agent text is going out: remember it so a restated question in the
-    # same turn is caught (recorded here, not in the wrapper, so the sandbox
-    # evaluation — which calls block_reason directly — sees the same behaviour).
-    if conv_id:
-        _note_agent_text(conv_id, text)
-    return None
+        return _block('duplicate')
+
+    # ── Rule C: a quoted reply — one per quoted inbound per turn ────────────
+    quoted_id = _quoted_id_of(reply_to_id, reply_to_message_id)
+    if quoted_id:
+        if conv_id and _already_quoted(conv_id, quoted_id):
+            return _block('duplicate_question')
+        if conv_id:
+            _note_quoted_reply(conv_id, quoted_id)
+        return _send()
+
+    # ── Rules A/B: unquoted agent text is never delivered as written ────────
+    if not conv_id:
+        return _block('unquoted_agent_text', 'no_conversation')
+    inbound = _newest_inbound(conv_id)
+    if inbound is None:
+        return _block('unquoted_agent_text', 'no_inbound')
+    if _is_transaction_message(_text_of(getattr(inbound, 'content', None))):
+        return _block('unquoted_agent_text', 'transaction_turn')
+    if reply_already_delivered(conv_id):
+        # A tool (balance, statement, static reply, quoted question) already
+        # answered this inbound; a trailing courtesy line («حاضر يا فندم 👋»)
+        # is filler, never the reply — sandbox 2026-09-05, scenario K1.
+        return _block('unquoted_agent_text', 'tool_replied')
+    if _quoted_reply_since(conv_id, inbound):
+        return _block('unquoted_agent_text', 'already_replied')
+    _note_quoted_reply(conv_id, str(inbound.id))
+    return {'action': 'forward', 'reason': 'unquoted_agent_text', 'forward_to': inbound}
+
+
+def block_reason(content, message_type, conversation, system_partner, *,
+                 reply_to_id=None, reply_to_message_id=None) -> Optional[str]:
+    """Compatibility view of decide(): the reason when it says block, else None.
+
+    A ``forward`` decision returns None — callers written against the old gate
+    treat that as "let it through", which is what forwarding is from their
+    point of view. New callers use decide() and act on ``forward_to``.
+    """
+    verdict = decide(content, message_type, conversation, system_partner,
+                     reply_to_id=reply_to_id, reply_to_message_id=reply_to_message_id)
+    return verdict['reason'] if verdict['action'] == 'block' else None
 
 
 def install() -> bool:
@@ -460,15 +633,22 @@ def install() -> bool:
     @wraps(original)
     def guarded(self, partner, content, *, message_type='text', conversation=None,
                 system_partner=None, **kwargs):
-        reason = None
+        verdict = _send()
         try:
-            reason = block_reason(content, message_type, conversation, system_partner)
+            verdict = decide(content, message_type, conversation, system_partner,
+                             reply_to_id=kwargs.get('reply_to_id'),
+                             reply_to_message_id=kwargs.get('reply_to_message_id'))
         except Exception:
             logger.exception('ai_guard: gate error — sending anyway')
-        if reason:
+        conv_id = getattr(conversation, 'id', None)
+        action = verdict.get('action')
+
+        if action == 'block':
+            reason = verdict.get('reason') or 'blocked'
             preview = (_text_of(content) or '')[:120].replace('\n', ' ⏎ ')
-            conv_id = getattr(conversation, 'id', None)
-            logger.warning('ai_guard: BLOCKED (%s) conv=%s text=%r', reason, conv_id, preview)
+            logger.warning('ai_guard: BLOCKED (%s%s) conv=%s text=%r', reason,
+                           f'/{verdict["detail"]}' if verdict.get('detail') else '',
+                           conv_id, preview)
             return {
                 'success': False,
                 'blocked': True,
@@ -477,6 +657,27 @@ def install() -> bool:
                 'chat_message_id': None,
                 'conversation_id': str(conv_id) if conv_id else None,
             }
+
+        if action == 'forward':
+            inbound = verdict.get('forward_to')
+            social_id = getattr(inbound, 'social_id', None)
+            preview = (_text_of(content) or '')[:120].replace('\n', ' ⏎ ')
+            if inbound is not None and social_id:
+                kwargs['reply_to_message_id'] = social_id
+                kwargs['reply_to_id'] = str(inbound.id)
+                logger.warning('ai_guard: FORWARDED as quote conv=%s on=%s text=%r',
+                               conv_id, inbound.id, preview)
+            else:
+                # The inbound has no WhatsApp id (nothing to quote on the wire):
+                # deliver it plain rather than leave the courtesy turn silent.
+                logger.warning('ai_guard: FORWARDED plain (inbound %s has no social_id) conv=%s text=%r',
+                               getattr(inbound, 'id', None), conv_id, preview)
+            result = original(self, partner, content, message_type=message_type,
+                              conversation=conversation, system_partner=system_partner, **kwargs)
+            if conversation is not None and not (isinstance(result, dict) and result.get('success') is False):
+                mark_reply_delivered(conversation)
+            return result
+
         return original(self, partner, content, message_type=message_type,
                         conversation=conversation, system_partner=system_partner, **kwargs)
 

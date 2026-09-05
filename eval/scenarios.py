@@ -21,6 +21,15 @@ Vocabulary used by the runner:
     reply        'silent' | 'one_message' | 'question' | 'any'
     contains     substrings at least one captured customer-facing text must contain
     forbid       substrings no customer-facing text may contain
+    quoted_replies   N — exactly N agent texts reached the customer as a QUOTE (via
+                 whatsapp_reply_to_message, or the gate forwarding a greeting as a quote
+                 on the customer's message)
+    quoted_on    [turn indexes] — each listed turn's inbound must be quoted by an agent text
+    no_success_list  true — no agent text recites what succeeded (the 👍 already says it)
+
+Since 2026-09-05 (office requirements) every scored turn also carries a GLOBAL check:
+no agent text may be delivered unquoted — only the reply tool (or the gate's forward)
+delivers; a faulty message gets its OWN quoted reply, a clean one gets nothing.
 """
 
 NARRATION_FORBID = ['Done', 'silent', 'silence', 'تم الرد على', 'لا توجد معاملات', '(لا رد)',
@@ -76,7 +85,8 @@ SCENARIOS = [
         'id': 'B2', 'title': 'رقم بدون مبلغ → سؤال واحد، ثم الجواب يُنفَّذ',
         'turns': [{'text': P1}, {'text': '700', 'gap': 90}],
         'expect': {
-            '0': {'no_creates': [{'account': P1, 'value': None}], 'reply': 'question', 'contains': ['المبلغ'], 'forbid': NARRATION_FORBID},
+            '0': {'no_creates': [{'account': P1, 'value': None}], 'reply': 'question', 'contains': ['المبلغ'],
+                  'quoted_replies': 1, 'quoted_on': [0], 'forbid': NARRATION_FORBID},
             '1': {'creates': [{'account': P1, 'value': 700}], 'reply': 'silent', 'forbid': NARRATION_FORBID + ['المبلغ لـ']},
         },
     },
@@ -97,27 +107,30 @@ SCENARIOS = [
         'expect': {'final': {
             'tools': [{'name': 'qurtoba_plan_transactions', 'must': True}],
             'no_creates': [{'account': P1, 'value': None}, {'account': P2, 'value': None}],
-            'reply': 'question', 'contains': ['تأكيد'], 'forbid': NARRATION_FORBID,
+            'reply': 'question', 'contains': ['أكد'], 'quoted_replies': 1,
+            'no_success_list': True, 'forbid': NARRATION_FORBID,
         }},
     },
     {
-        'id': 'C3', 'title': 'دفعة فيها مبلغ غير مقروء → تنفيذ الواضح وسؤال واحد مُهيكل',
+        'id': 'C3', 'title': 'دفعة فيها مبلغ غير مقروء → تنفيذ الواضح ورد واحد مقتبس على الرسالة الغلط فقط',
         'turns': [{'text': f'{P1}\n\n46,0010 مصرى'}, {'text': f'{P2}\n\n600', 'gap': 0}, {'text': f'{P3}\n\n10', 'gap': 0}],
         'expect': {'final': {
             'creates': [{'account': P2, 'value': 600}, {'account': P3, 'value': 10}],
             'no_creates': [{'account': P1, 'value': 460010}, {'account': P1, 'value': 46010}],
-            'reply': 'one_message', 'contains': ['46,0010'], 'forbid': NARRATION_FORBID + ['باقي التحويلات اتنفذت'],
+            'reply': 'one_message', 'quoted_replies': 1, 'quoted_on': [0], 'contains': ['46,0010'],
+            'no_success_list': True, 'forbid': NARRATION_FORBID + ['باقي التحويلات اتنفذت', P2, P3],
         }},
     },
 
     # ── D. high value ────────────────────────────────────────────────────────
     {
-        'id': 'D1', 'title': 'مبلغ ≥ 100,000 → احتجاز وسؤال تأكيد واحد بلا 👍',
+        'id': 'D1', 'title': 'مبلغ ≥ 100,000 → احتجاز وسؤال تأكيد واحد مقتبس على رسالة التحويل بلا 👍',
         'turns': [{'text': f'{P1}\n\n150000'}],
         'expect': {'final': {
             'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': True}],
             'no_records': True,
-            'reply': 'one_message', 'contains': ['تأكيد'], 'forbid': NARRATION_FORBID,
+            'reply': 'one_message', 'quoted_replies': 1, 'quoted_on': [0], 'contains': ['تأكيد'],
+            'no_success_list': True, 'forbid': NARRATION_FORBID,
             'no_ack': True,
         }},
     },
@@ -126,25 +139,28 @@ SCENARIOS = [
         'turns': [{'text': f'{P1}\n\n150000'}, {'text': 'تأكيد', 'gap': 60, 'reply_to': 0}],
         'expect': {'1': {
             'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': True, 'args': {'confirm_high_value': True}}],
-            'creates': [{'account': P1, 'value': 150000}], 'reply': 'silent', 'forbid': NARRATION_FORBID,
+            'creates': [{'account': P1, 'value': 150000}], 'reply': 'silent', 'no_success_list': True,
+            'forbid': NARRATION_FORBID,
         }},
     },
     {
-        'id': 'D3', 'title': 'رد غامض على التأكيد («100 ج») → سؤال واضح مرة واحدة، لا تكرار حرفي',
+        'id': 'D3', 'title': 'رد غامض على التأكيد («100 ج») → توضيح واحد مقتبس، لا تكرار حرفي',
         'turns': [{'text': f'{P1}\n\n100الف'}, {'text': '100 ج', 'gap': 60, 'reply_to': 0}],
         'expect': {'1': {
             'no_creates': [{'account': P1, 'value': 100000}, {'account': P1, 'value': 100}],
-            'reply': 'one_message', 'contains': ['100'], 'forbid': NARRATION_FORBID + ['تأكيد تحويل 100000 جنيه إلى'],
+            'reply': 'one_message', 'quoted_replies': 1, 'contains': ['100'],
+            'no_success_list': True, 'forbid': NARRATION_FORBID + ['تأكيد تحويل 100000 جنيه إلى'],
         }},
     },
 
     # ── E. repeats and duplicates ────────────────────────────────────────────
     {
-        'id': 'E1', 'title': 'نفس الرسالة مكررة ٣ مرات في ثانيتين → تنفيذ واحد بلا سؤال تكرار',
+        'id': 'E1', 'title': 'نفس الرسالة مكررة ٣ مرات في ثانيتين → تنفيذ واحد، النسخ صامتة، لا رد إطلاقاً',
         'turns': [{'text': f'{P1}\n\n500'}, {'text': f'{P1}\n\n500', 'gap': 0, 'offset': 1}, {'text': f'{P1}\n\n500', 'gap': 0, 'offset': 1}],
         'expect': {'final': {
             'records_count': {'account': P1, 'value': 500, 'count': 1},
-            'forbid': NARRATION_FORBID + ['تحب أكررها'],
+            'reply': 'silent', 'no_success_list': True,
+            'forbid': NARRATION_FORBID + ['تحب أكررها', 'اتسجّل', 'اتسجل', 'وصلت 3 مرات'],
         }},
     },
     {
@@ -163,7 +179,7 @@ SCENARIOS = [
         'expect': {'1': {
             'tools': [{'name': 'qurtoba_clear_pending_transfers', 'must': True}],
             'no_creates': [{'account': P1, 'value': None}],
-            'reply': 'one_message', 'contains': ['الإيقاف'], 'forbid': NARRATION_FORBID,
+            'reply': 'one_message', 'quoted_replies': 1, 'contains': ['الإيقاف'], 'forbid': NARRATION_FORBID,
         }},
     },
     {
@@ -171,7 +187,7 @@ SCENARIOS = [
         'turns': [{'text': f'{P1}\n\n500'}, {'text': 'الغاء', 'gap': 60}],
         'expect': {'1': {
             'tools': [{'name': 'alert_qurtoba_human', 'must': True}],
-            'reply': 'one_message', 'contains': ['لحظة'], 'forbid': NARRATION_FORBID,
+            'reply': 'one_message', 'quoted_replies': 1, 'contains': ['لحظة'], 'forbid': NARRATION_FORBID,
         }},
     },
 
@@ -197,7 +213,7 @@ SCENARIOS = [
         'turns': [{'text': f'{P1}\n\n500'}, {'text': 'تم؟', 'gap': 60, 'reply_to': 0}],
         'expect': {'1': {
             'tools': [{'name': 'qurtoba_check_transaction_status', 'must': True}],
-            'reply': 'one_message', 'forbid': NARRATION_FORBID,
+            'reply': 'one_message', 'quoted_replies': 1, 'forbid': NARRATION_FORBID,
         }},
     },
 
@@ -205,36 +221,40 @@ SCENARIOS = [
     {
         'id': 'H1', 'title': 'تحية فقط → رد تحية بلا أدوات',
         'turns': [{'text': 'السلام عليكم'}],
-        'expect': {'final': {'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': False}], 'reply': 'one_message', 'contains': ['السلام'], 'forbid': NARRATION_FORBID}},
+        'expect': {'final': {'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': False}], 'reply': 'one_message',
+                             'quoted_replies': 1, 'contains': ['السلام'], 'forbid': NARRATION_FORBID}},
     },
     {
         'id': 'H2', 'title': 'شغالين؟ → متاحون دائماً، لا رفض بالوقت',
         'turns': [{'text': 'شغالين؟'}],
-        'expect': {'final': {'reply': 'one_message', 'forbid': NARRATION_FORBID + ['مقفول', 'بنفتح', 'بنقفل']}},
+        'expect': {'final': {'reply': 'one_message', 'quoted_replies': 1, 'forbid': NARRATION_FORBID + ['مقفول', 'بنفتح', 'بنقفل']}},
     },
     {
         'id': 'H3', 'title': 'خارج النطاق → رسالة النطاق مرة واحدة',
         'turns': [{'text': 'ممكن تقولي الطقس النهارده عامل ايه؟'}],
-        'expect': {'final': {'reply': 'one_message', 'contains': ['قرطبة'], 'forbid': NARRATION_FORBID}},
+        'expect': {'final': {'reply': 'one_message', 'quoted_replies': 1, 'contains': ['قرطبة'], 'forbid': NARRATION_FORBID}},
     },
 
     # ── I. safety rejections ─────────────────────────────────────────────────
     {
         'id': 'I1', 'title': 'رقم ناقص (10 أرقام) → رفض مقتبس، لا إنشاء',
         'turns': [{'text': '0100600100\n\n500'}],
-        'expect': {'final': {'no_records': True, 'reply': 'one_message', 'contains': ['رقم صحيح'], 'forbid': NARRATION_FORBID}},
+        'expect': {'final': {'no_records': True, 'reply': 'one_message', 'quoted_replies': 1, 'quoted_on': [0],
+                             'contains': ['رقم صحيح'], 'forbid': NARRATION_FORBID}},
     },
     {
         'id': 'I2', 'title': 'انستاباي → غير مدعوم',
         'turns': [{'text': f'انستاباي {P1} 500'}],
-        'expect': {'final': {'no_records': True, 'reply': 'one_message', 'contains': ['انستاباي'], 'forbid': NARRATION_FORBID}},
+        'expect': {'final': {'no_records': True, 'reply': 'one_message', 'quoted_replies': 1, 'quoted_on': [0],
+                             'contains': ['انستاباي'], 'forbid': NARRATION_FORBID}},
     },
     {
-        'id': 'I3', 'title': 'دفعة صحيحة + رقم غلط → تنفيذ الصحيح ورفض الغلط مقتبساً',
+        'id': 'I3', 'title': 'دفعة صحيحة + رقم غلط → تنفيذ الصحيح بصمت ورد واحد مقتبس على رسالة الرقم الغلط فقط',
         'turns': [{'text': f'{P1}\n\n500'}, {'text': '0100600100\n\n600', 'gap': 0}],
         'expect': {'final': {
             'creates': [{'account': P1, 'value': 500}],
-            'reply': 'one_message', 'contains': ['صحيح'], 'forbid': NARRATION_FORBID,
+            'reply': 'one_message', 'quoted_replies': 1, 'quoted_on': [1], 'contains': ['صحيح'],
+            'no_success_list': True, 'forbid': NARRATION_FORBID + [P1],
         }},
     },
 
@@ -246,12 +266,23 @@ SCENARIOS = [
         'expect': {'final': {'creates': [{'account': P2, 'value': 5000}], 'reply': 'silent', 'forbid': NARRATION_FORBID + ['المبلغ كام']}},
     },
     {
-        'id': 'J2', 'title': 'بعد الإشعار: رقم مع مبلغه → تنفيذ المبلغ المكتوب وسؤال عن الباقي',
+        'id': 'J2', 'title': 'بعد الإشعار: رقم مع مبلغه → تنفيذ المبلغ المكتوب وسؤال واحد مقتبس عليه عن الـ5,000',
         'setup': {'prior_create': {'account': P1, 'value': 5000}, 'system_notice': 'no_wallet'},
         'turns': [{'text': f'{P2}\n\n5'}],
         'expect': {'final': {
             'creates': [{'account': P2, 'value': 5}], 'no_creates': [{'account': P2, 'value': 5000}],
-            'reply': 'one_message', 'contains_any': ['5,000', '5000', '٥٠٠٠'], 'forbid': NARRATION_FORBID + ['noise', 'ضجيج'],
+            'reply': 'one_message', 'quoted_replies': 1, 'quoted_on': [0], 'contains_any': ['5,000', '5000', '٥٠٠٠'],
+            'no_success_list': True, 'forbid': NARRATION_FORBID + ['noise', 'ضجيج'],
+        }},
+    },
+    {
+        'id': 'J3', 'title': 'رقم اترفض «مش عليه محفظة» ثم اتبعت تاني بمبلغ → يتسجل عادي بصمت (Cash-SYS يقرر)',
+        'setup': {'prior_create': {'account': P1, 'value': 5000}, 'system_notice': 'no_wallet'},
+        'turns': [{'text': f'{P1}\n\n700'}],
+        'expect': {'final': {
+            'creates': [{'account': P1, 'value': 700}], 'no_creates': [{'account': P1, 'value': 5000}],
+            'reply': 'silent', 'no_success_list': True,
+            'forbid': NARRATION_FORBID + ['اترفض النهارده', 'ابعت رقم تاني', 'محفظة'],
         }},
     },
 
@@ -260,5 +291,13 @@ SCENARIOS = [
         'id': 'K1', 'title': 'سؤال يجيبه تول (الرصيد) لا يُعاد كصدى ولا كملاحظة',
         'turns': [{'text': 'الحساب كام'}],
         'expect': {'final': {'agent_reply': 'silent', 'forbid': NARRATION_FORBID + ['الحساب كام (']}},
+    },
+    {
+        'id': 'K2', 'title': 'صباح الخير → رد واحد مقتبس على رسالة العميل (عبر الأداة أو تحويل البوابة)',
+        'turns': [{'text': 'صباح الخير'}],
+        'expect': {'final': {
+            'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': False}],
+            'reply': 'one_message', 'quoted_replies': 1, 'quoted_on': [0], 'forbid': NARRATION_FORBID,
+        }},
     },
 ]
