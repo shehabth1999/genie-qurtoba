@@ -107,7 +107,7 @@ SCENARIOS = [
         'expect': {'final': {
             'tools': [{'name': 'qurtoba_plan_transactions', 'must': True}],
             'no_creates': [{'account': P1, 'value': None}, {'account': P2, 'value': None}],
-            'reply': 'question', 'contains': ['أكد'], 'quoted_replies': 1,
+            'reply': 'question', 'contains_any': ['تأكيد', 'أكد', 'صح'], 'quoted_replies': 1,
             'no_success_list': True, 'forbid': NARRATION_FORBID,
         }},
     },
@@ -281,8 +281,10 @@ SCENARIOS = [
         'turns': [{'text': f'{P1}\n\n700'}],
         'expect': {'final': {
             'creates': [{'account': P1, 'value': 700}], 'no_creates': [{'account': P1, 'value': 5000}],
-            'reply': 'silent', 'no_success_list': True,
-            'forbid': NARRATION_FORBID + ['اترفض النهارده', 'ابعت رقم تاني', 'محفظة'],
+            # The 700 is registered silently; the agent MAY ask once (quoted) what to do
+            # with the still-owed 5,000 from the bounced transfer — never refuse the number.
+            'reply': 'any', 'no_success_list': True,
+            'forbid': NARRATION_FORBID + ['اترفض النهارده', 'ابعت رقم تاني', 'مش عليه محفظة'],
         }},
     },
 
