@@ -25,6 +25,7 @@ class QurtobaConfig(AppConfig):
             logger.exception('qurtoba: ai_inbound_catcher failed to register')
 
         self._apply_business_settings()
+        self._install_tool_db_hygiene()
         self._install_ai_guard()
         self._takeover_celery_config()
 
@@ -48,6 +49,83 @@ class QurtobaConfig(AppConfig):
             dj_settings.AI_HIGH_VALUE_CONFIRM_THRESHOLD = 100_000
         except Exception:
             logger.exception('qurtoba: could not apply AI_HIGH_VALUE_CONFIRM_THRESHOLD')
+
+    @staticmethod
+    def _install_tool_db_hygiene():
+        """Close the worker thread's DB connections after every AI tool call.
+
+        The engine runs each tool in a pool thread (``sync_to_async(...,
+        thread_sensitive=False)``). Django connections are thread-local and the
+        core hook that closes stale connections runs only in the task's main
+        thread, so every pool thread keeps an idle connection open for the
+        life of the process. On 2026-09-05 a 32-scenario evaluation piled those
+        up to the role's limit of 40 and every later tool call failed with
+        «FATAL: too many connections for role "qurtoba"» — the model then
+        narrated successes that never happened (the outbound gate dropped
+        them). The same build-up can happen in the Celery worker on a busy day.
+
+        The fix wraps ``tool_info.func`` at adaptation time: after the tool
+        returns (or raises) in a non-main thread, that thread's connections are
+        closed. Sync/async-ness is preserved because the adapter reads it from
+        the (wrapped) function. Idempotent; never blocks startup.
+        """
+        try:
+            import asyncio
+            import threading
+            from functools import wraps
+
+            from django.db import connections
+            from modules.aistudio.tools.langchain_adapter import ToolAdapter
+
+            original = ToolAdapter.__dict__['adapt_tool_for_langchain']
+            original_fn = original.__func__ if isinstance(original, staticmethod) else original
+            if getattr(original_fn, '_qurtoba_db_hygiene', False):
+                return
+
+            def _close_thread_connections():
+                if threading.current_thread() is threading.main_thread():
+                    return
+                try:
+                    connections.close_all()
+                except Exception:
+                    pass
+
+            def _wrap(func):
+                if getattr(func, '_qurtoba_db_hygiene', False):
+                    return func
+                if asyncio.iscoroutinefunction(func):
+                    @wraps(func)
+                    async def wrapped_async(*args, **kwargs):
+                        try:
+                            return await func(*args, **kwargs)
+                        finally:
+                            _close_thread_connections()
+                    wrapped_async._qurtoba_db_hygiene = True
+                    return wrapped_async
+
+                @wraps(func)
+                def wrapped_sync(*args, **kwargs):
+                    try:
+                        return func(*args, **kwargs)
+                    finally:
+                        _close_thread_connections()
+                wrapped_sync._qurtoba_db_hygiene = True
+                return wrapped_sync
+
+            def adapt_with_hygiene(tool_info, context_objects):
+                try:
+                    if getattr(tool_info, 'func', None) is not None:
+                        tool_info.func = _wrap(tool_info.func)
+                except Exception:
+                    logger.exception('qurtoba: could not wrap tool %s for DB hygiene',
+                                     getattr(tool_info, 'name', '?'))
+                return original_fn(tool_info, context_objects)
+
+            adapt_with_hygiene._qurtoba_db_hygiene = True
+            ToolAdapter.adapt_tool_for_langchain = staticmethod(adapt_with_hygiene)
+            logger.info('qurtoba: tool DB-connection hygiene installed on ToolAdapter')
+        except Exception:
+            logger.exception('qurtoba: tool DB hygiene NOT installed')
 
     @staticmethod
     def _install_ai_guard():
