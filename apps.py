@@ -27,6 +27,11 @@ class QurtobaConfig(AppConfig):
         self._apply_business_settings()
         self._install_tool_db_hygiene()
         self._install_ai_guard()
+        try:
+            from qurtoba.services.notice_templates import install_context_hook
+            install_context_hook()   # template sends can quote the customer's message
+        except Exception:
+            logger.exception('qurtoba: template quote hook NOT installed')
         self._takeover_celery_config()
 
         # Kick off a catalog pull on first startup so the tables are never empty.
