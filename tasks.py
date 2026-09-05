@@ -614,21 +614,7 @@ def _send_done_receipts(record):
         for brief in pending:
             attachment, url = _build_and_save_receipt_for_txn(record, brief)
             try:
-                from qurtoba.services.notice_templates import (
-                    REENGAGEMENT_ERROR_CODES, send_notice, template_for, use_template_now,
-                    fallback_allowed,
-                )
-                _receipt_params = {
-                    'amount': f"{float(brief.get('value') or 0):,.0f}",
-                    'fee': str(brief.get('fee') or 0),
-                    'account': str(brief.get('transfer_to') or record.account_number or '-'),
-                    'sim': str(brief.get('sim_number') or '-'),
-                }
-                _tpl = template_for('receipt', getattr(ctx['conv'], 'social_account', None))
-                if url and _tpl is not None and use_template_now(ctx['conv']):
-                    # outside the 24 h window: the receipt goes as the image-header template
-                    result = send_notice('receipt', ctx, _receipt_params, header_url=url)
-                elif url:
+                if url:
                     result = ctx['svc'].send_and_broadcast(
                         partner=ctx['conv'].social_partner,
                         content={'url': url, 'filename': attachment.name},
@@ -639,9 +625,6 @@ def _send_done_receipts(record):
                         reply_to_id=ctx['reply_local_id'],
                         websocket=True,
                     )
-                    if (not (result or {}).get('success') and (result or {}).get('error_code') in REENGAGEMENT_ERROR_CODES
-                            and _tpl is not None and fallback_allowed()):
-                        result = send_notice('receipt', ctx, _receipt_params, header_url=url)
                 else:
                     result = ctx['svc'].send_and_broadcast(
                         partner=ctx['conv'].social_partner,

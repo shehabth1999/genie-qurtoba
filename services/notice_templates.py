@@ -10,7 +10,7 @@ kinds the same inside the window, so this is purely a delivery guarantee.
 
 Kinds (one template each, account-scoped, Arabic ar_EG):
 
-    receipt          — IMAGE header (the rendered receipt) + amount/fee/number/SIM
+    (the receipt image is NOT templated — it always goes as a direct image send)
     service_fee      — «تم اضافه {fee} جنيه مصاريف خدمه …»
     reroute_partial  — part sent, remainder needs another number
     reroute_full     — nothing sent, number over its limit
@@ -49,20 +49,6 @@ REENGAGEMENT_ERROR_CODES = {131047}   # "Re-engagement message" — outside the 
 # Meta rules baked into the wording: no leading/trailing whitespace, a body never
 # starts or ends with a variable, variable names lowercase/underscore ≤ 20 chars.
 NOTICE_TEMPLATES: Dict[str, Dict[str, Any]] = {
-    'receipt': {
-        'name': 'qurtoba_receipt',
-        'header_format': 'IMAGE',
-        'body': (
-            '✅ تم تنفيذ التحويل بنجاح\n'
-            'المبلغ: {{amount}} جنيه\n'
-            'الرسوم: {{fee}} جنيه\n'
-            'رقم الحساب: {{account}}\n'
-            'شريحة التنفيذ: {{sim}}\n'
-            'العملية اتسجلت على حسابك.'
-        ),
-        'params': ['amount', 'fee', 'account', 'sim'],
-        'examples': ['1,000', '1', '01012345678', '01061265618'],
-    },
     'service_fee': {
         'name': 'qurtoba_service_fee',
         'header_format': 'NONE',
@@ -133,19 +119,12 @@ def _language():
             or Language.objects.filter(code='ar').first())
 
 
-def latest_receipt_attachment():
-    """A real rendered receipt to use as Meta's header example for the image template."""
-    from modules.base.models.attachment import Attachment
-    return Attachment.objects.filter(name__startswith='qurtoba_receipt_').order_by('-id').first()
-
-
 def ensure_templates(account, receipt_attachment=None) -> List[Any]:
     """Create or refresh the six templates as DRAFT rows (nothing sent to Meta)."""
     from modules.whatsapp.models import WhatsAppTemplate
     language = _language()
     if language is None:
         raise RuntimeError('No Arabic language row (ar_EG / ar) found')
-    receipt_attachment = receipt_attachment or latest_receipt_attachment()
     rows = []
     for kind, spec in NOTICE_TEMPLATES.items():
         tpl = WhatsAppTemplate.objects.filter(
@@ -164,9 +143,7 @@ def ensure_templates(account, receipt_attachment=None) -> List[Any]:
         # component is emitted for any other format — Meta rejects NONE)
         tpl.header_format = spec['header_format'] if spec['header_format'] != 'NONE' else 'TEXT'
         tpl.header_content = ''
-        if spec['header_format'] == 'IMAGE':
-            if receipt_attachment is None:
-                raise RuntimeError('receipt template needs an example image (no qurtoba_receipt_* attachment found)')
+        if spec['header_format'] == 'IMAGE' and receipt_attachment is not None:
             tpl.header_media = receipt_attachment
         tpl.body_text = spec['body']
         tpl.footer_text = FOOTER
