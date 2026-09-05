@@ -50,7 +50,7 @@ REENGAGEMENT_ERROR_CODES = {131047}   # "Re-engagement message" — outside the 
 # starts or ends with a variable, variable names lowercase/underscore ≤ 20 chars.
 NOTICE_TEMPLATES: Dict[str, Dict[str, Any]] = {
     'service_fee': {
-        'name': 'qurtoba_service_fee',
+        'name': 'qurtoba_service_fee_v2',
         'header_format': 'NONE',
         'body': (
             'تم اضافه {{fee}} جنيه مصاريف خدمه\n'
@@ -60,7 +60,7 @@ NOTICE_TEMPLATES: Dict[str, Dict[str, Any]] = {
         'examples': ['30'],
     },
     'reroute_partial': {
-        'name': 'qurtoba_reroute_partial',
+        'name': 'qurtoba_reroute_partial_v2',
         'header_format': 'NONE',
         'body': (
             '*تم تحويل ( {{sent}} ) و الباقى ( {{remaining}} )*\n'
@@ -73,7 +73,7 @@ NOTICE_TEMPLATES: Dict[str, Dict[str, Any]] = {
         'examples': ['6,000', '4,000'],
     },
     'reroute_full': {
-        'name': 'qurtoba_reroute_full',
+        'name': 'qurtoba_reroute_full_v2',
         'header_format': 'NONE',
         'body': (
             '*محتاجين رقم تانى نبعت عليه الرصيد*\n'
@@ -85,7 +85,7 @@ NOTICE_TEMPLATES: Dict[str, Dict[str, Any]] = {
         'examples': [],
     },
     'cancel_no_wallet': {
-        'name': 'qurtoba_cancel_no_wallet',
+        'name': 'qurtoba_cancel_no_wallet_v2',
         'header_format': 'NONE',
         'body': (
             '*محتاجين رقم تانى نبعت عليه الرصيد*\n'
@@ -96,7 +96,7 @@ NOTICE_TEMPLATES: Dict[str, Dict[str, Any]] = {
         'examples': [],
     },
     'cancel_request': {
-        'name': 'qurtoba_cancel_request',
+        'name': 'qurtoba_cancel_request_v2',
         'header_format': 'NONE',
         'body': (
             'تم الغاء التحويل\n'
@@ -108,7 +108,6 @@ NOTICE_TEMPLATES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-FOOTER = 'مكتب قرطبة'
 
 
 # ── creation / submission ────────────────────────────────────────────────────
@@ -146,7 +145,7 @@ def ensure_templates(account, receipt_attachment=None) -> List[Any]:
         if spec['header_format'] == 'IMAGE' and receipt_attachment is not None:
             tpl.header_media = receipt_attachment
         tpl.body_text = spec['body']
-        tpl.footer_text = FOOTER
+        tpl.footer_text = ''      # no footer, office request 2026-09-05
         tpl.content_type = None       # parameters are filled explicitly at send time
         tpl.save()                    # pre_save extracts body_text_numbered_mapping
         tpl.refresh_from_db()
