@@ -738,12 +738,16 @@ def _send_reroute_ask(record, fulfilled, reroute_amount):
             "( تجاوز الحد اليومى او الشهرى )"
         )
     try:
-        from qurtoba.services.notice_templates import send_text_or_template
-        if fulfilled and float(fulfilled) > 0:
-            kind, params = 'reroute_partial', {'sent': f"{float(fulfilled):,.0f}", 'remaining': remainder_txt}
-        else:
-            kind, params = 'reroute_full', {}
-        send_text_or_template(kind, ctx, text, params)
+        ctx['svc'].send_and_broadcast(
+            partner=ctx['conv'].social_partner,
+            content={'text': text},
+            message_type='text',
+            conversation=ctx['conv'],
+            system_partner=ctx['system_partner'],
+            reply_to_message_id=ctx['reply_wamid'],
+            reply_to_id=ctx['reply_local_id'],
+            websocket=True,
+        )
         logger.info('[CashSys Notify] reroute ask sent record=%d fulfilled=%s remainder=%s',
                     record.pk, fulfilled, reroute_amount)
     except Exception as exc:
@@ -771,10 +775,16 @@ def _send_cancel_notice(record, reason):
     if not ctx:
         return
     try:
-        from qurtoba.services.notice_templates import send_text_or_template
-        # free-form inside the 24 h window; the approved utility template outside it
-        send_text_or_template('cancel_no_wallet' if reason == 'no_wallet' else 'cancel_request',
-                              ctx, text, {})
+        ctx['svc'].send_and_broadcast(
+            partner=ctx['conv'].social_partner,
+            content={'text': text},
+            message_type='text',
+            conversation=ctx['conv'],
+            system_partner=ctx['system_partner'],
+            reply_to_message_id=ctx['reply_wamid'],
+            reply_to_id=ctx['reply_local_id'],
+            websocket=True,
+        )
         logger.info('[CashSys Notify] cancel notice sent record=%d reason=%s', record.pk, reason)
     except Exception as exc:
         logger.exception('[CashSys Notify] cancel notice failed record=%d: %s', record.pk, exc)
@@ -931,9 +941,14 @@ def _create_service_fees(record):
         if ctx:
             try:
                 # Service-fee note is a standalone message — NOT a quoted reply.
-                from qurtoba.services.notice_templates import send_text_or_template
-                send_text_or_template('service_fee', ctx, SERVICE_FEE_MESSAGE.format(x=fee),
-                                      {'fee': str(fee)}, reply=False)
+                ctx['svc'].send_and_broadcast(
+                    partner=ctx['conv'].social_partner,
+                    content={'text': SERVICE_FEE_MESSAGE.format(x=fee)},
+                    message_type='text',
+                    conversation=ctx['conv'],
+                    system_partner=ctx['system_partner'],
+                    websocket=True,
+                )
             except Exception as exc:
                 logger.exception('[CashSys Fee] message failed record=%d fee=%s: %s', record.pk, fee, exc)
 
