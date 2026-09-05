@@ -80,21 +80,27 @@ def partner_day_totals(partner, day: Optional[datetime.date] = None) -> dict:
 
 
 def partners_active_on(day: Optional[datetime.date] = None):
-    """Partner ids that requested at least one transaction through Genie on `day`.
+    """Partner ids the end-of-day reminder goes to: every linked number that was
+    ACTIVE with us on `day` — it created a record through the chat (any value,
+    including a transfer that was later cancelled or zeroed) OR it sent us at
+    least one WhatsApp message that day.
 
-    This is the reminder's audience. It is deliberately narrow: only chat-born
-    records carry a `partner`, so a customer whose transactions were all keyed
-    into Qurtoba by an accountant is correctly not messaged — nobody asked us
-    for anything from a phone that day.
+    Until 2026-09-05 only numbers with a record of value > 0 qualified, so a
+    customer who chatted with us but whose transfer bounced (value 0) — or who
+    only asked for the balance — got no summary. The office reported that as
+    a bug: whoever talked to us that day gets the day's summary, even if the
+    totals read 0.
     """
+    from django.utils import timezone
+    from modules.chat.models import Message
     from qurtoba.models import QurtobaRecord
 
     if day is None:
         day = reporting_day()
 
-    return list(
+    by_record = set(
         QurtobaRecord.objects
-        .filter(partner__isnull=False, date=day, value__gt=0)
+        .filter(partner__isnull=False, date=day)
         # .order_by() clears the model's Meta ordering ('-date', '-time').
         # Without it those columns join the SELECT to satisfy ORDER BY, and
         # DISTINCT then dedupes on (partner_id, date, time) — handing back the
@@ -103,6 +109,19 @@ def partners_active_on(day: Optional[datetime.date] = None):
         .values_list('partner_id', flat=True)
         .distinct()
     )
+    tz = timezone.get_current_timezone()
+    start = datetime.datetime.combine(day, datetime.time.min, tzinfo=tz)
+    end = start + datetime.timedelta(days=1)
+    by_chat = set(
+        Message.objects_all
+        .filter(direction='inbound', created_at__gte=start, created_at__lt=end,
+                conversation__type='whatsapp',
+                conversation__social_partner__qurtoba_customer__isnull=False)
+        .order_by()
+        .values_list('conversation__social_partner_id', flat=True)
+        .distinct()
+    )
+    return sorted(pid for pid in (by_record | by_chat) if pid)
 
 
 # Arabic day and month names, spelled the way the office writes them (plain
