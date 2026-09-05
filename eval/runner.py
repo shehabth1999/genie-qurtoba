@@ -197,6 +197,18 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
         pk = (args[0] if args else None) or (kwargs.get('args') or [None])[0]
         capture.pushes.append(pk)
 
+    # Reaction rows created by the tools would enqueue a real Celery task that
+    # tries to deliver the reaction to a sandbox WhatsApp id and fails — 76
+    # failed tasks on the 3-slot production worker in one day of evaluations.
+    try:
+        from modules.whatsapp.tasks import process_handling_reaction
+        originals['react_delay'] = process_handling_reaction.delay
+        originals['react_async'] = process_handling_reaction.apply_async
+        process_handling_reaction.delay = lambda *a, **k: None
+        process_handling_reaction.apply_async = lambda *a, **k: None
+    except Exception:
+        pass
+
     WhatsAppAPIService.send_and_broadcast = fake_sab
     WhatsAppAPIService.send_text_message = fake_text
     WhatsAppAPIService.send_media_message = fake_media
@@ -216,6 +228,13 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
         Conversation.alert_human = originals['alert']
         push_record_to_qurtoba_task.delay = originals['push_delay']
         push_record_to_qurtoba_task.apply_async = originals['push_async']
+        if 'react_delay' in originals:
+            try:
+                from modules.whatsapp.tasks import process_handling_reaction
+                process_handling_reaction.delay = originals['react_delay']
+                process_handling_reaction.apply_async = originals['react_async']
+            except Exception:
+                pass
 
 
 # ── sandbox fixtures ─────────────────────────────────────────────────────────

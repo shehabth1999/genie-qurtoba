@@ -177,9 +177,11 @@ SCENARIOS = [
         'id': 'F1', 'title': 'إلغاء دفعة لم تُنشأ (رقم بلا مبلغ ثم الغاء)',
         'turns': [{'text': P1}, {'text': 'الغاء', 'gap': 60}],
         'expect': {'1': {
-            'tools': [{'name': 'qurtoba_clear_pending_transfers', 'must': True}],
+            'tools': [{'name': 'qurtoba_clear_pending_transfers', 'must': True},
+                      {'name': 'whatsapp_reply_to_message', 'must': False}],
             'no_creates': [{'account': P1, 'value': None}],
-            'reply': 'one_message', 'quoted_replies': 1, 'contains': ['الإيقاف'], 'forbid': NARRATION_FORBID,
+            # the clear tool posts «تم الإيقاف…» itself (quoted); the agent stays silent
+            'tool_texts_contain': ['الإيقاف'], 'agent_reply': 'silent', 'forbid': NARRATION_FORBID,
         }},
     },
     {
@@ -303,3 +305,22 @@ SCENARIOS = [
         }},
     },
 ]
+
+
+# ── L. latency: the real burst from conversation d8bc5e42 on 2026-09-05 14:44 ──
+SCENARIOS.append({
+    'id': 'L1', 'title': 'دفعة حقيقية: تكرار + عملية جديدة + رقم ناقص بمبلغ بالحروف (قياس الزمن)',
+    'turns': [
+        {'text': f'{P1}\n\n1000'},
+        {'text': f'{P1}\n\n1000', 'gap': 90},
+        {'text': '01006001000\n\n60', 'gap': 0, 'offset': 0},
+        {'text': '0106013464\n\nالفين جنيه', 'gap': 0, 'offset': 1},
+    ],
+    'expect': {'1': {
+        'tools': [{'name': 'qurtoba_plan_transactions', 'must': True}],
+        'creates': [{'account': '01006001000', 'value': 60}],
+        'tool_texts_contain': ['تحب أكررها'],
+        'quoted_replies': 1, 'quoted_on': [3],
+        'no_success_list': True, 'forbid': NARRATION_FORBID,
+    }},
+})

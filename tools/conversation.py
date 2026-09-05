@@ -81,6 +81,8 @@ def qurtoba_send_customer_balance_to_chat(context) -> Dict[str, Any]:
         'Marks the recent still-open inbound messages as handled — call it when the customer '
         'aborts a WHOLE not-yet-created transfer burst («الغاء/وقف/غلط» = scrap what I just '
         'sent), so the aborted numbers/amounts don\'t linger and get re-paired when they resend. '
+        'It POSTS the «تم الإيقاف…» confirmation itself (quoted on the cancel message) — after it '
+        'returns reply_fully_handled=true, output ZERO characters and call no reply tool. '
         'NOT for cancelling one op among several, nor an already-executed transfer.'
     ),
     category='qurtoba',
@@ -106,10 +108,34 @@ def qurtoba_clear_pending_transfers(context) -> Dict[str, Any]:
             ai_consumed_at__isnull=True, created_at__gte=cutoff,
         )
         cleared = 0
-        for m in rows:
+        newest = None
+        for m in rows.order_by('created_at'):
+            newest = m
             if m.mark_ai_consumed(None):
                 cleared += 1
-        return {'success': True, 'cleared': cleared}
+        # The tool posts the cancel confirmation itself, quoted on the customer's
+        # «الغاء» message, and marks the reply delivered — so the agent needs no
+        # second tool call and no final text. Every LLM round-trip costs the
+        # customer ~25 s on this prompt; on 2026-09-05 a plain «الغاء» took 100 s
+        # (clear tool → reply tool → reply tool again → final).
+        replied = False
+        try:
+            from qurtoba.tools.transactions import _send_quoted_text
+            partner = getattr(conv, 'social_partner', None)
+            if newest is not None and partner is not None:
+                replied = bool(_send_quoted_text(
+                    conv, partner, str(newest.id),
+                    'تم الإيقاف. تأكد من تفاصيل المعاملة قبل إرسالها — النظام ينفّذ بسرعة.',
+                ))
+        except Exception:
+            replied = False
+        return {
+            'success': True, 'cleared': cleared,
+            'reply_fully_handled': replied,
+            'note': ('Cancel confirmation already posted to the chat by this tool. Output ZERO '
+                     'characters.' if replied else
+                     'Could not post the confirmation — reply once, quoted on the cancel message.'),
+        }
     except Exception as e:
         return {'success': False, 'error_type': 'clear_failed', 'error': str(e)}
 
