@@ -96,14 +96,11 @@ def _react_created_on_source(conversation, source_message_id, emoji='👍') -> N
                         bridge._send_to_user(_uid, 'user_message', payload)
         except Exception:
             logger.warning('qurtoba: reaction realtime broadcast failed', exc_info=True)
-        # 3) Send the actual reaction to WhatsApp, then store its returned id.
-        resp = svc.send_reaction(phone, wamid, emoji)
-        try:
-            rid = resp.get('message_id') if isinstance(resp, dict) else None
-            if reaction is not None and rid:
-                MessageReaction.objects.filter(id=reaction.id).update(social_id=rid)
-        except Exception:
-            pass
+        # 3) Delivery to WhatsApp is done by core: saving the reaction row (post_save →
+        #    account.handle_reaction → process_handling_reaction task, which retries with a
+        #    backoff on provider errors). Sending here as well doubled every reaction — a
+        #    26-transfer burst made 52 reaction calls and tripped WhatsApp's per-user rate
+        #    limit (#131056), so half of them never arrived (2026-09-06).
     except Exception:
         logger.warning('qurtoba: source-message reaction failed', exc_info=True)
 
