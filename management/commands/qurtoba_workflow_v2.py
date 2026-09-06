@@ -97,10 +97,10 @@ def build_spec(src_nodes, tool_ids):
         'tool_description': 'Register سداد payments from a receipt image (شراء كاش / شراء فورى), or explicit payment wording («العميل دفع»).',
     }]}
     thinker['update_state'] = []
-    # the thinking half on a fast model: Haiku 4.5 (llm 21, the node's former backup), DeepSeek
-    # V4 Flash (31) kept as the backup — its 20–150 s turns were every «late reply» of 2026-09-06
-    thinker['llm_model_id'] = 21
-    thinker['backup_llm_model_id'] = 31
+    # owner decision 2026-09-06: DeepSeek V4 Flash (31) reads the customer better than Haiku on
+    # this task (Haiku asked where it should act); Haiku 4.5 (21) stays the backup for outages
+    thinker['llm_model_id'] = 31
+    thinker['backup_llm_model_id'] = 21
     thinker['max_iterations'] = 6
     thinker['max_tokens'] = 1500
     thinker['temperature'] = 0.2
