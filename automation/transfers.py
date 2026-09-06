@@ -566,17 +566,13 @@ def _python_replies_enabled() -> bool:
 
 
 def _is_noise_line(text: str) -> bool:
-    """Only what can carry no meaning at all: empty, punctuation, an emoji, or a SINGLE word
-    without digits (a first name under a number). Two words or more («حسابي كام», «عاصم كاش»)
-    go to the AI — Python does not decide what a sentence means."""
+    """Only what can carry no meaning at all: empty, punctuation, an emoji. Every word —
+    even a single one («طارق» may be a name, «الغاء» is an order) — goes to the AI; Python
+    does not decide what a message means."""
     t = ' '.join(str(text or '').split())
     if not t:
         return True
-    if L.is_question(t):
-        return False
-    if L.is_only_emoji(t) or all(ch in '.,،!…-_' for ch in t):
-        return True
-    return len(t.split()) == 1 and not any(ch.isdigit() for ch in t)
+    return L.is_only_emoji(t) or all(ch in '.,،!…-_' for ch in t)
 
 
 def render_ai_summary(summary: Dict[str, Any]) -> str:

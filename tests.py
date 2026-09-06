@@ -351,9 +351,9 @@ class HighValueAndRerouteTests(SimpleTestCase):
 class AiHandoverTests(SimpleTestCase):
 
     def test_noise_lines_do_not_wake_the_model(self):
-        for t in ('طارق', '.', '👍', ''):
+        for t in ('.', '👍', '', '...'):
             self.assertTrue(_is_noise_line(t), t)
-        for t in ('حسابي كام', 'عاصم كاش', 'ليه الرصيد زاد؟', 'ممكن تبعتلي الايصال تاني', 'الغي التحويل ده', 'تم؟'):
+        for t in ('طارق', 'الغاء', 'حسابي كام', 'عاصم كاش', 'ليه الرصيد زاد؟', 'ممكن تبعتلي الايصال تاني', 'تم؟', '؟'):
             self.assertFalse(_is_noise_line(t), t)
 
     def test_summary_block_for_the_model(self):

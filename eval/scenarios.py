@@ -389,8 +389,7 @@ SCENARIOS += [
         'turns': [{'text': 'عايز اعرف ليه الرصيد زاد كده من غير ما احول حاجه'}],
         'expect': {'final': {
             'no_records': True,
-            'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': False},
-                      {'name': 'qurtoba_plan_transactions', 'must': False}],
+            'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': False}],
             'forbid': NARRATION_FORBID,
         }},
     },
