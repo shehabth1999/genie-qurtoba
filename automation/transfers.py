@@ -466,8 +466,7 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                 summary['replies'] += 1
         elif mid and (asked_recently(conversation, mid, minutes=15) or said_recently(conversation, mid, text, minutes=360)):
             log('leftover_already_asked', conversation, mid=str(mid)[:8])   # never ask twice
-            if kind == 'planner' and text == R.BAD_NUMBER:
-                consume(conversation, [mid])       # a reported bad number is finished with
+            # a reported bad number stays unconsumed: the customer's next bare number corrects it
         else:
             leftovers.append({'message_id': mid, 'kind': kind, 'text': (_text_of(rows[mid]) if mid in rows else '')[:80],
                               'suggested_reply': text})
