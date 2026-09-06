@@ -674,7 +674,16 @@ def _is_noise_line(text: str) -> bool:
     t = ' '.join(str(text or '').split())
     if not t:
         return True
-    return L.is_only_emoji(t) or all(ch in '.,،!…-_' for ch in t)
+    if L.is_only_emoji(t) or all(ch in '.,،!…-_' for ch in t):
+        return True
+    # A FEE NOTE («اخصم مصاريف الخدمة», «لو هيخصم 15 اخصمها», «الرسوم عليا») is the customer
+    # authorising the service fee the system adds itself. Office rule (2026-09-06): fully
+    # ignored — no reply, no model, and its number is never an amount.
+    from qurtoba.tools.planning import _FEE_NOTE_RE
+    cls = _classify_message(t)
+    if _FEE_NOTE_RE.search(L.norm(t)) and not cls['phones'] and len(t.split()) <= 8:
+        return True
+    return False
 
 
 def render_ai_summary(summary: Dict[str, Any]) -> str:
