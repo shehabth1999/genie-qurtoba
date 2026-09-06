@@ -799,7 +799,19 @@ def _send_cancel_notice(record, reason):
 SERVICE_FEE_TYPE = 'مصاريف خدمه'
 SERVICE_FEE_THRESHOLD = 60000   # total transferred ≤ this → one fee (highest); above → one per transfer
 SERVICE_FEE_010_CAP = 30        # 010 (Vodafone) recipient, total ≤ threshold → summed fee capped at this
-SERVICE_FEE_MESSAGE = "تم اضافه {x} جنيه مصاريف خدمه\n( الرقم عليه محفظه اخرى غير فودافون كاش )"
+SERVICE_FEE_MESSAGE = (
+    "تم اضافه {x} جنيه مصاريف خدمه\n"
+    "ل رقم {number}\n"
+    "( الرقم عليه محفظه اخرى غير فودافون كاش )"
+)
+
+
+def _service_fee_text(fee, number) -> str:
+    """The customer-facing fee note. Names the recipient number so the customer can tell
+    which transfer the fee belongs to; the number line is dropped only when unknown."""
+    if not number:
+        return SERVICE_FEE_MESSAGE.replace("ل رقم {number}\n", "").format(x=fee)
+    return SERVICE_FEE_MESSAGE.format(x=fee, number=number)
 
 
 def _floor_fee(value):
@@ -943,7 +955,7 @@ def _create_service_fees(record):
                 # Service-fee note is a standalone message — NOT a quoted reply.
                 ctx['svc'].send_and_broadcast(
                     partner=ctx['conv'].social_partner,
-                    content={'text': SERVICE_FEE_MESSAGE.format(x=fee)},
+                    content={'text': _service_fee_text(fee, recipient)},
                     message_type='text',
                     conversation=ctx['conv'],
                     system_partner=ctx['system_partner'],
