@@ -467,3 +467,20 @@ class TallyLineTests(SimpleTestCase):
         self.assertEqual(cls['amounts'], [35343])
         cls = _classify_message('W2399\n01276956929\n39.125 مصري مصري\nفودافوان\nعامر فون 6.08')
         self.assertEqual(cls['amounts'], [39125])
+
+
+class ThrottleRetryTests(SimpleTestCase):
+
+    def test_throttled_send_is_retried_then_released(self):
+        from unittest import mock
+        from qurtoba import ai_guard
+        calls = []
+        def original(self, partner, content, message_type='text', conversation=None, system_partner=None, **kw):
+            calls.append(1)
+            return {'success': False, 'error': 'Failed: (#131056) pair rate limit'} if len(calls) < 2 else {'success': True}
+        with mock.patch.object(ai_guard.time, 'sleep', lambda s: None) if hasattr(ai_guard, 'time') else mock.patch('time.sleep', lambda s: None):
+            res = ai_guard._deliver(original, None, None, {'text': 'x'}, None, None, 'text', {})
+        self.assertTrue(res['success'])
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(ai_guard._is_throttled({'success': False, 'error': 'تعذّر إرسال الرسالة عبر المزوّد. (#131056)'}))
+        self.assertFalse(ai_guard._is_throttled({'success': False, 'error': 'invalid number'}))

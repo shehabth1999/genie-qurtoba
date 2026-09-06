@@ -171,7 +171,7 @@ def _send_quoted_text(conversation, social_partner, src_message_id, text) -> boo
 
         from qurtoba.ai_guard import mark_reply_delivered, system_send
         with system_send():
-            OmnichannelSendService().send_and_broadcast(
+            _res = OmnichannelSendService().send_and_broadcast(
                 partner=social_partner,
                 content={'text': str(text)},
                 message_type='text',
@@ -181,6 +181,9 @@ def _send_quoted_text(conversation, social_partner, src_message_id, text) -> boo
                 reply_to_id=reply_local_id,
                 websocket=True,
             )
+        if isinstance(_res, dict) and _res.get('success') is False:
+            logger.warning('qurtoba: quoted reply NOT delivered: %s', str(_res.get('error'))[:120])
+            return False
         # The tool's quoted question («تحب أكررها؟») or corrected number IS this
         # turn's reply — the prompt orders the agent to stay silent after it. Marking
         # it delivered lets the gate drop any status line the model adds anyway

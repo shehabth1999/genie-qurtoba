@@ -399,14 +399,58 @@ def _dedupe_key_text(text: str) -> str:
     return _PUNCT_RE.sub('', _normalize_for_match(text))
 
 
-def _is_duplicate_send(conversation_id, text: str) -> bool:
+def _duplicate_key(conversation_id, text: str) -> str:
     digest = hashlib.sha1(_dedupe_key_text(text).encode('utf-8')).hexdigest()[:16]
-    key = f'qurtoba:ai_sent:{conversation_id}:{digest}'
+    return f'qurtoba:ai_sent:{conversation_id}:{digest}'
+
+
+def _is_duplicate_send(conversation_id, text: str) -> bool:
     try:
         # cache.add is SETNX: False means the same text went out moments ago.
-        return not cache.add(key, 1, timeout=_DUPLICATE_WINDOW)
+        return not cache.add(_duplicate_key(conversation_id, text), 1, timeout=_DUPLICATE_WINDOW)
     except Exception:
         return False
+
+
+def _release_duplicate(conversation_id, text: str) -> None:
+    """The text did NOT reach the provider — forget it, so a retry is not read as a duplicate
+    (2026-09-06: a rate-limited «ابعت رقم صحيح» was retried at once and blocked as duplicate)."""
+    try:
+        cache.delete(_duplicate_key(conversation_id, text))
+    except Exception:
+        pass
+
+
+# WhatsApp pair rate limit (#131056: too many messages to the same user in a short time) —
+# hit after a big burst (26 👍 reactions + texts). Retry with a short backoff instead of losing
+# the line; anything else fails as before.
+_THROTTLE_MARKERS = ('131056', 'rate limit', 'rate_limit', 'too many')
+_THROTTLE_BACKOFF = (3, 6)
+
+
+def _is_throttled(result) -> bool:
+    err = str((result or {}).get('error') or '') if isinstance(result, dict) else ''
+    return any(m in err.lower() for m in _THROTTLE_MARKERS)
+
+
+def _deliver(original, self, partner, content, conversation, system_partner, message_type, kwargs):
+    """Call the real send; on provider throttling wait and retry; release the duplicate marker
+    when the text finally did not go out."""
+    import time as _time
+    result = original(self, partner, content, message_type=message_type,
+                      conversation=conversation, system_partner=system_partner, **kwargs)
+    for wait in _THROTTLE_BACKOFF:
+        if not (isinstance(result, dict) and result.get('success') is False and _is_throttled(result)):
+            break
+        logger.warning('ai_guard: provider throttled (%s) — retrying in %ss', (result.get('error') or '')[:60], wait)
+        _time.sleep(wait)
+        result = original(self, partner, content, message_type=message_type,
+                          conversation=conversation, system_partner=system_partner, **kwargs)
+    if isinstance(result, dict) and result.get('success') is False and message_type == 'text':
+        conv_id = getattr(conversation, 'id', None)
+        if conv_id:
+            _release_duplicate(conv_id, _text_of(content) or '')
+    return result
 
 
 # ── Quoted-reply bookkeeping (rules C and B) ─────────────────────────────────
@@ -688,14 +732,12 @@ def install() -> bool:
                 # deliver it plain rather than leave the courtesy turn silent.
                 logger.warning('ai_guard: FORWARDED plain (inbound %s has no social_id) conv=%s text=%r',
                                getattr(inbound, 'id', None), conv_id, preview)
-            result = original(self, partner, content, message_type=message_type,
-                              conversation=conversation, system_partner=system_partner, **kwargs)
+            result = _deliver(original, self, partner, content, conversation, system_partner, message_type, kwargs)
             if conversation is not None and not (isinstance(result, dict) and result.get('success') is False):
                 mark_reply_delivered(conversation)
             return result
 
-        return original(self, partner, content, message_type=message_type,
-                        conversation=conversation, system_partner=system_partner, **kwargs)
+        return _deliver(original, self, partner, content, conversation, system_partner, message_type, kwargs)
 
     guarded._qurtoba_ai_guard = True
     guarded._qurtoba_original = original
