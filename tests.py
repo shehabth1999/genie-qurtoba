@@ -409,3 +409,12 @@ class HighValueAndRerouteTests(SimpleTestCase):
         d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute={'amount': 5000.0}, texts={})
         self.assertEqual([(i['account_number'], i['value']) for i in d['items']], [('01098765432', 5.0)])
         self.assertEqual(d['replies'], [('n', 'والـ 5,000 بتاع التحويل اللي اترفض — يتحول على نفس الرقم ده ولا رقم تاني؟')])
+
+    def test_pair_held_by_the_high_value_question_waits_for_the_confirmation(self):
+        plan = {'success': True, 'ambiguous': [], 'ignored': [], 'orphans': [], 'answers': [], 'needs_resend': False,
+                'pairs': [{'account_number': '01012345678', 'value': 100000.0, 'source_message_id': 's', 'confidence': 'high'}]}
+        d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute=None, texts={}, hv_pending='01012345678')
+        self.assertEqual(d['items'], [])
+        plan['answers'] = [{'message_id': 'a', 'text': 'تأكيد', 'kind': 'reply', 'about_phone': '01012345678'}]
+        d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute=None, texts={}, hv_pending='01012345678')
+        self.assertTrue(d['items'][0]['confirm_high_value'])

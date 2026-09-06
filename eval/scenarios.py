@@ -343,7 +343,7 @@ SCENARIOS += [
         'id': 'V2', 'title': 'v2: تحية → رد ثابت مقتبس، بدون موديل',
         'turns': [{'text': 'السلام عليكم'}],
         'expect': {'final': {
-            'no_records': True, 'reply': 'silent', 'tool_texts_contain': ['السلام'], 'forbid': NARRATION_FORBID,
+            'no_records': True, 'reply': 'one_message', 'quoted_replies': 1, 'contains': ['السلام'], 'forbid': NARRATION_FORBID,
         }},
     },
     {
@@ -351,7 +351,7 @@ SCENARIOS += [
         'turns': [{'text': f'{P1}\n\n500'}, {'text': 'تم؟', 'gap': 60, 'reply_to': 0}],
         'expect': {'1': {
             'tools': [{'name': 'qurtoba_check_transaction_status', 'must': True}],
-            'reply': 'silent', 'forbid': NARRATION_FORBID,
+            'reply': 'one_message', 'quoted_replies': 1, 'forbid': NARRATION_FORBID,
         }},
     },
     {
@@ -378,12 +378,12 @@ SCENARIOS += [
     {
         'id': 'V7', 'title': 'v2: رقم مع اسم ملزوق برقم → سؤال موجّه بدل «المبلغ؟»',
         'turns': [{'text': f'{P1}\nعبدالله15100'}],
-        'expect': {'final': {'no_records': True, 'tool_texts_contain': ['هو 15,100'], 'reply': 'silent', 'forbid': NARRATION_FORBID}},
+        'expect': {'final': {'no_records': True, 'contains': ['هو 15,100'], 'reply': 'question', 'quoted_on': [0], 'forbid': NARRATION_FORBID}},
     },
     {
         'id': 'V8', 'title': 'v2: انستاباي → رسالة غير مدعوم، بدون إنشاء',
         'turns': [{'text': f'انستاباي {P1} 500'}],
-        'expect': {'final': {'no_records': True, 'tool_texts_contain': ['انستاباي'], 'reply': 'silent', 'forbid': NARRATION_FORBID}},
+        'expect': {'final': {'no_records': True, 'contains': ['انستاباي'], 'reply': 'one_message', 'quoted_on': [0], 'forbid': NARRATION_FORBID}},
     },
     {
         'id': 'V9', 'title': 'v2: نص حر → الموديل الصغير فقط (بدون أدوات مال)',

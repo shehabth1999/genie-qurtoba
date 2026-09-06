@@ -30,7 +30,8 @@ PENDING_TTL = 3600
 
 def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
            reroute: Optional[Dict[str, Any]], texts: Dict[str, str],
-           accounts: Optional[List[tuple]] = None, list_pending: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+           accounts: Optional[List[tuple]] = None, list_pending: Optional[Dict[str, Any]] = None,
+           hv_pending: Optional[str] = None) -> Dict[str, Any]:
     """Planner output → actions. No I/O.
 
     Returns {'items': [...create items...], 'replies': [(message_id, text)],
@@ -130,6 +131,9 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
             continue                                   # waiting for أيوة/لأ — the tool already asked
         if p.get('answer_message_id') in unclear_answers:
             continue                                   # re-valued by an unclear reply — asked instead
+        if hv_pending and phone == hv_pending and phone not in yes_phones and value is not None \
+                and float(value) >= hv_threshold:
+            continue                                   # held by the high-value question — waiting for «تأكيد»
         if reason == 'separator_ambiguous':
             raw = _last_line(texts.get(src, ''))
             replies.append((src, R.UNREADABLE_AMOUNT.format(raw=raw or value)))
@@ -152,8 +156,11 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
         replies.append((to_confirm[0].get('source_message_id'), '\n'.join(lines)))
         out['list_confirm'] = {'phones': [p['account_number'] for p in to_confirm]}
 
+    answered_mids = {a.get('message_id') for a in plan.get('answers') or []}
     for o in plan.get('orphans') or []:
         mid, kind, val = o.get('message_id'), o.get('kind'), o.get('value')
+        if mid in answered_mids:
+            continue                                   # it was an answer to our question, not a new orphan
         if kind == 'phone':
             if reroute_amount and not out['reroute_used']:
                 items.append({'type': 'كاش', 'value': reroute_amount, 'account_number': val,
@@ -425,13 +432,20 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     # for: a held repeat, a list confirmation, or a high-value hold.
     repeat_pending = _list_repeat_pending(conversation) or {}
     list_pending = cache_get(LIST_KEY.format(conv=conv_key))
-    hv_phone = _hv_question_pending(conversation)
+    hv_phone, hv_src = _hv_question_pending(conversation)
     answered_ids = {a.get('message_id') for a in plan.get('answers') or []}
     for mid in route.get('batch_ids') or []:
         m = rows.get(mid)
         if m is None or m.type != 'text' or mid in answered_ids:
             continue
         text = _text_of(m)
+        cls = _classify_message(text)
+        if hv_phone and not cls['phones'] and len(cls['amounts']) == 1 and not (L.is_yes(text) or L.is_no(text)):
+            # «100 ج» to the high-value hold (its line carries no «؟», so the planner does not see an answer)
+            plan.setdefault('answers', []).append({'message_id': mid, 'text': text, 'kind': 'amount_reply',
+                                                   'value': float(cls['amounts'][0]), 'about_phone': hv_phone,
+                                                   'about_message_id': hv_src, 'question_text': R.HIGH_VALUE})
+            continue
         if not (L.is_yes(text) or L.is_no(text)):
             continue
         about = None
@@ -449,7 +463,7 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
 
     decision = decide(plan, hv_threshold=_high_value_threshold(), repeat_pending=repeat_pending,
                       reroute=reroute, texts={mid: _text_of(m) for mid, m in rows.items()}, accounts=accounts,
-                      list_pending=list_pending)
+                      list_pending=list_pending, hv_pending=hv_phone)
     if decision.get('list_confirm'):
         cache_set(LIST_KEY.format(conv=conv_key), {**decision['list_confirm'], 'ts': time.time()}, PENDING_TTL)
     elif list_pending:
@@ -534,8 +548,9 @@ def _noncash_answer(text: str, pending: Dict[str, Any]) -> Optional[Dict[str, An
     return None
 
 
-def _hv_question_pending(conversation) -> Optional[str]:
-    """The phone of the transfer our last «مبلغ كبير — محتاج تأكيد» line (≤ 6 h) is holding, else None."""
+def _hv_question_pending(conversation):
+    """(phone, source message id) of the transfer our last «مبلغ كبير — محتاج تأكيد» line (≤ 6 h)
+    is holding, else (None, None)."""
     try:
         from datetime import timedelta
         from django.utils import timezone
@@ -544,17 +559,17 @@ def _hv_question_pending(conversation) -> Optional[str]:
                                         created_at__gte=timezone.now() - timedelta(hours=6))
              .select_related('reply_to').order_by('-created_at').first())
         if m is None:
-            return None
+            return None, None
         txt = (m.content or {}).get('text') if isinstance(m.content, dict) else ''
         if not txt or not str(txt).startswith('مبلغ كبير'):
-            return None
+            return None, None
         q = m.reply_to
         if q is None or getattr(q, 'direction', None) != 'inbound':
-            return None
+            return None, None
         phones = _classify_message(_text_of(q)).get('phones') or []
-        return phones[0] if phones else None
+        return (phones[0], str(q.id)) if phones else (None, None)
     except Exception:
-        return None
+        return None, None
 
 
 _REROUTE_LINE = 'محتاجين رقم تانى'
