@@ -246,6 +246,8 @@ def _classify_message(text: str) -> Dict[str, Any]:
         # number) so «0100600100» can't become the amount 100,600,100 paired with a phone.
         _kept_rest = []
         for _tok in rest:
+            if line_phones and re.fullmatch(r'\+?0{0,2}2(?:0)?', _tok):
+                continue                   # «+2» / «+20» / «002» next to the number: a country code, not 2 pounds
             if re.fullmatch(r'0\d{9,11}', _tok):
                 has_name = True            # broken phone → noise, not a giant amount
                 _ignore(_tok, 'broken_phone')

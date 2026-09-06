@@ -347,7 +347,12 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         if m.type in ('audio', 'voice'):
             if cls['phones'] or cls['amounts']:
                 pre_replies.append((mid, R.VOICE_CASH))
-            pre_consume.append(mid)
+                pre_consume.append(mid)
+            elif text.strip():
+                to_model.append({'message_id': mid, 'kind': 'voice', 'text': text[:200]})   # «حسابي كام» by voice
+                pre_consume.append(mid)
+            else:
+                pre_consume.append(mid)
             continue
         if m.type != 'text':
             continue
@@ -371,6 +376,11 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         if len(cls['phones']) >= 2 and len(cls['amounts']) == 1:
             # several numbers with ONE amount: «لكل رقم» / «قسم» / a mistake — meaning → the model
             to_model.append({'message_id': mid, 'kind': 'multi_number', 'text': text[:200]})
+            pre_consume.append(mid)
+            continue
+        if cls['phones'] and cls['amounts'] and L.HOLD.search(t):
+            # a STOP word inside the order («الغي», «متبعتش», «بكرة», «تحصيل», «سداد») — held for the model
+            to_model.append({'message_id': mid, 'kind': 'hold_word', 'text': text[:200]})
             pre_consume.append(mid)
             continue
         if cls['phones'] and cls['amounts'] and _number_inside_prose(text, cls):
@@ -450,8 +460,12 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     if plan.get('success') and any(o.get('kind') == 'amount' for o in plan.get('orphans') or []):
         used = _amounts_used_since(conversation, partner, rows)
         if used:
-            consume(conversation, used)
             plan['orphans'] = [o for o in plan['orphans'] if o.get('message_id') not in used]
+            for mid in used:
+                # the amount matches a transfer of the last minutes — «ارجع لي الـ 500» is about THAT
+                # transfer, not a new one; the model reads the sentence
+                to_model.append({'message_id': mid, 'kind': 'sentence', 'text': _text_of(rows[mid])[:200]})
+            consume(conversation, used)
 
     reroute = cache_get(REROUTE_KEY.format(conv=conv_key))
     if reroute and not _reroute_still_valid(conversation, partner, reroute):
@@ -509,6 +523,19 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         cache_delete(LIST_KEY.format(conv=conv_key))
     for tm in decision.get('to_model') or []:
         to_model.append({'message_id': tm['message_id'], 'kind': 'pending_answer', 'text': tm['text'][:200]})
+    # an amount with no number while the customer has registered فورى/أمان/طاير accounts:
+    # the model picks the account (one → use it, several → ask which), not «الرقم للمبلغ؟»
+    reg = _registered(partner)
+    if reg:
+        keep = []
+        for mid, text in decision['replies']:
+            o = next((o for o in plan.get('orphans') or [] if o.get('message_id') == mid and o.get('kind') == 'amount'), None)
+            if o is not None:
+                to_model.append({'message_id': mid, 'kind': 'amount_only',
+                                 'text': f"{_text_of(rows[mid])[:80]} — registered accounts: {', '.join(f'{t} {n}' for t, n in reg)}"})
+            else:
+                keep.append((mid, text))
+        decision['replies'] = keep
 
     if decision['confirm_repeats']:
         call_tool(conversation, partner, qurtoba_confirm_pending_repeats)
@@ -661,7 +688,13 @@ def render_ai_summary(summary: Dict[str, Any]) -> str:
             if k == 'multi_number':
                 hint = 'several numbers with ONE amount — read it: the same amount to each (create one item per number), a split (alert a human), or unclear (ask)'
             elif k == 'sentence':
-                hint = 'a number and an amount INSIDE a sentence — read it: a status question (check_transaction_status), an order (create it), or unclear (ask)'
+                hint = 'a number and/or an amount INSIDE a sentence — read it: a status question (check_transaction_status), a complaint or refund (alert a human + «لحظة»), an order (create it), or unclear (ask)'
+            elif k == 'hold_word':
+                hint = 'an order that ALSO carries a stop word (cancel / not now / tomorrow / تحصيل / سداد) — read it: a cancelled or postponed order → nothing (say «تمام»), a collection or payment → never a transfer, otherwise create it'
+            elif k == 'voice':
+                hint = 'a VOICE message (transcribed) — answer it like text; never create money from voice'
+            elif k == 'amount_only':
+                hint = 'an amount with no number — the customer has registered accounts: exactly one → create with it (type + account), several → ask which, or a cash number is missing → ask «الرقم للمبلغ X؟»'
             elif k == 'pending_answer':
                 hint = "the customer's reply to the PENDING question above — decide yes or no and call qurtoba_answer_pending"
             else:
@@ -674,6 +707,15 @@ def render_ai_summary(summary: Dict[str, Any]) -> str:
     if not lines:
         lines.append('Nothing open: every message was a clean transfer and is created.')
     return '\n'.join(lines)
+
+
+def _registered(partner) -> List[tuple]:
+    try:
+        from qurtoba.tools.transactions import _registered_accounts
+        customer = getattr(partner, 'qurtoba_customer', None)
+        return _registered_accounts(customer) if customer is not None else []
+    except Exception:
+        return []
 
 
 def _amounts_used_since(conversation, partner, rows) -> List[str]:
@@ -690,8 +732,9 @@ def _amounts_used_since(conversation, partner, rows) -> List[str]:
             cls = _classify_message(_text_of(m))
             if cls['phones'] or len(cls['amounts']) != 1:
                 continue
+            from datetime import timedelta
             if QurtobaRecord.objects.filter(customer=customer, value=float(cls['amounts'][0]),
-                                            created_at__gt=m.created_at).exists():
+                                            created_at__gte=m.created_at - timedelta(minutes=15)).exists():
                 out.append(mid)
     except Exception:
         pass

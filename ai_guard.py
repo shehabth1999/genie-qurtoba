@@ -399,24 +399,26 @@ def _dedupe_key_text(text: str) -> str:
     return _PUNCT_RE.sub('', _normalize_for_match(text))
 
 
-def _duplicate_key(conversation_id, text: str) -> str:
-    digest = hashlib.sha1(_dedupe_key_text(text).encode('utf-8')).hexdigest()[:16]
+def _duplicate_key(conversation_id, text: str, quoted_id=None) -> str:
+    # the same fixed line on TWO different customer messages («ابعت رقم صحيح» on two bad
+    # numbers) is not a duplicate — the quoted id is part of the key
+    digest = hashlib.sha1((_dedupe_key_text(text) + '|' + str(quoted_id or '')).encode('utf-8')).hexdigest()[:16]
     return f'qurtoba:ai_sent:{conversation_id}:{digest}'
 
 
-def _is_duplicate_send(conversation_id, text: str) -> bool:
+def _is_duplicate_send(conversation_id, text: str, quoted_id=None) -> bool:
     try:
         # cache.add is SETNX: False means the same text went out moments ago.
-        return not cache.add(_duplicate_key(conversation_id, text), 1, timeout=_DUPLICATE_WINDOW)
+        return not cache.add(_duplicate_key(conversation_id, text, quoted_id), 1, timeout=_DUPLICATE_WINDOW)
     except Exception:
         return False
 
 
-def _release_duplicate(conversation_id, text: str) -> None:
+def _release_duplicate(conversation_id, text: str, quoted_id=None) -> None:
     """The text did NOT reach the provider — forget it, so a retry is not read as a duplicate
     (2026-09-06: a rate-limited «ابعت رقم صحيح» was retried at once and blocked as duplicate)."""
     try:
-        cache.delete(_duplicate_key(conversation_id, text))
+        cache.delete(_duplicate_key(conversation_id, text, quoted_id))
     except Exception:
         pass
 
@@ -449,7 +451,7 @@ def _deliver(original, self, partner, content, conversation, system_partner, mes
     if isinstance(result, dict) and result.get('success') is False and message_type == 'text':
         conv_id = getattr(conversation, 'id', None)
         if conv_id:
-            _release_duplicate(conv_id, _text_of(content) or '')
+            _release_duplicate(conv_id, _text_of(content) or '', kwargs.get('reply_to_id'))
     return result
 
 
@@ -634,7 +636,7 @@ def decide(content, message_type, conversation, system_partner, *,
         return _block('echo')
     if is_self_narration(text):
         return _block('self_narration')
-    if conv_id and _is_duplicate_send(conv_id, text):
+    if conv_id and _is_duplicate_send(conv_id, text, reply_to_id):
         return _block('duplicate')
 
     # ── Rule C: a quoted reply — one per quoted inbound per turn ────────────

@@ -47,6 +47,11 @@ class QurtobaConfig(AppConfig):
         from django.conf import settings as dj_settings
         try:
             dj_settings.AI_HIGH_VALUE_CONFIRM_THRESHOLD = 100_000
+            # A pasted burst of split messages (number, amount, number, amount…) lands over
+            # several seconds; more than 3 split transfers inside this window are withheld and
+            # the customer is asked to resend each number with its amount (widened from 4 s on
+            # 2026-09-06 after a 5-pair paste over ~8 s was paired positionally).
+            dj_settings.AI_SAME_TIME_WINDOW_SEC = 12
         except Exception:
             logger.exception('qurtoba: could not apply AI_HIGH_VALUE_CONFIRM_THRESHOLD')
 

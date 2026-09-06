@@ -524,3 +524,22 @@ class QuotePairingTests(SimpleTestCase):
         pairs, mids, orphans, _amb, _lp = _pair_events(_build_events(msgs, {}, None, {'n': ('a', '500')}))
         self.assertEqual([(p['account_number'], p['value'], p['source_message_id']) for p in pairs], [('01012345678', 500.0, 'n')])
         self.assertEqual(orphans, [])
+
+
+class AttackRoundTwoTests(SimpleTestCase):
+
+    def test_country_code_fragment_is_not_an_amount(self):
+        for t in ('+2 01012345678\n500', '+20 01012345678\n500', '002 01012345678 500'):
+            cls = _classify_message(t)
+            self.assertEqual(cls['phones'], ['01012345678'], t)
+            self.assertEqual(cls['amounts'], [500], t)
+
+    def test_tam_is_not_a_yes_and_hold_words_are_detected(self):
+        self.assertFalse(L.is_bare_yes('تم'))
+        for t in ('01012345678 500 الغي', '01012345678 500 متبعتش', 'تحصيل 500 من 01012345678', 'سداد 500 على 01012345678', '01012345678 500 بكرة'):
+            self.assertTrue(L.HOLD.search(L.norm(t)), t)
+        self.assertFalse(L.HOLD.search(L.norm('01012345678\n500\nعاصم كاش')))
+
+    def test_duplicate_guard_is_per_quoted_message(self):
+        from qurtoba import ai_guard
+        self.assertNotEqual(ai_guard._duplicate_key('c', 'x', 'a'), ai_guard._duplicate_key('c', 'x', 'b'))
