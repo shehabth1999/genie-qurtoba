@@ -139,7 +139,8 @@ class BurstPairingTests(SimpleTestCase):
 
 from qurtoba.automation import lexicon as L  # noqa: E402
 from qurtoba.automation.arabic_numbers import parse_arabic_amount  # noqa: E402
-from qurtoba.automation.router import Intent, classify_rows, classify_text, batch_ids_from_input  # noqa: E402
+from qurtoba.automation.router import batch_ids_from_input  # noqa: E402
+from qurtoba.automation.transfers import render_ai_summary, _is_noise_line  # noqa: E402
 from qurtoba.automation.transfers import decide, resolve_noncash, _multi_number  # noqa: E402
 
 
@@ -161,73 +162,6 @@ class LexiconTests(SimpleTestCase):
 
 
 class RouterTests(SimpleTestCase):
-
-    def _i(self, text, **kw):
-        return classify_text(text, **kw)['intent']
-
-    def test_info_intents(self):
-        self.assertEqual(self._i('الحساب كام'), Intent.BALANCE)
-        self.assertEqual(self._i('حسابي كام؟'), Intent.BALANCE)
-        self.assertEqual(self._i('عليا كام دلوقتي'), Intent.BALANCE)
-        self.assertEqual(self._i('كشف حساب النهارده'), Intent.STATEMENT)
-        self.assertEqual(self._i('تقرير امبارح'), Intent.STATEMENT)
-        self.assertTrue(classify_text('تقرير امبارح')['flags']['yesterday'])
-        self.assertEqual(self._i('تم؟'), Intent.STATUS)
-        self.assertEqual(self._i('وصل ولا لسه؟'), Intent.STATUS)
-        self.assertEqual(classify_text('اللي متمتش؟')['sub'], 'subset')
-        self.assertEqual(self._i('الغي التحويل'), Intent.CANCEL)
-        self.assertEqual(self._i('غلط الغيها'), Intent.CANCEL)
-
-    def test_money_intents(self):
-        self.assertEqual(classify_text('01023551947\n*مبلغ15.100مصري*')['sub'], 'cash')
-        self.assertEqual(classify_text('1000 فوري')['flags'], {'type': 'فورى'})
-        self.assertEqual(classify_text('انستاباي 500')['sub'], 'instapay')
-        self.assertEqual(self._i('محتاج 500'), Intent.TRANSFER)
-        self.assertEqual(self._i('01012345678 خمسمائة'), Intent.TRANSFER)
-        # an amount with «تم» inside a transfer message is still a transfer
-        self.assertEqual(self._i('01012345678\n500\nتم'), Intent.TRANSFER)
-
-    def test_receipt_words_without_a_phone(self):
-        self.assertEqual(self._i('دفعت 500 سداد'), Intent.RECEIPT)
-        self.assertEqual(self._i('الإيصال اهو'), Intent.RECEIPT)
-
-    def test_social_and_noise(self):
-        self.assertEqual(classify_text('السلام عليكم')['sub'], 'salam')
-        self.assertEqual(classify_text('اهلا')['sub'], 'greeting')
-        self.assertEqual(classify_text('صباح الخير')['sub'], 'morning')
-        self.assertEqual(classify_text('شكرا جدا')['sub'], 'thanks')
-        self.assertEqual(classify_text('شغالين؟')['sub'], 'availability')
-        self.assertEqual(classify_text('ازيك يا باشا')['sub'], 'wellbeing')
-        self.assertEqual(self._i('👍'), Intent.NOISE)
-        self.assertEqual(self._i('احمد'), Intent.NOISE)
-
-    def test_free_text_goes_to_the_model(self):
-        self.assertEqual(self._i('عايز اعرف ليه الرصيد زاد كده من غير ما احول حاجه'), Intent.FREETEXT)
-        self.assertEqual(self._i('ممكن تبعتلي صورة الايصال بتاع امبارح تاني'), Intent.FREETEXT)
-        self.assertEqual(self._i('فين الايصال؟'), Intent.STATUS)
-
-    def test_answers_to_our_question_join_the_money_path(self):
-        self.assertEqual(classify_text('أيوة', quotes_our_question=True)['sub'], 'answer')
-        self.assertEqual(classify_text('700', pending_question=True)['sub'], 'answer')
-        self.assertEqual(classify_text('أيوة')['intent'], Intent.NOISE)
-
-    def test_batch_priority_and_secondary(self):
-        rows = [{'id': 'a', 'type': 'text', 'text': 'السلام عليكم'},
-                {'id': 'b', 'type': 'text', 'text': '01012345678\n500'},
-                {'id': 'c', 'type': 'text', 'text': 'وحسابي كام'}]
-        r = classify_rows(rows)
-        self.assertEqual(r['intent'], Intent.TRANSFER)
-        self.assertEqual(r['primary_id'], 'b')
-        self.assertEqual([s['intent'] for s in r['secondary']], [Intent.SOCIAL, Intent.BALANCE])
-        r = classify_rows([{'id': 'x', 'type': 'image', 'text': ''}, {'id': 'y', 'type': 'text', 'text': '01012345678 500'}])
-        self.assertEqual(r['intent'], Intent.RECEIPT)
-        r = classify_rows([{'id': 'v', 'type': 'audio', 'text': 'حول لرقم 01012345678 خمسمية'}])
-        self.assertEqual(r['intent'], Intent.TRANSFER)
-        self.assertTrue(r['flags'].get('voice'))
-
-    def test_off_hours_only_blocks_what_is_not_balance_or_statement(self):
-        self.assertEqual(classify_rows([{'id': 'a', 'type': 'text', 'text': 'حسابي كام'}], off_hours=True)['intent'], Intent.BALANCE)
-        self.assertEqual(classify_rows([{'id': 'a', 'type': 'text', 'text': '01012345678 500'}], off_hours=True)['intent'], Intent.OFF_HOURS)
 
     def test_batch_ids_from_channel_markers(self):
         data = {'message': '[message_id: 5e884d7d-4073-4b1d-91aa-e042809f48ce]\n01009021516',
@@ -384,12 +318,6 @@ class RepeatHoldTests(SimpleTestCase):
         self.assertTrue(d['confirm_repeats'])
         self.assertEqual(d['items'], [])
 
-    def test_punctuation_quoting_own_message_reclassifies_the_quoted_text(self):
-        rows = [{'id': 'x', 'type': 'text', 'text': '.', 'quotes_outbound': False}]
-        # the DB wrapper substitutes the quoted text before classify_rows; here we assert the classifier side
-        self.assertEqual(classify_rows([{'id': 'x', 'type': 'text', 'text': 'حسابي كام'}])['intent'], Intent.BALANCE)
-        self.assertEqual(classify_rows(rows)['intent'], Intent.NOISE)
-
 
 class HighValueAndRerouteTests(SimpleTestCase):
 
@@ -418,3 +346,24 @@ class HighValueAndRerouteTests(SimpleTestCase):
         plan['answers'] = [{'message_id': 'a', 'text': 'تأكيد', 'kind': 'reply', 'about_phone': '01012345678'}]
         d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute=None, texts={}, hv_pending='01012345678')
         self.assertTrue(d['items'][0]['confirm_high_value'])
+
+
+class AiHandoverTests(SimpleTestCase):
+
+    def test_noise_lines_do_not_wake_the_model(self):
+        for t in ('طارق', '.', '👍', ''):
+            self.assertTrue(_is_noise_line(t), t)
+        for t in ('حسابي كام', 'عاصم كاش', 'ليه الرصيد زاد؟', 'ممكن تبعتلي الايصال تاني', 'الغي التحويل ده', 'تم؟'):
+            self.assertFalse(_is_noise_line(t), t)
+
+    def test_summary_block_for_the_model(self):
+        s = render_ai_summary({'created': [{'type': 'كاش', 'value': 4110.0, 'account_number': '01017983810'}],
+                               'leftovers': [{'message_id': 'm6', 'kind': 'planner', 'text': '0 11 27969725',
+                                              'suggested_reply': 'المبلغ لـ 01127969725؟'}],
+                               'others': [{'message_id': 'm9', 'type': 'text', 'text': 'حسابي كام'}]})
+        self.assertIn('CREATED', s)
+        self.assertIn('4,110 → 01017983810', s)
+        self.assertIn('[message_id: m6]', s)
+        self.assertIn('المبلغ لـ 01127969725؟', s)
+        self.assertIn('حسابي كام', s)
+        self.assertEqual(render_ai_summary({}), 'Nothing open: every message was a clean transfer and is created.')

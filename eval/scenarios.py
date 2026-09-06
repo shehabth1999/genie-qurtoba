@@ -326,13 +326,12 @@ SCENARIOS.append({
 })
 
 
-# ── V. workflow v2 (automation-first) — router intents, no model on these turns ──
-# Automation replies are SYSTEM sends (fixed lines through the system-send path), so they
-# show up under `tool_texts_contain`, never as agent paragraphs; `reply: silent` therefore
-# asserts that no MODEL text was produced at all on the turn.
+# ── V. workflow v2 (money first, thinking second) ──
+# Clean transfers are created by Python before any model runs; open items and non-money
+# messages go to the thinking model, which answers through the reply tool.
 SCENARIOS += [
     {
-        'id': 'V1', 'title': 'v2: سؤال الرصيد → أداة الرصيد فقط، بدون موديل',
+        'id': 'V1', 'title': 'v2: سؤال الرصيد → الموديل يستدعي أداة الرصيد فقط',
         'turns': [{'text': 'حسابي كام؟'}],
         'expect': {'final': {
             'tools': [{'name': 'qurtoba_send_customer_balance_to_chat', 'must': True}],
@@ -340,7 +339,7 @@ SCENARIOS += [
         }},
     },
     {
-        'id': 'V2', 'title': 'v2: تحية → رد ثابت مقتبس، بدون موديل',
+        'id': 'V2', 'title': 'v2: تحية → رد واحد مقتبس من الموديل',
         'turns': [{'text': 'السلام عليكم'}],
         'expect': {'final': {
             'no_records': True, 'reply': 'one_message', 'quoted_replies': 1, 'contains': ['السلام'], 'forbid': NARRATION_FORBID,
@@ -363,7 +362,7 @@ SCENARIOS += [
         }},
     },
     {
-        'id': 'V5', 'title': 'v2: مبلغ بالحروف بدون موديل → إنشاء صامت',
+        'id': 'V5', 'title': 'v2: مبلغ بالحروف → إنشاء صامت بدون موديل',
         'turns': [{'text': f'{P1}\nخمسين الف'}],
         'expect': {'final': {'creates': [{'account': P1, 'value': 50000}], 'reply': 'silent', 'forbid': NARRATION_FORBID}},
     },

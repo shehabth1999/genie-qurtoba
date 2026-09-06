@@ -1,5 +1,8 @@
 """Build / update the workflow-v2 graph («Qurtoba Accountant Automations») from a Python spec.
 
+Graph: linked? → route → [receipt → payments agent | off-hours → notice | MONEY PATH (creates, no model)
+       → anything left? → thinking model (replies + info tools) | done].
+
     manage.py qurtoba_workflow_v2                 # upsert nodes + edges of workflow 3 (idempotent)
     manage.py qurtoba_workflow_v2 --dry-run       # print the spec, change nothing
     manage.py qurtoba_workflow_v2 --canary 4      # route ONE partner to workflow 3
@@ -30,23 +33,16 @@ SRC_PAYMENTS_NODE = 'agent_chat_1783507166437'
 SRC_CASH_NODE = 'agent_chat_1783507168037'
 SRC_NOT_LINKED_TOOL = 'tool_1781113475079'
 
-FREETEXT_TOOLS = (
-    'qurtoba_send_customer_balance_to_chat', 'qurtoba_get_customer_daily_transactions',
-    'qurtoba_check_transaction_status', 'qurtoba_check_payment_status', 'alert_qurtoba_human',
-    'whatsapp_reply_to_message', 'qurtoba_send_static_message',
+THINKER_TOOLS = (
+    'whatsapp_reply_to_message', 'qurtoba_send_customer_balance_to_chat', 'qurtoba_get_customer_daily_transactions',
+    'qurtoba_check_transaction_status', 'qurtoba_check_payment_status', 'qurtoba_clear_pending_transfers',
+    'alert_qurtoba_human', 'qurtoba_send_static_message',
 )
 
-INTENT_BRANCHES = ['transfer', 'balance', 'statement', 'status', 'cancel', 'social', 'off_hours', 'receipt', 'noise']
-INTENT_TARGET = {
-    'transfer': 'function_transfers', 'balance': 'function_balance', 'statement': 'function_statement',
-    'status': 'function_status', 'cancel': 'function_cancel', 'social': 'function_social',
-    'off_hours': 'function_off_hours', 'receipt': AVAILABILITY_NODE, 'noise': 'function_noise',
-}
-
-_PROMPT_PATH = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, 'prompts', 'agents', 'freetext', 'prompt.md')
+_PROMPT_PATH = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, 'prompts', 'agents', 'thinker', 'prompt.md')
 
 
-def _freetext_prompt() -> str:
+def _thinker_prompt() -> str:
     with open(_PROMPT_PATH, encoding='utf-8') as fh:
         text = fh.read()
     return text.split('**prompt:**', 1)[1].strip() if '**prompt:**' in text else text.strip()
@@ -58,76 +54,76 @@ def _fn(node_id, label, x, y, code, timeout=60):
 
 
 def build_spec(src_nodes, tool_ids):
-    """(nodes, edges, global_configuration) for the v2 graph."""
+    """(nodes, edges, global_configuration) for the v2 graph:
+    linked? → route → [receipt → payments agent | off-hours → notice | money path → needs AI? → thinker | done]"""
     def src_cfg(node_id):
         n = src_nodes.get(node_id)
         if n is None:
             raise CommandError(f'workflow {SOURCE_WORKFLOW_ID} has no node {node_id}')
         return json.loads(json.dumps(n.configuration))
 
-    intent_conditions = [
-        {'operator': 'equals', 'data_type': 'string', 'variable1': '{{ function_route.intent }}', 'variable2': name}
-        for name in INTENT_BRANCHES
-    ]
     payments = src_cfg(SRC_PAYMENTS_NODE)
     payments['handoff'] = {'enabled': False, 'targets': []}
     payments['update_state'] = []
 
-    freetext = src_cfg(SRC_CASH_NODE)
-    freetext['messages'] = [{'role': 'system', 'text': _freetext_prompt(), 'cache': True, 'cache_ttl': '5m', 'attachments': []}]
-    freetext['selected_tools'] = [{'store': True, 'tool_id': tool_ids[name], 'ask_human': False} for name in FREETEXT_TOOLS]
-    freetext['handoff'] = {'enabled': True, 'targets': [{
+    thinker = src_cfg(SRC_CASH_NODE)
+    thinker['messages'] = [{'role': 'system', 'text': _thinker_prompt(), 'cache': True, 'cache_ttl': '5m', 'attachments': []}]
+    thinker['selected_tools'] = [{'store': True, 'tool_id': tool_ids[name], 'ask_human': False} for name in THINKER_TOOLS]
+    thinker['handoff'] = {'enabled': True, 'targets': [{
         'node_id': 'agent_payments', 'tool_name': '',
         'tool_description': 'Register سداد payments from a receipt image (شراء كاش / شراء فورى), or explicit payment wording («العميل دفع»).',
     }]}
-    freetext['update_state'] = []
-    freetext['max_iterations'] = 4
-    freetext['max_tokens'] = 1500
-    freetext['temperature'] = 0.2
-    freetext['reasoning_mode'] = 'none'
-    freetext['description'] = 'Small model for free-text turns only — no money tools.'
+    thinker['update_state'] = []
+    thinker['max_iterations'] = 6
+    thinker['max_tokens'] = 1500
+    thinker['temperature'] = 0.2
+    thinker['reasoning_mode'] = 'none'
+    thinker['description'] = 'Thinking model: runs after the system created the clean transfers; no money tools.'
 
     not_linked = src_cfg(SRC_NOT_LINKED_TOOL)
     not_linked['arguments'] = {'message': R.NOT_LINKED}
 
-    X0, X1, X2, X3, X4, X5 = 0, 320, 640, 980, 1320, 1660
+    X0, X1, X2, X3, X4, X5, X6 = 0, 320, 640, 960, 1280, 1600, 1920
     nodes = [
-        dict(node_id='conditional_linked', node_type='conditional', label='linked to a Qurtoba customer?', x=X0, y=400,
+        dict(node_id='conditional_linked', node_type='conditional', label='linked to a Qurtoba customer?', x=X0, y=300,
              configuration={'conditions': [{'operator': 'is_true', 'data_type': 'boolean',
                                             'variable1': '{{partner.has_qurtoba_customer}}', 'variable2': ''}],
                             'default_branch': 'default'}),
-        dict(node_id='tool_not_linked', node_type='tool', label='not linked → static notice', x=X1, y=760, configuration=not_linked),
-        _fn('function_route', 'ROUTER (deterministic)', X1, 400, NODE_CODE['function_route']),
-        dict(node_id='conditional_intent', node_type='conditional', label='intent?', x=X2, y=400,
-             configuration={'conditions': intent_conditions, 'default_branch': 'default'}),
-        _fn('function_transfers', '1 transfer → planner + create (no model)', X3, 0, NODE_CODE['function_transfers'], timeout=120),
-        _fn('function_balance', '2 balance', X3, 130, NODE_CODE['function_balance']),
-        _fn('function_statement', '3 statement', X3, 260, NODE_CODE['function_statement'], timeout=120),
-        _fn('function_status', '4 status', X3, 390, NODE_CODE['function_status']),
-        _fn('function_cancel', '5 cancel', X3, 520, NODE_CODE['function_cancel']),
-        _fn('function_social', '6 courtesy', X3, 650, NODE_CODE['function_social']),
-        _fn('function_off_hours', '7 off-hours', X3, 780, NODE_CODE['function_off_hours']),
-        _fn('function_noise', '9 noise (nothing to do)', X3, 1040, NODE_CODE['function_noise']),
-        dict(node_id=AVAILABILITY_NODE, node_type='function', label='service_availability', x=X3, y=910,
+        dict(node_id='tool_not_linked', node_type='tool', label='not linked → static notice', x=X1, y=560, configuration=not_linked),
+        _fn('function_route', 'ROUTE: receipt image? off-hours? else money', X1, 300, NODE_CODE['function_route']),
+        dict(node_id='conditional_route', node_type='conditional', label='receipt / off-hours / money', x=X2, y=300,
+             configuration={'conditions': [
+                 {'operator': 'equals', 'data_type': 'string', 'variable1': '{{ function_route.intent }}', 'variable2': 'receipt'},
+                 {'operator': 'equals', 'data_type': 'string', 'variable1': '{{ function_route.intent }}', 'variable2': 'off_hours'},
+             ], 'default_branch': 'default'}),
+        _fn('function_transfers', 'MONEY PATH: planner → create (no model)', X3, 300, NODE_CODE['function_transfers'], timeout=120),
+        dict(node_id='conditional_needs_ai', node_type='conditional', label='anything left for the AI?', x=X4, y=300,
+             configuration={'conditions': [{'operator': 'is_true', 'data_type': 'boolean',
+                                            'variable1': '{{ function_transfers.needs_ai }}', 'variable2': ''}],
+                            'default_branch': 'default'}),
+        _fn('function_done', 'done — silent turn', X5, 440, NODE_CODE['function_done']),
+        _fn('function_ai_context', 'context for the thinking model', X5, 300, NODE_CODE['function_ai_context']),
+        dict(node_id='agent_thinker', node_type='agent_chat', label='THINKER (model): questions, replies, info tools', x=X6, y=300, configuration=thinker),
+        _fn('function_off_hours', 'off-hours notice', X3, 560, NODE_CODE['function_off_hours']),
+        dict(node_id=AVAILABILITY_NODE, node_type='function', label='service_availability', x=X3, y=40,
              configuration=src_cfg(AVAILABILITY_NODE)),
-        dict(node_id=SHARED_CORE_NODE, node_type='function', label='shared_roles', x=X4, y=910,
+        dict(node_id=SHARED_CORE_NODE, node_type='function', label='shared_roles', x=X4, y=40,
              configuration=src_cfg(SHARED_CORE_NODE)),
-        dict(node_id='agent_payments', node_type='agent_chat', label='8 payments_agent (vision model)', x=X5, y=910, configuration=payments),
-        _fn('function_freetext_context', 'else: context for the small model', X3, 1170, NODE_CODE['function_freetext_context']),
-        dict(node_id='agent_freetext', node_type='agent_chat', label='freetext_agent (small model, no money tools)', x=X4, y=1170, configuration=freetext),
+        dict(node_id='agent_payments', node_type='agent_chat', label='payments_agent (vision model)', x=X5, y=40, configuration=payments),
     ]
     edges = [
         ('conditional_linked', 'function_route', '1'),
         ('conditional_linked', 'tool_not_linked', '0'),
-        ('function_route', 'conditional_intent', ''),
-    ]
-    for i, name in enumerate(INTENT_BRANCHES, 1):
-        edges.append(('conditional_intent', INTENT_TARGET[name], str(i)))
-    edges += [
-        ('conditional_intent', 'function_freetext_context', '0'),
+        ('function_route', 'conditional_route', ''),
+        ('conditional_route', AVAILABILITY_NODE, '1'),
+        ('conditional_route', 'function_off_hours', '2'),
+        ('conditional_route', 'function_transfers', '0'),
+        ('function_transfers', 'conditional_needs_ai', ''),
+        ('conditional_needs_ai', 'function_ai_context', '1'),
+        ('conditional_needs_ai', 'function_done', '0'),
+        ('function_ai_context', 'agent_thinker', ''),
         (AVAILABILITY_NODE, SHARED_CORE_NODE, ''),
         (SHARED_CORE_NODE, 'agent_payments', ''),
-        ('function_freetext_context', 'agent_freetext', ''),
     ]
     global_configuration = {
         'schedules': [], 'chat_based': False, 'input_message': '', 'record_trigger': {}, 'recursion_limit': 25,
@@ -160,8 +156,8 @@ class Command(BaseCommand):
         if wf is None or src is None:
             raise CommandError(f'workflow {wf_id} or {src_id} not found')
         src_nodes = {n.node_id: n for n in WorkflowNode.objects.filter(workflow=src)}
-        tool_ids = dict(ToolDefinition.objects.filter(name__in=FREETEXT_TOOLS).values_list('name', 'id'))
-        missing = [t for t in FREETEXT_TOOLS if t not in tool_ids]
+        tool_ids = dict(ToolDefinition.objects.filter(name__in=THINKER_TOOLS).values_list('name', 'id'))
+        missing = [t for t in THINKER_TOOLS if t not in tool_ids]
         if missing:
             raise CommandError(f'tools not registered in ToolDefinition: {missing}')
 

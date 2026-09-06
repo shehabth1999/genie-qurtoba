@@ -61,31 +61,33 @@ prompt:      <the specialty system prompt, on top of _shared/core.md>
 
 ## Workflow v2 — «Qurtoba Accountant Automations» (workflow id 3)
 
-Automation first, small model only for free text. Built and versioned by
-`manage.py qurtoba_workflow_v2` (idempotent; re-run after any change to
-`qurtoba/automation/nodes.py` or `freetext/prompt.md`).
+Money first, thinking second. Built and versioned by `manage.py qurtoba_workflow_v2`
+(idempotent; re-run after any change to `qurtoba/automation/nodes.py` or `thinker/prompt.md`,
+then restart the worker).
 
 ```
 conditional_linked ──0──► tool_not_linked (static notice)
         │1
-function_route  (qurtoba.automation.router.route — deterministic)
+function_route          receipt image? / off-hours switch? / else money
         │
-conditional_intent  on {{ function_route.intent }}
-   1 transfer   → function_transfers   planner → create tool → quoted replies   (no model)
-   2 balance    → function_balance     qurtoba_send_customer_balance_to_chat
-   3 statement  → function_statement   qurtoba_get_customer_daily_transactions
-   4 status     → function_status      check_transaction/payment_status → pretty_ar
-   5 cancel     → function_cancel      clear pending burst | alert human + «لحظة»
-   6 social     → function_social      greeting / thanks / availability (fixed lines)
-   7 off_hours  → function_off_hours   static notice (manual switch: state `off_hours`)
-   8 receipt    → service_availability → shared_roles → agent_payments (vision model)
-   9 noise      → function_noise       nothing
-   0 else       → function_freetext_context → agent_freetext (small model, no money tools)
+conditional_route
+   1 receipt   → service_availability → shared_roles → agent_payments (vision model)
+   2 off_hours → function_off_hours (static notice)
+   0 money     → function_transfers   PLANNER → CREATE every clean pair NOW (no model, ~1 s)
+                        │
+                 conditional_needs_ai   {{ function_transfers.needs_ai }}
+                   0 → function_done          silent turn (every message was a clean transfer)
+                   1 → function_ai_context → agent_thinker (model)
 ```
 
-- Rules live in `qurtoba/automation/` (lexicon, router, transfers, intents, replies) and are
-  unit-tested (`manage.py test qurtoba.tests`).
-- `freetext/prompt.md` is the ONLY prompt the small model sees; it has no transfer tool.
-- The payments agent is copied from workflow 2 at build time (same prompt, handoff off).
-- Rollout: `--canary <partner_id>` (one partner), `--release` (account 3), `--rollback`.
-- Evaluate: `manage.py qurtoba_ai_eval --workflow 3` (scenarios V1–V9 are v2-specific).
+- `function_transfers` (qurtoba/automation/transfers.py) creates the clean transfers, applies the
+  customer's answers to earlier questions («أيوة», «تأكيد», an amount) and hands EVERYTHING it did
+  not settle to the model as `leftovers` (each with the office's suggested line) and `others`
+  (any message that is not money). Python does not interpret wording.
+- `agent_thinker` (prompts/agents/thinker/prompt.md) reads `<money_path>` and `<messages>`, sends the
+  quoted replies, and uses the info tools (balance, statement, status, payment status, clear
+  pending, human alert). It has NO transfer tool.
+- `QURTOBA_AUTOMATION_REPLIES = True` (Django setting) makes Python send the suggested lines itself
+  instead of handing them to the model (off by default).
+- Rollout: `--canary <partner_id>`, `--release` (account 3), `--rollback`.
+- Evaluate: `manage.py qurtoba_ai_eval --workflow 3`.

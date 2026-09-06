@@ -6,6 +6,13 @@ repeats, watermark these rows). ``run`` gathers the facts, calls the planner and
 the create tool through the same @tool functions the agent used, and applies the
 decisions. Every rule below is the cash / fawry prompt rule it replaces, with the
 prompt line quoted in the comment.
+
+Division of labour (owner decision 2026-09-06): Python CREATES — every clean pair is
+created the moment it arrives, no model in the path. Python does NOT interpret the
+customer: whatever is left after the creates (a number without an amount, an
+unreadable amount, a held high value, a question, a greeting) is handed to the AI as
+``leftovers`` with a suggested line, and the AI decides what to say. The fixed lines
+are sent by Python only when ``QURTOBA_AUTOMATION_REPLIES`` is True.
 """
 import time
 from typing import Any, Dict, List, Optional
@@ -408,11 +415,24 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             if val:
                 fallback_amounts[mid] = float(val)
 
+    replies_enabled = _python_replies_enabled()
+    leftovers: List[Dict[str, Any]] = []
+
+    def _say(mid, text, kind):
+        if replies_enabled:
+            if send_quoted(conversation, mid, text):
+                summary['replies'] += 1
+        else:
+            leftovers.append({'message_id': mid, 'kind': kind, 'text': (_text_of(rows[mid]) if mid in rows else '')[:80],
+                              'suggested_reply': text})
+
     for mid, text in pre_replies:
-        if send_quoted(conversation, mid, text):
-            summary['replies'] += 1
-    if pre_consume:
+        _say(mid, text, 'pre')
+    if pre_consume and replies_enabled:
         consume(conversation, pre_consume)          # handled here → the planner must not see them
+    elif pre_consume:
+        # not answered by Python: keep the rows visible to the AI, but out of the planner
+        consume(conversation, [m for m in pre_consume if m not in {l['message_id'] for l in leftovers}])
 
     # The planner (authoritative DB fetch; `amount` fallbacks by message id survive it).
     planner_input = [{'message_id': mid, 'text': _text_of(m), **({'amount': fallback_amounts[mid]} if mid in fallback_amounts else {})}
@@ -481,19 +501,27 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
 
     items = pre_items + [i for i in decision['items']]
     created_result = None
+    held_items: List[Dict[str, Any]] = []
+    created_items: List[Dict[str, Any]] = []
     if items:
         clean = [{k: v for k, v in i.items() if k != 'reroute'} for i in items]
         created_result = call_tool(conversation, partner, qurtoba_create_new_transactions_bulk, transactions=clean)
         summary['items'] = len(clean)
-        _handle_create_result(conversation, partner, created_result, clean, summary)
+        held_items, created_items = _handle_create_result(conversation, partner, created_result, clean, summary,
+                                                          replies_enabled=replies_enabled)
         if decision['reroute_used'] and created_result.get('success'):
             cache_delete(REROUTE_KEY.format(conv=conv_key))
 
     for mid, text in decision['replies']:
-        if send_quoted(conversation, mid, text):
-            summary['replies'] += 1
+        _say(mid, text, 'planner')
     if decision['consume']:
         consume(conversation, decision['consume'])
+    for h in held_items:
+        leftovers.append({'message_id': h.get('source_message_id'), 'kind': 'high_value_held',
+                          'text': f"{h.get('account_number')} ← {R._fmt(h.get('value'))}",
+                          'suggested_reply': R.HIGH_VALUE})
+    for rj in summary.pop('_rejected', []):
+        leftovers.append({**rj, 'text': (_text_of(rows[rj['message_id']]) if rj.get('message_id') in rows else '')[:80]})
 
     # Rows that carried nothing for the money path (a name line, a greeting next to the
     # numbers) are finished with — never let them linger into the next burst.
@@ -503,11 +531,76 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     if noise:
         consume(conversation, noise)
 
-    from .intents import run_secondary
-    run_secondary(conversation, partner, route)
-    log('transfers', conversation, **{k: v for k, v in summary.items()},
+    # Everything the customer wrote that the money path did not settle goes to the AI.
+    others = []
+    for mid in route.get('batch_ids') or []:
+        m = rows.get(mid)
+        if m is None:
+            continue
+        if mid in noise or mid in (decision.get('consume') or []) or mid in {i.get('source_message_id') for i in created_items}:
+            continue
+        if any(l.get('message_id') == mid for l in leftovers):
+            continue
+        txt = _text_of(m)
+        if m.type == 'text' and _is_noise_line(txt):
+            consume(conversation, [mid])
+            continue
+        others.append({'message_id': mid, 'type': m.type, 'text': txt[:200]})
+
+    summary.update({
+        'created': [{'account_number': i.get('account_number'), 'value': i.get('value'), 'type': i.get('type')} for i in created_items],
+        'leftovers': leftovers,
+        'others': others,
+        'needs_ai': bool(leftovers or others),
+    })
+    summary['summary'] = render_ai_summary(summary)
+    log('transfers', conversation, items=summary['items'], replies=summary['replies'], needs_ai=summary['needs_ai'],
+        leftovers=[l['kind'] for l in leftovers] or None, others=len(others) or None,
         pairs=len(plan.get('pairs') or []), orphans=len(plan.get('orphans') or []))
     return summary
+
+
+def _python_replies_enabled() -> bool:
+    try:
+        from django.conf import settings as dj
+        return bool(getattr(dj, 'QURTOBA_AUTOMATION_REPLIES', False))
+    except Exception:
+        return False
+
+
+def _is_noise_line(text: str) -> bool:
+    """Only what can carry no meaning at all: empty, punctuation, an emoji, or a SINGLE word
+    without digits (a first name under a number). Two words or more («حسابي كام», «عاصم كاش»)
+    go to the AI — Python does not decide what a sentence means."""
+    t = ' '.join(str(text or '').split())
+    if not t:
+        return True
+    if L.is_question(t):
+        return False
+    if L.is_only_emoji(t) or all(ch in '.,،!…-_' for ch in t):
+        return True
+    return len(t.split()) == 1 and not any(ch.isdigit() for ch in t)
+
+
+def render_ai_summary(summary: Dict[str, Any]) -> str:
+    """The block the AI reads: what the system already did, what is still open."""
+    lines = []
+    created = summary.get('created') or []
+    if created:
+        lines.append('CREATED by the system this turn (👍 already sent — say NOTHING about them):')
+        lines += [f"  - {c.get('type')} {R._fmt(c.get('value'))} → {c.get('account_number')}" for c in created]
+    lo = summary.get('leftovers') or []
+    if lo:
+        lines.append('OPEN ITEMS — each needs ONE quoted reply on its message_id (suggested wording given; keep it or adapt it, never invent an amount):')
+        for l in lo:
+            lines.append(f"  - [message_id: {l.get('message_id')}] kind={l.get('kind')} «{l.get('text')}» → suggested: «{l.get('suggested_reply')}»")
+    ot = summary.get('others') or []
+    if ot:
+        lines.append('OTHER MESSAGES from the customer this turn (not money — understand and answer them):')
+        lines += [f"  - [message_id: {o.get('message_id')}] ({o.get('type')}) {o.get('text')}" for o in ot]
+    if not lines:
+        lines.append('Nothing open: every message was a clean transfer and is created.')
+    return '\n'.join(lines)
 
 
 def _noncash_answer(text: str, pending: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -645,20 +738,29 @@ def _reroute_still_valid(conversation, partner, marker: Dict[str, Any]) -> bool:
         return False
 
 
-def _handle_create_result(conversation, partner, result: Dict[str, Any], items: List[Dict[str, Any]], summary: Dict[str, Any]) -> None:
-    """REPLY PROTOCOL: a clean item gets nothing (the tool spoke); a faulty item gets ONE quoted line."""
+def _handle_create_result(conversation, partner, result: Dict[str, Any], items: List[Dict[str, Any]],
+                          summary: Dict[str, Any], *, replies_enabled: bool = False):
+    """REPLY PROTOCOL: a clean item gets nothing (the tool spoke); a faulty item gets ONE quoted line —
+    sent here when Python replies are on, otherwise handed to the AI as a leftover.
+    Returns (held_items, created_items)."""
+    held: List[Dict[str, Any]] = []
+    created: List[Dict[str, Any]] = []
     if not result.get('success'):
         alert_human(conversation, partner, f'فشل إنشاء التحويلات تلقائياً: {result.get("error")}')
-        return
+        return held, created
     for r in result.get('results') or []:
         idx = r.get('index')
-        src = r.get('source_message_id') or (items[idx].get('source_message_id') if isinstance(idx, int) and idx < len(items) else None)
+        item = items[idx] if isinstance(idx, int) and idx < len(items) else {}
+        src = r.get('source_message_id') or item.get('source_message_id')
         status = r.get('status')
         if status == 'needs_confirmation' and r.get('confirm_kind', 'high_value') == 'high_value':
             # «Held → on the transfer message: مبلغ كبير — محتاج منك كلمة «تأكيد» …» — once.
-            if not r.get('already_asked') and not asked_recently(conversation, src, minutes=360):
-                if send_quoted(conversation, src, R.HIGH_VALUE):
-                    summary['replies'] += 1
+            if replies_enabled:
+                if not r.get('already_asked') and not asked_recently(conversation, src, minutes=360):
+                    if send_quoted(conversation, src, R.HIGH_VALUE):
+                        summary['replies'] += 1
+            elif not asked_recently(conversation, src, minutes=360):
+                held.append({**item, 'source_message_id': src})
         elif status == 'rejected':
             et = r.get('error_type')
             if et == 'invalid_account_number':
@@ -668,7 +770,13 @@ def _handle_create_result(conversation, partner, result: Dict[str, Any], items: 
                 continue
             else:
                 text = r.get('error') or R.NOT_UNDERSTOOD
-            if send_quoted(conversation, src, text):
-                summary['replies'] += 1
-            consume(conversation, [src])
-        # created / pending_review / duplicate / repeat_asked / account_corrected → the tool already spoke
+            if replies_enabled:
+                if send_quoted(conversation, src, text):
+                    summary['replies'] += 1
+                consume(conversation, [src])
+            else:
+                summary.setdefault('_rejected', []).append({'message_id': src, 'kind': 'rejected', 'text': '', 'suggested_reply': text})
+        elif status in ('created', 'pending_review'):
+            created.append({**item, 'source_message_id': src, 'record_id': r.get('record_id')})
+        # duplicate / repeat_asked / account_corrected → the tool already spoke
+    return held, created
