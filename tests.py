@@ -147,7 +147,7 @@ from qurtoba.automation.transfers import decide, resolve_noncash, _multi_number 
 class LexiconTests(SimpleTestCase):
 
     def test_yes_no_answers(self):
-        for t in ('أيوة', 'ايوه كرر', 'تمام', 'تأكيد', 'اه', 'نعم يا باشا', 'ok', 'ماشي كده'):
+        for t in ('أيوة', 'ايوه كرر', 'تمام', 'تأكيد', 'اه', 'نعم يا باشا', 'ok', 'ماشي كده', 'اها كرر الكل', 'ايوه اعملها كلها'):
             self.assertTrue(L.is_yes(t), t)
             self.assertFalse(L.is_no(t), t)
         for t in ('لأ', 'لا خلاص', 'بلاش', 'no'):
@@ -367,3 +367,20 @@ class AiHandoverTests(SimpleTestCase):
         self.assertIn('المبلغ لـ 01127969725؟', s)
         self.assertIn('حسابي كام', s)
         self.assertEqual(render_ai_summary({}), 'Nothing open: every message was a clean transfer and is created.')
+
+
+class BrokenNumberTests(SimpleTestCase):
+    """2026-09-06: «0106013464 ⏎ الفين جنيه» leaked its 2,000 into the next split pair."""
+
+    def test_broken_number_keeps_its_amount_out_of_the_pairing(self):
+        msgs = [{'text': '0106013464\nالفين جنيه', 'message_id': 'b'},
+                {'text': '01011061657', 'message_id': 'p'}, {'text': '8310', 'message_id': 'a'}]
+        pairs, _m, orphans, _amb, _lp = _pair_events(_build_events(msgs, {}, {'b': 2000.0}))
+        self.assertEqual([(p['account_number'], p['value']) for p in pairs], [('01011061657', 8310.0)])
+        self.assertEqual(orphans, [])
+
+    def test_broken_number_gets_the_bad_number_line(self):
+        plan = {'success': True, 'pairs': [], 'orphans': [], 'ambiguous': [], 'answers': [], 'needs_resend': False,
+                'ignored': [{'message_id': 'b', 'text': '0106013464', 'reason': 'broken_phone'}]}
+        d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute=None, texts={})
+        self.assertEqual(d['replies'], [('b', 'الرقم ده مش صحيح — ابعت رقم صحيح 11 رقم')])

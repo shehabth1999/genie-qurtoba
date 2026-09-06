@@ -197,6 +197,10 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
                 continue
             replies.append((mid, R.ORPHAN_AMOUNT.format(amount=R._fmt(val))))
 
+    for mid in broken_phone_mids:
+        if not any(r[0] == mid for r in replies):
+            replies.append((mid, R.BAD_NUMBER))
+
     if reroute_amount and not out['reroute_used']:
         # «A number that arrives WITH an amount is NOT the reroute answer … create exactly what the
         # message says, then ask ONE quoted question about the still-owed reroute amount.»
@@ -407,6 +411,8 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                 cache_set(MULTI_KEY.format(conv=conv_key), {'phones': multi['phones'], 'amount': multi['amount'], 'message_id': mid}, PENDING_TTL)
             pre_consume.append(mid)
             continue
+        if any(i.get('reason') == 'broken_phone' for i in cls.get('ignored') or []) and not cls['phones']:
+            continue                                   # a bad number keeps its (spelled) amount to itself
         if not cls['amounts'] and _looks_like_spelled_amount(text):
             words = text
             for ph in cls['phones']:
@@ -422,6 +428,8 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         if replies_enabled:
             if send_quoted(conversation, mid, text):
                 summary['replies'] += 1
+        elif mid and asked_recently(conversation, mid, minutes=15):
+            log('leftover_already_asked', conversation, mid=str(mid)[:8])   # never ask twice
         else:
             leftovers.append({'message_id': mid, 'kind': kind, 'text': (_text_of(rows[mid]) if mid in rows else '')[:80],
                               'suggested_reply': text})

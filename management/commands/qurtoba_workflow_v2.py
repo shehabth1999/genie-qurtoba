@@ -36,7 +36,7 @@ SRC_NOT_LINKED_TOOL = 'tool_1781113475079'
 THINKER_TOOLS = (
     'whatsapp_reply_to_message', 'qurtoba_send_customer_balance_to_chat', 'qurtoba_get_customer_daily_transactions',
     'qurtoba_check_transaction_status', 'qurtoba_check_payment_status', 'qurtoba_clear_pending_transfers',
-    'alert_qurtoba_human', 'qurtoba_send_static_message',
+    'qurtoba_confirm_pending_repeats', 'alert_qurtoba_human', 'qurtoba_send_static_message',
 )
 
 _PROMPT_PATH = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, 'prompts', 'agents', 'thinker', 'prompt.md')

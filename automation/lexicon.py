@@ -116,9 +116,9 @@ _YES_WORDS = {
     'نكمل', 'ننفذ', 'صح', 'اكد', 'مؤكد', 'موكد', 'اعمل', 'اعملها', 'حول', 'حولها', 'ابعت',
     'ابعتها', 'تمم', 'تم', 'ok.', '👍', 'يب', 'ايوة',
 }
-_NO_WORDS = {'لا', 'لأ', 'لاء', 'لاا', 'no', 'خلاص', 'الغي', 'الغيها', 'مش', 'ما', 'بلاش', 'كفايه'}
+_NO_WORDS = {'لا', 'لأ', 'لاء', 'لاا', 'no', 'خلاص', 'الغي', 'الغيها', 'مش', 'ما', 'بلاش', 'كفايه', 'بس', 'غير', 'الا'}
 _FILLER = {'يا', 'باشا', 'فندم', 'يافندم', 'يا فندم', 'حبيبي', 'يا باشا', 'يا حبيبي', 'من', 'فضلك',
-           'لو', 'سمحت', 'شكرا', 'طيب', 'و', 'كده', 'كدا', 'بس', 'ياباشا', 'يا كبير', 'كبير'}
+           'لو', 'سمحت', 'شكرا', 'طيب', 'و', 'كده', 'كدا', 'ياباشا', 'يا كبير', 'كبير', 'الكل', 'كلها', 'كله', 'كلهم'}
 _ANSWER_MAX_WORDS = 4      # a yes/no is a SHORT message; a sentence that contains «ما» is not a «no»
 
 
@@ -132,7 +132,9 @@ def is_yes(text: str) -> bool:
     words = _answer_words(text)
     if not words or len(words) > _ANSWER_MAX_WORDS:
         return False
-    return all(w in _YES_WORDS for w in words) and not any(w in _NO_WORDS for w in words)
+    # «اها كرر الكل», «ايوه اعملها كلها» — a yes word with a harmless tail is still a yes.
+    return any(w in _YES_WORDS for w in words) and not any(w in _NO_WORDS for w in words) \
+        and not any(ch.isdigit() for w in words for ch in w)
 
 
 def is_no(text: str) -> bool:

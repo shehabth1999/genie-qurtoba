@@ -390,6 +390,13 @@ def _build_events(messages, msg_text, msg_fallback=None):
         text = (msg_text or {}).get(mid) or item.get('text') or ''
         cls = _classify_message(text)
         phones, amounts, amb = cls['phones'], cls['amounts'], cls['ambiguous']
+        # A message with a BROKEN number («0106013464 ⏎ الفين جنيه», 10 digits) is one unit:
+        # its amount belongs to that bad number, never to the next bare number in the burst.
+        # 2026-09-06: the loose 2,000 shifted every split pair after it. The message is a
+        # rejected op (the agent asks for a correct number); its amount is not an event.
+        if not phones and any(i.get('reason') == 'broken_phone' for i in cls.get('ignored') or []):
+            events.append(('name', mid))
+            continue
         # Fallback: only when Python parsed nothing for this message. Prefer the id-keyed
         # map (survives the DB-authoritative re-fetch that replaces the item list) and fall
         # back to an inline `amount` on the item (no-conversation path).
