@@ -30,6 +30,7 @@ REROUTE_TTL = 24 * 3600
 MULTI_KEY = 'qurtoba:multi_pending:{conv}'       # «تقصد X لكل رقم ولا تقسيمه؟» waiting for its answer
 NONCASH_KEY = 'qurtoba:noncash_pending:{conv}'   # «أي حساب فورى؟ 1) … 2) …» waiting for its answer
 LIST_KEY = 'qurtoba:list_confirm:{conv}'         # «تأكيد المطابقة» for a positional list, waiting for أيوة/لأ
+CORRECTION_KEY = 'qurtoba:correction_pending:{conv}'   # «تقصد تحويل X على الرقم ده؟ ابعت حول» waiting for حول
 PENDING_TTL = 3600
 
 
@@ -384,9 +385,10 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     fallback_amounts: Dict[str, float] = {}
     accounts = _registered_accounts(partner)
 
-    # answers to a pending «أي حساب؟» / «المبلغ لـ فورى …؟» / «لكل رقم ولا تقسيم؟»
+    # answers to a pending «أي حساب؟» / «المبلغ لـ فورى …؟» / «لكل رقم ولا تقسيم؟» / «ابعت حول»
     noncash_pending = cache_get(NONCASH_KEY.format(conv=conv_key))
     multi_pending = cache_get(MULTI_KEY.format(conv=conv_key))
+    correction_pending = cache_get(CORRECTION_KEY.format(conv=conv_key))
 
     for mid, m in list(rows.items()):
         text = _text_of(m)
@@ -402,6 +404,19 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             pre_replies.append((mid, R.INSTAPAY))
             pre_consume.append(mid)
             continue
+        if correction_pending and mid in (route.get('batch_ids') or []) and not cls['phones'] and not cls['amounts']:
+            if L.is_yes(text):
+                pre_items.append({'type': 'كاش', 'value': float(correction_pending['value']),
+                                  'account_number': correction_pending['account_number'],
+                                  'source_message_id': correction_pending['source_message_id']})
+                pre_consume += [mid, correction_pending.get('correction_of')]
+                cache_delete(CORRECTION_KEY.format(conv=conv_key)); correction_pending = None
+                continue
+            if L.is_no(text):
+                pre_replies.append((mid, R.CORRECTION_DECLINED))
+                pre_consume += [mid, correction_pending.get('correction_of'), correction_pending.get('source_message_id')]
+                cache_delete(CORRECTION_KEY.format(conv=conv_key)); correction_pending = None
+                continue
         if multi_pending and mid in (route.get('batch_ids') or []) and not cls['phones']:
             if L.PER_NUMBER.search(t) or L.is_yes(text):
                 for ph in multi_pending['phones']:
@@ -501,11 +516,15 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                                  'asked': said_recently(conversation, mid, R.BAD_NUMBER, minutes=360)})
         orphan_phones = [{'message_id': o['message_id'], 'value': o['value'], 'at': rows[o['message_id']].created_at}
                          for o in plan['orphans'] if o.get('kind') == 'phone' and o.get('message_id') in rows]
-        corrections = match_corrections(orphan_phones, rejected)
-        if corrections:
-            done = {c['source_message_id'] for c in corrections}
-            plan['orphans'] = [o for o in plan['orphans'] if o.get('message_id') not in done]
-            log('correction', conversation, items=[(c['account_number'], c['value']) for c in corrections])
+        for c in match_corrections(orphan_phones, rejected):
+            # Owner decision 2026-09-06: confirm first — «تقصد تحويل X على الرقم ده؟ ابعت «حول»» —
+            # then «حول» creates it instantly (handled in the pre-pass above, no model).
+            plan['orphans'] = [o for o in plan['orphans'] if o.get('message_id') != c['source_message_id']]
+            cache_set(CORRECTION_KEY.format(conv=conv_key), {**c, 'ts': time.time()}, PENDING_TTL)
+            if send_quoted(conversation, c['source_message_id'],
+                           R.CORRECTION_CONFIRM.format(amount=R._fmt(c['value']), phone=c['account_number'])):
+                summary['replies'] += 1
+            log('correction_asked', conversation, phone=c['account_number'], value=c['value'])
 
     reroute = cache_get(REROUTE_KEY.format(conv=conv_key))
     if reroute and not _reroute_still_valid(conversation, partner, reroute):
@@ -565,7 +584,7 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     if decision['clear_repeats']:
         _clear_repeat_pending(conversation)
 
-    items = pre_items + corrections + [i for i in decision['items']]
+    items = pre_items + [i for i in decision['items']]
     created_result = None
     held_items: List[Dict[str, Any]] = []
     created_items: List[Dict[str, Any]] = []
@@ -577,9 +596,7 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                                                           replies_enabled=replies_enabled)
         if decision['reroute_used'] and created_result.get('success'):
             cache_delete(REROUTE_KEY.format(conv=conv_key))
-        if corrections and created_result.get('success'):
-            consume(conversation, [c['correction_of'] for c in corrections])   # the rejected message is settled
-        elif created_items:
+        if created_items:
             # «The expectation expires: any other transaction since → a bare number is a normal op.»
             # The customer moved on — a rejected message older than what was just created is retired,
             # so a later bare number can never pick up its amount by mistake.
@@ -589,6 +606,7 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                      and m.created_at < newest_created and _broken_number_amount(_text_of(m))]
             if stale:
                 consume(conversation, stale)
+                cache_delete(CORRECTION_KEY.format(conv=conv_key))
                 log('correction_expired', conversation, mids=[x[:8] for x in stale])
 
     for mid, text in decision['replies']:

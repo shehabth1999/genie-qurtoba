@@ -419,3 +419,14 @@ class CorrectedNumberTests(SimpleTestCase):
         self.assertEqual(match_corrections([{'message_id': 'n', 'value': '01060134646', 'at': 10}],
                                            [{'message_id': 'b', 'amount': 2000.0, 'at': 5, 'asked': True},
                                             {'message_id': 'c', 'amount': 500.0, 'at': 6, 'asked': True}]), [])
+
+
+class CorrectionConfirmTests(SimpleTestCase):
+
+    def test_hawel_is_a_yes_and_the_line_reads_well(self):
+        from qurtoba.automation import replies as R
+        self.assertTrue(L.is_yes('حول'))
+        self.assertTrue(L.is_yes('حول يا باشا'))
+        self.assertFalse(L.is_yes('حول 500'))
+        self.assertEqual(R.CORRECTION_CONFIRM.format(amount='2,000', phone='01060134646'),
+                         'الرقم اللي فات كان غلط 🙏\nتقصد تحويل 2,000 على الرقم ده 01060134646؟\nلو أيوة ابعت «حول» وننفذها فوراً.')
