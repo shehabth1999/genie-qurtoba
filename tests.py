@@ -435,3 +435,24 @@ class LayoutNotMeaningTests(SimpleTestCase):
         for t in ('01012345678\n500', '01012345678 500', '01012345678\n5000\nعاصم كاش محمد سعد الرباط', '01012345678 كاش 500',
                   '01012345678\n500 جنيه\nطارق', 'رقم المستلم: 01090878331\nالقيمة: 15,014'):
             self.assertFalse(_number_inside_prose(t, _classify_message(t)), t)
+
+
+class ThousandAndTests(SimpleTestCase):
+    """2026-09-06 live: «27 ألف و 700» was created as 27 pounds. «X ألف و Y» = X×1000 + Y."""
+
+    def test_thousand_and_rest(self):
+        from qurtoba.tools._amounts import normalize_amount
+        cases = {'27 ألف و 700': 27700, '70 ألف و 225': 70225, '20 ألف و 625': 20625, '41 ألف و 400': 41400,
+                 '33 ألف و 100': 33100, '46 ألف و 10': 46010, 'الفين و 500': 2500, '3 آلاف و نص': 3500,
+                 '50 ألف': 50000, '٢٧ ألف و ٧٠٠': 27700, '27الف و700': 27700}
+        for text, value in cases.items():
+            r = normalize_amount(text)
+            self.assertTrue(r['ok'], text)
+            self.assertEqual(r['value'], value, text)
+
+    def test_live_messages_pair_correctly(self):
+        for text, value in {'01009659589\n27 ألف و 700\n💰كاش🔟 - جنى(112)': 27700,
+                            '01080658932\n70 ألف و 225\n💰كاش🔟 - خيرى(173)': 70225,
+                            '01148485123\n50 ألف \n💰كاش🔟 - وفا(843)': 50000}.items():
+            cls = _classify_message(text)
+            self.assertEqual(cls['amounts'], [value], text)

@@ -54,6 +54,26 @@ def _arabic_normalize(s: str) -> str:
     return s.replace('ى', 'ي').replace('ـ', '')
 
 
+_THOUSAND_AND_RE = re.compile(
+    r'(?P<count>\d+(?:[.,]\d+)?)?\s*(?P<word>' + '|'.join(sorted(_THOUSAND_FORMS | _THOUSAND_DUAL, key=len, reverse=True)) +
+    r')\s*و\s*(?P<rest>\d{1,3}(?![\d.,])|نص|ربع|تلت)\b')
+
+
+def _fold_thousand_and(s: str) -> str:
+    """«27 الف و 700» → «27700», «الفين و 500» → «2500», «3 الاف و نص» → «3500». Only a rest
+    under 1,000 (or نص/ربع/تلت) folds; anything else is left for the normal path."""
+    def _sub(m):
+        word = m.group('word')
+        count = m.group('count')
+        base = 2000 if word in _THOUSAND_DUAL else (float(count.replace(',', '.')) if count else 1) * 1000
+        rest = m.group('rest')
+        rest_v = {'نص': 500, 'ربع': 250, 'تلت': 333}.get(rest)
+        if rest_v is None:
+            rest_v = int(rest)
+        return str(int(base + rest_v))
+    return _THOUSAND_AND_RE.sub(_sub, s)
+
+
 def normalize_amount(raw: Any) -> Dict[str, Any]:
     """Normalize a written amount to a positive float.
 
@@ -90,6 +110,11 @@ def normalize_amount(raw: Any) -> Dict[str, Any]:
     if not s:
         out['reason'] = 'empty'
         return out
+
+    # «X ألف و Y» = X×1000 + Y — the office's everyday form («27 ألف و 700» = 27,700, «الفين و 500» =
+    # 2,500, «3 آلاف و نص» = 3,500). Folded into ONE number up front; without this the two numbers
+    # were read as two amounts (2026-09-06: «27 ألف و 700» became a 27-pound transfer + «الرقم للمبلغ 700؟»).
+    s = _fold_thousand_and(s)
 
     # A minus glued to a digit ("-500", "1-6") is never a valid transfer amount —
     # the later `[^0-9.,]`→space strip would silently swallow the sign and turn
