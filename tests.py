@@ -141,7 +141,7 @@ from qurtoba.automation import lexicon as L  # noqa: E402
 from qurtoba.automation.arabic_numbers import parse_arabic_amount  # noqa: E402
 from qurtoba.automation.router import batch_ids_from_input  # noqa: E402
 from qurtoba.automation.transfers import render_ai_summary, _is_noise_line, _broken_number_amount, match_corrections  # noqa: E402
-from qurtoba.automation.transfers import decide, resolve_noncash, _multi_number  # noqa: E402
+from qurtoba.automation.transfers import decide, _number_inside_prose  # noqa: E402
 
 
 class LexiconTests(SimpleTestCase):
@@ -201,7 +201,7 @@ class TransferDecisionTests(SimpleTestCase):
         self.assertEqual([r[0] for r in d['replies']], ['m4', 'm6'])
         self.assertIn('01023551947 ← 20,200', d['replies'][0][1])
         self.assertEqual(d['replies'][1][1], 'المبلغ لـ 01127969725؟')
-        self.assertEqual(d['list_confirm'], {'phones': ['01023551947']})
+        self.assertEqual(d['list_confirm']['phones'], ['01023551947'])
 
     def test_orphan_phone_with_a_label_candidate_gets_a_targeted_question(self):
         plan = self._plan(orphans=[{'kind': 'phone', 'value': '01023551947', 'message_id': 'a'}],
@@ -229,7 +229,7 @@ class TransferDecisionTests(SimpleTestCase):
         self.assertEqual(d['replies'], [])
 
     def test_yes_and_no_to_a_repeat_question(self):
-        plan = self._plan(answers=[{'message_id': 'ans', 'text': 'أيوة كرر', 'kind': 'reply', 'about_phone': None}])
+        plan = self._plan(answers=[{'message_id': 'ans', 'text': 'أيوة', 'kind': 'reply', 'about_phone': None}])
         self.assertTrue(decide(plan, hv_threshold=1e5, repeat_pending=True, reroute=None, texts={})['confirm_repeats'])
         plan = self._plan(answers=[{'message_id': 'ans', 'text': 'لأ', 'kind': 'reply', 'about_phone': None}])
         d = decide(plan, hv_threshold=1e5, repeat_pending=True, reroute=None, texts={})
@@ -248,49 +248,6 @@ class TransferDecisionTests(SimpleTestCase):
         self.assertEqual(d['items'][0]['value'], 5.0)
         self.assertFalse(d['reroute_used'])
 
-    def test_amount_only_uses_the_single_registered_account(self):
-        plan = self._plan(orphans=[{'kind': 'amount', 'value': 500.0, 'message_id': 'a'}])
-        d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute=None, texts={}, accounts=[('فورى', '6081844')])
-        self.assertEqual(d['items'], [{'type': 'فورى', 'value': 500.0, 'account_number': '6081844', 'source_message_id': 'a'}])
-        d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute=None, texts={}, accounts=[('فورى', '111'), ('أمان', '222')])
-        self.assertEqual(d['items'], [])
-        self.assertIn('أي حساب؟', d['replies'][0][1])
-        self.assertEqual(d['pending']['amount'], 500.0)
-        d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute=None, texts={}, accounts=[])
-        self.assertEqual(d['replies'], [('a', 'الرقم للمبلغ 500؟')])
-
-
-class NonCashResolutionTests(SimpleTestCase):
-
-    def test_account_guard(self):
-        acc = [('فورى', '6081844'), ('أمان', '970604')]
-        self.assertEqual(resolve_noncash('1000 فوري', 'فورى', acc), {'item': {'type': 'فورى', 'value': 1000.0, 'account_number': '6081844'}})
-        self.assertEqual(resolve_noncash('فوري 6081844 700', 'فورى', acc)['item']['value'], 700.0)
-        self.assertIn('مسجل كحساب فورى وليس أمان', resolve_noncash('امان 6081844 500', 'أمان', acc)['reply'])
-        self.assertIn('غير مسجل', resolve_noncash('فوري 5555555 500', 'فورى', [('فورى', '6081844')])['reply'])
-        self.assertIn('لا يوجد حساب طاير', resolve_noncash('طاير 300', 'طاير', acc)['reply'])
-        r = resolve_noncash('فوري 700', 'فورى', [('فورى', '111'), ('فورى', '222')])
-        self.assertEqual(r['reply'], 'أي حساب فورى؟ 1) 111 2) 222')
-        self.assertEqual(r['pending']['amount'], 700.0)
-        self.assertEqual(resolve_noncash('فوري', 'فورى', [('فورى', '111')])['reply'], 'المبلغ لـ فورى 111؟')
-        self.assertEqual(resolve_noncash('الفين فوري', 'فورى', [('فورى', '111')])['item']['value'], 2000.0)
-
-    def test_multi_number_messages(self):
-        m = _multi_number('01012345678\n01098765432\n500 لكل رقم')
-        self.assertEqual((m['mode'], m['amount'], len(m['phones'])), ('each', 500.0, 2))
-        self.assertEqual(_multi_number('01012345678 01098765432 قسم 1000 عليهم')['mode'], 'split')
-        self.assertEqual(_multi_number('01012345678\n01098765432\n1000')['mode'], 'ask')
-        self.assertIsNone(_multi_number('01012345678\n500'))
-
-    def test_broken_phone_next_to_an_amount_is_never_routed_to_a_registered_account(self):
-        # 2026-09-06 test line: «0106001000 ⏎ 590» created فورى 590 to the registered account
-        plan = {'success': True, 'pairs': [], 'answers': [], 'ambiguous': [], 'needs_resend': False,
-                'orphans': [{'kind': 'amount', 'value': 590.0, 'message_id': 'a'}],
-                'ignored': [{'message_id': 'a', 'text': '0106001000', 'reason': 'broken_phone'}]}
-        d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute=None, texts={}, accounts=[('فورى', '2924523')])
-        self.assertEqual(d['items'], [])
-        self.assertEqual(d['replies'], [('a', 'الرقم ده مش صحيح — ابعت رقم صحيح 11 رقم')])
-
 
 class RepeatHoldTests(SimpleTestCase):
     """2026-09-06 test line: a held same-day repeat was re-submitted on every turn and re-asked."""
@@ -308,7 +265,7 @@ class RepeatHoldTests(SimpleTestCase):
         self.assertEqual(d['replies'], [])
 
     def test_no_drops_the_held_pair_and_yes_leaves_it_to_the_tool(self):
-        no = [{'message_id': 'a', 'text': 'لا تجاهل', 'kind': 'reply', 'about_phone': '01118696547'}]
+        no = [{'message_id': 'a', 'text': 'لا', 'kind': 'reply', 'about_phone': '01118696547'}]
         d = decide(self._plan(no), hv_threshold=1e5, repeat_pending=self.HELD, reroute=None, texts={})
         self.assertTrue(d['clear_repeats'])
         self.assertEqual(d['items'], [])
@@ -451,4 +408,30 @@ class AdversarialFixTests(SimpleTestCase):
         cls = _classify_message('01012345678\n01012345678\n800')
         self.assertEqual(cls['phones'], ['01012345678'])
         self.assertEqual(cls['amounts'], [800])
-        self.assertIsNone(_multi_number('01012345678\n01012345678\n800'))
+
+
+class MeaningGoesToTheModelTests(SimpleTestCase):
+
+    def test_only_a_bare_word_is_a_yes_or_no_for_python(self):
+        for t in ('حول', 'أيوة', 'تأكيد', 'لا', 'بلاش'):
+            self.assertTrue(L.is_bare_yes(t) or L.is_bare_no(t), t)
+        for t in ('تمام يا معلم اعملها', 'لا مش عايز اكررها', 'ايوه بس خليها 300', 'ماشي نفذها ربنا يخليك'):
+            self.assertFalse(L.is_bare_yes(t) or L.is_bare_no(t), t)
+
+    def test_a_worded_reply_to_our_question_goes_to_the_model(self):
+        plan = {'success': True, 'pairs': [], 'orphans': [], 'ambiguous': [], 'ignored': [], 'needs_resend': False,
+                'answers': [{'message_id': 'a', 'text': 'تمام يا معلم اعملها', 'kind': 'reply', 'about_phone': '01012345678',
+                             'question_text': 'تحب أكررها؟'}]}
+        d = decide(plan, hv_threshold=1e5, repeat_pending={'x': {'account_number': '01012345678', 'value': 500.0}}, reroute=None, texts={})
+        self.assertFalse(d['confirm_repeats'])
+        self.assertEqual([t['message_id'] for t in d['to_model']], ['a'])
+
+
+class LayoutNotMeaningTests(SimpleTestCase):
+
+    def test_number_inside_prose_goes_to_the_model_but_order_layouts_do_not(self):
+        for t in ('انا بعت لـ 01012345678 امبارح 500 وصلت؟', '01012345678 500 ده اتحول ولا لسه', 'ابعت 500 على 01012345678 لو سمحت'):
+            self.assertTrue(_number_inside_prose(t, _classify_message(t)), t)
+        for t in ('01012345678\n500', '01012345678 500', '01012345678\n5000\nعاصم كاش محمد سعد الرباط', '01012345678 كاش 500',
+                  '01012345678\n500 جنيه\nطارق', 'رقم المستلم: 01090878331\nالقيمة: 15,014'):
+            self.assertFalse(_number_inside_prose(t, _classify_message(t)), t)

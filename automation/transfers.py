@@ -27,8 +27,6 @@ from .context import (alert_human, asked_recently, cache_delete, cache_get, cach
 
 REROUTE_KEY = 'qurtoba:reroute_owed:{conv}'      # set by tasks._send_reroute_ask / _send_cancel_notice
 REROUTE_TTL = 24 * 3600
-MULTI_KEY = 'qurtoba:multi_pending:{conv}'       # «تقصد X لكل رقم ولا تقسيمه؟» waiting for its answer
-NONCASH_KEY = 'qurtoba:noncash_pending:{conv}'   # «أي حساب فورى؟ 1) … 2) …» waiting for its answer
 LIST_KEY = 'qurtoba:list_confirm:{conv}'         # «تأكيد المطابقة» for a positional list, waiting for أيوة/لأ
 CORRECTION_KEY = 'qurtoba:correction_pending:{conv}'   # «تقصد تحويل X على الرقم ده؟ ابعت حول» waiting for حول
 PENDING_TTL = 3600
@@ -50,7 +48,7 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
     replies: List[tuple] = []
     consumed: List[str] = []
     out = {'items': items, 'replies': replies, 'confirm_repeats': False, 'clear_repeats': False,
-           'consume': consumed, 'reroute_used': False, 'pending': None, 'list_confirm': None}
+           'consume': consumed, 'reroute_used': False, 'pending': None, 'list_confirm': None, 'to_model': []}
     if not plan or not plan.get('success'):
         return out
     accounts = accounts or []
@@ -94,7 +92,7 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
             continue
         if kind == 'amount_reply' and a.get('applied_to'):
             continue                                   # already folded into its pair
-        if L.is_yes(text):
+        if L.is_bare_yes(text):
             if repeat_pending:
                 out['confirm_repeats'] = True          # «تحب أكررها؟» → أيوة (the tool creates it)
                 no_phones.update(held_phones)          # …so this turn must not create it again
@@ -104,7 +102,7 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
             elif phone:
                 yes_phones.add(phone)                  # «تأكيد» on a held high value / a list pairing
             consumed.append(a['message_id'])
-        elif L.is_no(text):
+        elif L.is_bare_no(text):
             if repeat_pending:
                 out['clear_repeats'] = True
                 no_phones.update(held_phones)          # dropped: never re-submit the held pair
@@ -120,9 +118,8 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
         elif kind == 'amount_reply' and a.get('value') is not None and not a.get('applied_to'):
             continue                                   # the planner will have re-paired it next turn
         else:
-            # «رديت بـ«100 ج» على تأكيد الـ100,000 — قصدك …؟» — ask ONCE, on the reply itself.
-            q = (a.get('question_text') or '')[:40]
-            replies.append((a['message_id'], R.UNCLEAR_ANSWER.format(text=text[:30], question=q)))
+            # a reply in the customer's own words → meaning → the model decides (answer_pending)
+            out['to_model'].append({'message_id': a['message_id'], 'text': text, 'question': (a.get('question_text') or '')[:60]})
 
     # Reroute answer: «the partner's next BARE phone number is the answer → create the owed
     # amount + the new number as a brand-new transaction». A phone WITH an amount is never it.
@@ -162,7 +159,9 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
         # ONE question for the whole positional list, quoted on its first number message.
         lines = [R.LIST_CONFIRM_HEADER] + [f"{p['account_number']} ← {R._fmt(p['value'])}" for p in to_confirm] + [R.LIST_CONFIRM_TAIL]
         replies.append((to_confirm[0].get('source_message_id'), '\n'.join(lines)))
-        out['list_confirm'] = {'phones': [p['account_number'] for p in to_confirm]}
+        out['list_confirm'] = {'phones': [p['account_number'] for p in to_confirm],
+                               'pairs': [{'account_number': p['account_number'], 'value': p['value'],
+                                          'source_message_id': p.get('source_message_id')} for p in to_confirm]}
 
     answered_mids = {a.get('message_id') for a in plan.get('answers') or []}
     for o in plan.get('orphans') or []:
@@ -184,17 +183,6 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
         else:
             if mid in broken_phone_mids:
                 replies.append((mid, R.BAD_NUMBER))
-                continue
-            if no_phone_anywhere and len(accounts) == 1:
-                ty, acc = accounts[0]
-                items.append({'type': ty, 'value': float(val), 'account_number': acc, 'source_message_id': mid})
-                continue
-            if no_phone_anywhere and len(accounts) > 1 and out['pending'] is None:
-                options = ' '.join(f'{i}) {ty} {n}' for i, (ty, n) in enumerate(accounts, 1))
-                replies.append((mid, R.WHICH_ACCOUNT_ANY.format(options=options)))
-                out['pending'] = {'amount': float(val), 'options': [n for _t, n in accounts],
-                                  'types': {n: ty for ty, n in accounts}, 'message_id': mid}
-                consumed.append(mid)
                 continue
             replies.append((mid, R.ORPHAN_AMOUNT.format(amount=R._fmt(val))))
 
@@ -275,89 +263,6 @@ def _text_of(m) -> str:
     return str(c.get('text') or c.get('transcription') or '')
 
 
-def _registered_accounts(partner) -> List[tuple]:
-    """[(type, number)] registered for the customer (فورى/أمان/طاير)."""
-    customer = getattr(partner, 'qurtoba_customer', None)
-    if customer is None:
-        return []
-    try:
-        rows = list(customer.account_entries.all().order_by('type', 'account_number'))
-        if rows:
-            return [(r.type, str(r.account_number)) for r in rows]
-        from qurtoba.models import _parse_accounts
-        return [(t, str(n)) for t, n in _parse_accounts(customer.accounts or '')]
-    except Exception:
-        return []
-
-
-def resolve_noncash(text: str, type_name: str, accounts: List[tuple], pending: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Pure. A فورى/أمان/طاير request → {'item': {...}} or {'reply': text} (+ 'pending' to store).
-
-    Rules (fawry prompt ACCOUNT GUARD / MISSING ACCOUNT): the account must match a
-    registered one EXACTLY under the SAME type; type given + account missing → the
-    only registered account of that type, or ask which; a registered account under
-    another type → the wrong-type line.
-    """
-    t = L.norm(text)
-    digits = [d for d in _digit_runs(t)]
-    of_type = [(ty, n) for ty, n in accounts if ty == type_name]
-    numbers = {n: ty for ty, n in accounts}
-    account = next((d for d in digits if d in numbers), None)
-    # Two numbers and one of them is a ≥5-digit run that matches no registered account →
-    # the customer typed an account we do not know («فوري 5555555 500»).
-    unknown_account = None
-    if account is None and len(digits) >= 2:
-        unknown_account = next((d for d in digits if len(d) >= 5 and not (len(d) == 11 and d.startswith('01'))), None)
-    amounts = [d for d in digits if d != account and d != unknown_account and not (len(d) == 11 and d.startswith('01'))]
-    # a spelled amount («الفين فورى»)
-    amount = None
-    if amounts:
-        from qurtoba.tools._amounts import normalize_amount
-        r = normalize_amount(amounts[-1])
-        amount = r['value'] if r.get('ok') and float(r['value']).is_integer() else None
-    if amount is None and _looks_like_spelled_amount(t):
-        amount = parse_arabic_amount(_strip_type_words(t))
-
-    if account is not None and numbers[account] != type_name:
-        return {'reply': R.WRONG_TYPE.format(account=account, registered_type=numbers[account], requested_type=type_name)}
-    if account is None:
-        if unknown_account is not None and of_type:
-            reg = '، '.join(f'{ty} {n}' for ty, n in of_type)
-            return {'reply': R.NOT_REGISTERED.format(account=unknown_account, registered=reg)}
-        if not of_type:
-            return {'reply': R.NO_ACCOUNT_OF_TYPE.format(type=type_name)}
-        if len(of_type) == 1:
-            account = of_type[0][1]
-        else:
-            options = ' '.join(f'{i}) {n}' for i, (_t, n) in enumerate(of_type, 1))
-            return {'reply': R.WHICH_ACCOUNT.format(type=type_name, options=options),
-                    'pending': {'type': type_name, 'amount': amount, 'options': [n for _t, n in of_type]}}
-    if amount is None:
-        return {'reply': R.NONCASH_AMOUNT_QUESTION.format(type=type_name, account=account),
-                'pending': {'type': type_name, 'account': account, 'amount': None}}
-    return {'item': {'type': type_name, 'value': float(amount), 'account_number': account}}
-
-
-def _digit_runs(t: str) -> List[str]:
-    import re
-    return [d.replace(',', '').replace('.', '') for d in re.findall(r'\d[\d.,]*', t)]
-
-
-def _strip_type_words(t: str) -> str:
-    import re
-    return re.sub(r'فوري|فورى|امان|طاير|fawry|aman', ' ', t)
-
-
-def _multi_number(text: str) -> Optional[Dict[str, Any]]:
-    """≥2 phones and ONE amount in one message → {phones, amount, mode} (mode: each / split / ask)."""
-    cls = _classify_message(text)
-    if len(cls['phones']) < 2 or len(cls['amounts']) != 1:
-        return None
-    t = L.norm(text)
-    mode = 'each' if L.PER_NUMBER.search(t) else 'split' if L.SPLIT.search(t) else 'ask'
-    return {'phones': cls['phones'], 'amount': cls['amounts'][0], 'mode': mode}
-
-
 # ── the run ──────────────────────────────────────────────────────────────────
 
 def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
@@ -382,12 +287,12 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     pre_replies: List[tuple] = []
     pre_consume: List[str] = []
     fallback_amounts: Dict[str, float] = {}
-    accounts = _registered_accounts(partner)
+    accounts: List[tuple] = []
 
-    # answers to a pending «أي حساب؟» / «المبلغ لـ فورى …؟» / «لكل رقم ولا تقسيم؟» / «ابعت حول»
-    noncash_pending = cache_get(NONCASH_KEY.format(conv=conv_key))
-    multi_pending = cache_get(MULTI_KEY.format(conv=conv_key))
+    # a pending «ابعت حول» question: a BARE «حول»/«أيوة»/«لا» is applied here; anything longer is
+    # meaning and reaches the model (it calls qurtoba_answer_pending).
     correction_pending = cache_get(CORRECTION_KEY.format(conv=conv_key))
+    to_model: List[Dict[str, Any]] = []
 
     for mid, m in list(rows.items()):
         text = _text_of(m)
@@ -399,83 +304,40 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                 pre_replies.append((mid, R.VOICE_CASH))
             pre_consume.append(mid)
             continue
-        if L.INSTAPAY.search(t):
+        if m.type != 'text':
+            continue
+        if L.INSTAPAY.search(t):                       # a product name we do not serve — never cash
             pre_replies.append((mid, R.INSTAPAY))
             pre_consume.append(mid)
             continue
-        if cls['phones'] and cls['amounts'] and L.is_question(text) and len(cls['phones']) == 1 and len(cls['amounts']) == 1:
-            # «انا بعت لـ 01… امبارح 500 وصلت؟» — a QUESTION with a number and an amount in it is not
-            # an order. Confirm first; «حول» creates it (2026-09-06 adversarial test X20 created it).
-            pre_replies.append((mid, R.QUESTION_CONFIRM.format(amount=R._fmt(cls['amounts'][0]), phone=cls['phones'][0])))
-            cache_set(CORRECTION_KEY.format(conv=conv_key),
-                      {'type': 'كاش', 'value': float(cls['amounts'][0]), 'account_number': cls['phones'][0],
-                       'source_message_id': mid, 'correction_of': None, 'ts': time.time()}, PENDING_TTL)
-            pre_consume.append(mid)
-            continue
         if correction_pending and mid in (route.get('batch_ids') or []) and not cls['phones'] and not cls['amounts']:
-            if L.is_yes(text):
-                pre_items.append({'type': 'كاش', 'value': float(correction_pending['value']),
+            if L.is_bare_yes(text):
+                pre_items.append({'type': correction_pending.get('type') or 'كاش', 'value': float(correction_pending['value']),
                                   'account_number': correction_pending['account_number'],
                                   'source_message_id': correction_pending['source_message_id']})
                 pre_consume += [x for x in (mid, correction_pending.get('correction_of')) if x]
                 cache_delete(CORRECTION_KEY.format(conv=conv_key)); correction_pending = None
                 continue
-            if L.is_no(text):
+            if L.is_bare_no(text):
                 pre_replies.append((mid, R.CORRECTION_DECLINED))
                 pre_consume += [x for x in (mid, correction_pending.get('correction_of'), correction_pending.get('source_message_id')) if x]
                 cache_delete(CORRECTION_KEY.format(conv=conv_key)); correction_pending = None
                 continue
-        if multi_pending and mid in (route.get('batch_ids') or []) and not cls['phones']:
-            if L.PER_NUMBER.search(t) or L.is_yes(text):
-                for ph in multi_pending['phones']:
-                    pre_items.append({'type': 'كاش', 'value': multi_pending['amount'], 'account_number': ph,
-                                      'source_message_id': multi_pending['message_id']})
-                cache_delete(MULTI_KEY.format(conv=conv_key)); multi_pending = None
-                pre_consume.append(mid)
-                continue
-            if L.SPLIT.search(t):
-                alert_human(conversation, partner, f'العميل يطلب تقسيم مبلغ {multi_pending["amount"]} على عدة أرقام {multi_pending["phones"]}')
-                pre_replies.append((mid, R.SPLIT_INFO))
-                cache_delete(MULTI_KEY.format(conv=conv_key)); multi_pending = None
-                pre_consume.append(mid)
-                continue
-        if noncash_pending and mid in (route.get('batch_ids') or []) and not cls['phones']:
-            chosen = _noncash_answer(text, noncash_pending)
-            if chosen is not None:
-                pre_items.append({**chosen, 'source_message_id': noncash_pending['message_id']})
-                cache_delete(NONCASH_KEY.format(conv=conv_key)); noncash_pending = None
-                pre_consume.append(mid)
-                continue
-        noncash = L.noncash_type(t)
-        if noncash:
-            res = resolve_noncash(text, noncash, accounts)
-            if res.get('item'):
-                pre_items.append({**res['item'], 'source_message_id': mid})
-            else:
-                pre_replies.append((mid, res['reply']))
-                if res.get('pending'):
-                    cache_set(NONCASH_KEY.format(conv=conv_key), {**res['pending'], 'message_id': mid}, PENDING_TTL)
+        if len(cls['phones']) >= 2 and len(cls['amounts']) == 1:
+            # several numbers with ONE amount: «لكل رقم» / «قسم» / a mistake — meaning → the model
+            to_model.append({'message_id': mid, 'kind': 'multi_number', 'text': text[:200]})
             pre_consume.append(mid)
             continue
-        multi = _multi_number(text)
-        if multi:
-            if multi['mode'] == 'each':
-                for ph in multi['phones']:
-                    pre_items.append({'type': 'كاش', 'value': multi['amount'], 'account_number': ph, 'source_message_id': mid})
-            elif multi['mode'] == 'split':
-                alert_human(conversation, partner, f'العميل يطلب تقسيم مبلغ {multi["amount"]} على عدة أرقام {multi["phones"]} [message_id: {mid}]')
-                pre_replies.append((mid, R.SPLIT_INFO))
-            else:
-                pre_replies.append((mid, R.PER_NUMBER_QUESTION.format(amount=R._fmt(multi['amount']))))
-                cache_set(MULTI_KEY.format(conv=conv_key), {'phones': multi['phones'], 'amount': multi['amount'], 'message_id': mid}, PENDING_TTL)
+        if cls['phones'] and cls['amounts'] and _number_inside_prose(text, cls):
+            # the number sits INSIDE a sentence («انا بعت لـ 01… امبارح 500 وصلت») — a layout the
+            # office never uses for an order; what the sentence means is the model's call
+            to_model.append({'message_id': mid, 'kind': 'sentence', 'text': text[:200]})
             pre_consume.append(mid)
             continue
-        if any(i.get('reason') == 'broken_phone' for i in cls.get('ignored') or []) and not cls['phones']:
-            continue                                   # a bad number keeps its (spelled) amount to itself
-        if not cls['amounts'] and _looks_like_spelled_amount(text):
-            words = text
-            for ph in cls['phones']:
-                words = words.replace(ph, ' ')
+        if not cls['amounts'] and len(cls['phones']) == 1 and _looks_like_spelled_amount(text):
+            # arithmetic on a closed vocabulary («خمسين الف»); anything the parser does not know stays
+            # for the model (it reads «الفين لكل رقم» and creates)
+            words = text.replace(cls['phones'][0], ' ')
             val = parse_arabic_amount(words)
             if val:
                 fallback_amounts[mid] = float(val)
@@ -553,13 +415,16 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             continue
         text = _text_of(m)
         cls = _classify_message(text)
-        if hv_phone and not cls['phones'] and len(cls['amounts']) == 1 and not (L.is_yes(text) or L.is_no(text)):
+        waiting = bool(repeat_pending or list_pending or hv_phone)
+        if hv_phone and not cls['phones'] and len(cls['amounts']) == 1 and not (L.is_bare_yes(text) or L.is_bare_no(text)):
             # «100 ج» to the high-value hold (its line carries no «؟», so the planner does not see an answer)
             plan.setdefault('answers', []).append({'message_id': mid, 'text': text, 'kind': 'amount_reply',
                                                    'value': float(cls['amounts'][0]), 'about_phone': hv_phone,
                                                    'about_message_id': hv_src, 'question_text': R.HIGH_VALUE})
             continue
-        if not (L.is_yes(text) or L.is_no(text)):
+        if not (L.is_bare_yes(text) or L.is_bare_no(text)):
+            if waiting and not cls['phones'] and not cls['amounts']:
+                to_model.append({'message_id': mid, 'kind': 'pending_answer', 'text': text[:200]})
             continue
         # a yes/no quoted on ANOTHER customer message is about that message, not our question
         q = getattr(m, 'reply_to', None)
@@ -585,11 +450,8 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         cache_set(LIST_KEY.format(conv=conv_key), {**decision['list_confirm'], 'ts': time.time()}, PENDING_TTL)
     elif list_pending:
         cache_delete(LIST_KEY.format(conv=conv_key))
-    if decision.get('pending'):
-        pend = decision['pending']
-        cache_set(NONCASH_KEY.format(conv=conv_key),
-                  {'type': None, 'amount': pend['amount'], 'options': pend['options'], 'types': pend['types'],
-                   'message_id': pend['message_id']}, PENDING_TTL)
+    for tm in decision.get('to_model') or []:
+        to_model.append({'message_id': tm['message_id'], 'kind': 'pending_answer', 'text': tm['text'][:200]})
 
     if decision['confirm_repeats']:
         call_tool(conversation, partner, qurtoba_confirm_pending_repeats)
@@ -634,6 +496,10 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                           'suggested_reply': R.HIGH_VALUE})
     for rj in summary.pop('_rejected', []):
         leftovers.append({**rj, 'text': (_text_of(rows[rj['message_id']]) if rj.get('message_id') in rows else '')[:80]})
+    for tm in to_model:
+        if not any(l.get('message_id') == tm['message_id'] for l in leftovers):
+            leftovers.append({'message_id': tm['message_id'], 'kind': tm['kind'], 'text': tm['text'],
+                              'suggested_reply': ''})
 
     # Everything the customer wrote that the money path did not settle goes to the AI.
     # Python judges nothing here: only a bare single word / punctuation / emoji is dropped.
@@ -662,11 +528,35 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         'others': others,
         'needs_ai': bool(leftovers or others),
     })
+    try:
+        from .pending import describe
+        summary['pending'] = describe(conversation)
+    except Exception:
+        summary['pending'] = []
     summary['summary'] = render_ai_summary(summary)
     log('transfers', conversation, items=summary['items'], replies=summary['replies'], needs_ai=summary['needs_ai'],
         leftovers=[l['kind'] for l in leftovers] or None, others=len(others) or None,
         pairs=len(plan.get('pairs') or []), orphans=len(plan.get('orphans') or []))
     return summary
+
+
+_LAYOUT_OK_WORDS = {'كاش', 'فودافون', 'اتصالات', 'اورانج', 'وي', 'محفظه', 'جنيه', 'جنيها', 'ج', 'م', 'مصري',
+                    'الف', 'الاف', 'مبلغ', 'المبلغ', 'رقم', 'الرقم', 'القيمه', 'قيمه', 'حواله', 'تحويل', 'فوري', 'امان', 'طاير'}
+
+
+def _number_inside_prose(text: str, cls: Dict[str, Any]) -> bool:
+    """Layout, not meaning: the phone shares its LINE with two or more words that are not
+    money/wallet words («انا بعت لـ 01… امبارح 500 وصلت»). A number on its own line, or with
+    just the amount / a wallet word / one name, is the office's order format."""
+    import re
+    for raw in str(text or '').splitlines():
+        line = L.norm(raw)
+        if not any(ph[-9:] in re.sub(r'\D', '', line) for ph in cls['phones']):
+            continue
+        words = [w for w in re.findall(r'[a-z\u0600-\u06ff]+', line) if w not in _LAYOUT_OK_WORDS and len(w) > 1]
+        if len(words) >= 2:
+            return True
+    return False
 
 
 def _python_replies_enabled() -> bool:
@@ -694,11 +584,24 @@ def render_ai_summary(summary: Dict[str, Any]) -> str:
     if created:
         lines.append('CREATED by the system this turn (👍 already sent — say NOTHING about them):')
         lines += [f"  - {c.get('type')} {R._fmt(c.get('value'))} → {c.get('account_number')}" for c in created]
+    pend = summary.get('pending') or []
+    if pend:
+        lines.append('PENDING — the system is HOLDING a transfer behind a yes/no it asked (settle it with qurtoba_answer_pending, never the create tool):')
+        lines += pend
     lo = summary.get('leftovers') or []
     if lo:
-        lines.append('OPEN ITEMS — each needs ONE quoted reply on its message_id (suggested wording given; keep it or adapt it, never invent an amount):')
+        lines.append('OPEN ITEMS — each needs YOUR decision on its message_id:')
         for l in lo:
-            lines.append(f"  - [message_id: {l.get('message_id')}] kind={l.get('kind')} «{l.get('text')}» → suggested: «{l.get('suggested_reply')}»")
+            k = l.get('kind')
+            if k == 'multi_number':
+                hint = 'several numbers with ONE amount — read it: the same amount to each (create one item per number), a split (alert a human), or unclear (ask)'
+            elif k == 'sentence':
+                hint = 'a number and an amount INSIDE a sentence — read it: a status question (check_transaction_status), an order (create it), or unclear (ask)'
+            elif k == 'pending_answer':
+                hint = "the customer's reply to the PENDING question above — decide yes or no and call qurtoba_answer_pending"
+            else:
+                hint = f"suggested: «{l.get('suggested_reply')}»"
+            lines.append(f"  - [message_id: {l.get('message_id')}] kind={k} «{l.get('text')}» → {hint}")
     ot = summary.get('others') or []
     if ot:
         lines.append('OTHER MESSAGES from the customer this turn (not money — understand and answer them):')
@@ -706,44 +609,6 @@ def render_ai_summary(summary: Dict[str, Any]) -> str:
     if not lines:
         lines.append('Nothing open: every message was a clean transfer and is created.')
     return '\n'.join(lines)
-
-
-def _noncash_answer(text: str, pending: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The customer's reply to «أي حساب …؟ 1) … 2) …» or «المبلغ لـ فورى …؟»."""
-    t = L.norm(text)
-    digits = _digit_runs(t)
-    if pending.get('options'):
-        chosen = None
-        for d in digits:
-            if d in pending['options']:
-                chosen = d
-            elif d.isdigit() and 1 <= int(d) <= len(pending['options']) and len(d) == 1:
-                chosen = pending['options'][int(d) - 1]
-        if chosen is None:
-            return None
-        amount = pending.get('amount')
-        if amount is None:
-            others = [d for d in digits if d != chosen and not (len(d) == 1)]
-            if others:
-                from qurtoba.tools._amounts import normalize_amount
-                r = normalize_amount(others[-1]); amount = r['value'] if r.get('ok') else None
-        if amount is None:
-            return None
-        ty = pending.get('type') or (pending.get('types') or {}).get(chosen)
-        if not ty:
-            return None
-        return {'type': ty, 'value': float(amount), 'account_number': chosen}
-    if pending.get('account') and pending.get('amount') is None:
-        from qurtoba.tools._amounts import normalize_amount
-        val = None
-        if digits:
-            r = normalize_amount(digits[-1]); val = r['value'] if r.get('ok') and float(r['value']).is_integer() else None
-        if val is None and _looks_like_spelled_amount(t):
-            val = parse_arabic_amount(t)
-        if val is None:
-            return None
-        return {'type': pending['type'], 'value': float(val), 'account_number': pending['account']}
-    return None
 
 
 def _replied_on(conversation, message_id, *, minutes: int = 360) -> bool:

@@ -95,7 +95,7 @@ PER_NUMBER = _rx([r'\bلكل رقم\b', r'\bلكل واحد\b', r'\bكل رقم\
 FAWRY = _rx([r'\bفوري\b', r'\bفوى\b', r'\bfawry\b', r'\bفورى\b'])
 AMAN = _rx([r'\bامان\b', r'\baman\b'])
 TAYER = _rx([r'\bطاير\b', r'\bطايره\b'])
-INSTAPAY = _rx([r'انستا ?باي', r'instapay', r'insta ?pay', r'\bipn\b', r'\bانستاباى\b'])
+INSTAPAY = _rx([r'انستا', r'instapay', r'insta ?pay', r'\bipn\b', r'\binsta\b'])   # a product name, not meaning
 
 NONCASH_TYPES = (('فورى', FAWRY), ('أمان', AMAN), ('طاير', TAYER))
 
@@ -143,6 +143,18 @@ def is_no(text: str) -> bool:
     if not words or len(words) > _ANSWER_MAX_WORDS:
         return False
     return any(w in _NO_WORDS for w in words) and not any(w in _YES_WORDS for w in words)
+
+
+def is_bare_yes(text: str) -> bool:
+    """ONE word that is a yes («حول», «أيوة», «تأكيد») — the only yes Python applies itself;
+    anything longer is meaning and goes to the model."""
+    words = _answer_words(text)
+    return len(words) == 1 and words[0] in _YES_WORDS
+
+
+def is_bare_no(text: str) -> bool:
+    words = _answer_words(text)
+    return len(words) == 1 and words[0] in _NO_WORDS
 
 
 _WAW_RE = re.compile(r'(?<!\S)و(?=\S)')

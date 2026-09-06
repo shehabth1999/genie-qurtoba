@@ -254,6 +254,39 @@ def _check_type_allowed_for_account(conversation, effective_type: str):
     )
 
 
+def _registered_accounts(customer):
+    """[(type, number)] registered for the customer (rows first, CSV fallback)."""
+    try:
+        rows = list(customer.account_entries.all().order_by('type', 'account_number'))
+        if rows:
+            return [(r.type, str(r.account_number).strip()) for r in rows]
+        from qurtoba.models import _parse_accounts
+        return [(t, str(n).strip()) for t, n in _parse_accounts(getattr(customer, 'accounts', '') or '')]
+    except Exception:
+        return []
+
+
+def _noncash_account_guard(customer, type_name: str, account: Optional[str]):
+    """None when `account` is registered under `type_name`; else the rejection dict with the
+    office's line (no account of that type / not registered / registered under another type)."""
+    accounts = _registered_accounts(customer)
+    of_type = [n for t, n in accounts if t == type_name]
+    acc = str(account or '').strip()
+    if not of_type:
+        return {'success': False, 'error_type': 'no_account_of_type',
+                'error': f'لا يوجد حساب {type_name} مسجل لهذا العميل. تواصل مع إدارة قرطبة لإضافة الحساب أولاً.'}
+    if acc in of_type:
+        return None
+    other = next((t for t, n in accounts if n == acc), None)
+    if other:
+        return {'success': False, 'error_type': 'wrong_type',
+                'error': (f'الرقم {acc} مسجل كحساب {other} وليس {type_name}. للتنفيذ كـ{other} أكّد، '
+                          f'أو تواصل مع الإدارة لإضافة حساب {type_name}.')}
+    registered = '، '.join(f'{type_name} {n}' for n in of_type)
+    return {'success': False, 'error_type': 'not_registered',
+            'error': f'الحساب {acc} غير مسجل. الحساب المسجل: {registered}. لإضافة حساب جديد تواصل مع إدارة قرطبة.'}
+
+
 def _normalize_cash_bracket(type: str, amount: float) -> str:
     """
     The four كاش variants are amount BRACKETS (filters), not commissions:
@@ -640,6 +673,13 @@ def _create_one_debt(
             'error': disabled_msg,
             'disabled_type': type,
         }
+
+    # ACCOUNT GUARD (فورى / أمان / طاير): the account must be registered for this customer
+    # under the SAME type — the last gate before money leaves, owned by the tool, not a prompt.
+    if not is_cash and type in ('فورى', 'أمان', 'طاير') and not override_grade_limit:
+        guard = _noncash_account_guard(customer, type, final_account)
+        if guard is not None:
+            return guard
 
     # --- Source-message validation (B2) ---------------------------------------
     # The cited message MUST contain the destination phone. This catches the

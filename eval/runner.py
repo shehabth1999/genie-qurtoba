@@ -595,6 +595,11 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
     rows_by_turn: Dict[int, Any] = {}
     try:
         setup = scn.get('setup') or {}
+        # registered فورى/أمان/طاير accounts for this scenario ('فورى,6081844,أمان,970604')
+        from qurtoba.models import QurtobaCustomer, _sync_customer_accounts
+        QurtobaCustomer.objects.filter(pk=customer.pk).update(accounts=setup.get('accounts') or '')
+        customer.refresh_from_db()
+        _sync_customer_accounts(customer)
         if setup.get('prior_create'):
             from qurtoba.models import QurtobaRecord
             pc = setup['prior_create']

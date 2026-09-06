@@ -535,3 +535,79 @@ SCENARIOS += [
         'expect': {'final': {'creates': [{'account': P1, 'value': 2000}, {'account': P2, 'value': 2000}], 'forbid': SAFE}},
     },
 ]
+
+
+# ── Y. attack the word lists: same meaning, other words ────────────────────
+ACC = 'فورى,6081844,أمان,970604'
+SCENARIOS += [
+    # multi-number wording
+    {'id': 'Y1', 'title': 'y: «الفين على الاتنين»', 'turns': [{'text': f'{P1}\n{P2}\nالفين على الاتنين'}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 2000}, {'account': P2, 'value': 2000}], 'forbid': SAFE}}},
+    {'id': 'Y2', 'title': 'y: «كل واحد ياخد 500»', 'turns': [{'text': f'{P1}\n{P2}\nكل واحد ياخد 500'}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 500}, {'account': P2, 'value': 500}], 'forbid': SAFE}}},
+    {'id': 'Y3', 'title': 'y: «ابعت 700 للرقمين دول»', 'turns': [{'text': f'ابعت 700 للرقمين دول\n{P1}\n{P2}'}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 700}, {'account': P2, 'value': 700}], 'forbid': SAFE}}},
+    {'id': 'Y4', 'title': 'y: «نص نص» = تقسيم → لا تنفيذ، تنبيه', 'turns': [{'text': f'{P1}\n{P2}\n1000 نص نص'}],
+     'expect': {'final': {'no_records': True, 'tools': [{'name': 'alert_qurtoba_human', 'must': True}], 'forbid': SAFE}}},
+    {'id': 'Y5', 'title': 'y: «وزعهم بالتساوي» = تقسيم → لا تنفيذ', 'turns': [{'text': f'{P1}\n{P2}\n1000 وزعهم بالتساوي'}],
+     'expect': {'final': {'no_records': True, 'forbid': SAFE}}},
+    # non-cash wording
+    {'id': 'Y6', 'title': 'y: «حول 500 على الفوري بتاعي»', 'setup': {'accounts': ACC}, 'turns': [{'text': 'حول 500 على الفوري بتاعي'}],
+     'expect': {'final': {'creates': [{'account': '6081844', 'value': 500}], 'forbid': SAFE}}},
+    {'id': 'Y7', 'title': 'y: «فوررى 300» (typo)', 'setup': {'accounts': ACC}, 'turns': [{'text': 'فوررى 300'}],
+     'expect': {'final': {'creates': [{'account': '6081844', 'value': 300}], 'forbid': SAFE}}},
+    {'id': 'Y8', 'title': 'y: «Fawry 250»', 'setup': {'accounts': ACC}, 'turns': [{'text': 'Fawry 250'}],
+     'expect': {'final': {'creates': [{'account': '6081844', 'value': 250}], 'forbid': SAFE}}},
+    {'id': 'Y9', 'title': 'y: «امان 400» بدون همزة', 'setup': {'accounts': ACC}, 'turns': [{'text': 'امان 400'}],
+     'expect': {'final': {'creates': [{'account': '970604', 'value': 400}], 'forbid': SAFE}}},
+    {'id': 'Y10', 'title': 'y: «6081844 ⏎ 900» حساب فوري بدون كلمة النوع', 'setup': {'accounts': ACC}, 'turns': [{'text': '6081844\n900'}],
+     'expect': {'final': {'creates': [{'account': '6081844', 'value': 900}], 'no_records_type': 'كاش', 'forbid': SAFE}}},
+    # instapay wording
+    {'id': 'Y11', 'title': 'y: «على الانستا» → رفض', 'turns': [{'text': f'{P1}\n500 على الانستا'}],
+     'expect': {'final': {'no_records': True, 'forbid': SAFE}}},
+    {'id': 'Y12', 'title': 'y: «insta pay» → رفض', 'turns': [{'text': f'insta pay {P1} 500'}],
+     'expect': {'final': {'no_records': True, 'forbid': SAFE}}},
+    {'id': 'Y13', 'title': 'y: «IPN» → رفض', 'turns': [{'text': f'IPN\n{P1}\n500'}],
+     'expect': {'final': {'no_records': True, 'forbid': SAFE}}},
+    # yes / no wording
+    {'id': 'Y14', 'title': 'y: تكرار ثم «تمام يا معلم اعملها»', 'turns': [{'text': f'{P1}\n500'}, {'text': f'{P1}\n500', 'gap': 70}, {'text': 'تمام يا معلم اعملها', 'gap': 20}],
+     'expect': {'2': {'records_count': {'account': P1, 'value': 500, 'count': 1}, 'forbid': SAFE}}},
+    {'id': 'Y15', 'title': 'y: تكرار ثم «ماشي نفذها ربنا يخليك»', 'turns': [{'text': f'{P1}\n500'}, {'text': f'{P1}\n500', 'gap': 70}, {'text': 'ماشي نفذها ربنا يخليك', 'gap': 20}],
+     'expect': {'2': {'records_count': {'account': P1, 'value': 500, 'count': 1}, 'forbid': SAFE}}},
+    {'id': 'Y16', 'title': 'y: تكرار ثم «لا مش عايز اكررها» → لا تنفيذ', 'turns': [{'text': f'{P1}\n500'}, {'text': f'{P1}\n500', 'gap': 70}, {'text': 'لا مش عايز اكررها', 'gap': 20}],
+     'expect': {'2': {'no_records': True, 'forbid': SAFE}}},
+    {'id': 'Y17', 'title': 'y: تكرار ثم «انسى» → لا تنفيذ', 'turns': [{'text': f'{P1}\n500'}, {'text': f'{P1}\n500', 'gap': 70}, {'text': 'انسى', 'gap': 20}],
+     'expect': {'2': {'no_records': True, 'forbid': SAFE}}},
+    {'id': 'Y18', 'title': 'y: تكرار ثم «ايوه بس خليها 300» → لا تكرار الـ500', 'turns': [{'text': f'{P1}\n500'}, {'text': f'{P1}\n500', 'gap': 70}, {'text': 'ايوه بس خليها 300', 'gap': 20}],
+     'expect': {'2': {'no_creates': [{'account': P1, 'value': 500}], 'forbid': SAFE}}},
+    {'id': 'Y19', 'title': 'y: مبلغ كبير ثم «أكيد طبعا نفذ»', 'turns': [{'text': f'{P1}\n150000'}, {'text': 'أكيد طبعا نفذ', 'gap': 30}],
+     'expect': {'1': {'creates': [{'account': P1, 'value': 150000}], 'forbid': SAFE}}},
+    {'id': 'Y20', 'title': 'y: مبلغ كبير ثم «لأ خلاص كفاية» → لا تنفيذ', 'turns': [{'text': f'{P1}\n150000'}, {'text': 'لأ خلاص كفاية', 'gap': 30}],
+     'expect': {'1': {'no_records': True, 'forbid': SAFE}}},
+    {'id': 'Y21', 'title': 'y: تصحيح رقم ثم «yes please» → تنفيذ', 'turns': [{'text': '0106013464\n2000'}, {'text': P1, 'gap': 20}, {'text': 'yes please', 'gap': 15}],
+     'expect': {'2': {'creates': [{'account': P1, 'value': 2000}], 'forbid': SAFE}}},
+    # question without a mark / order with a mark
+    {'id': 'Y22', 'title': 'y: سؤال بلا علامة «01… 500 ده اتحول» → لا تنفيذ', 'turns': [{'text': f'{P1} 500 ده اتحول ولا لسه'}],
+     'expect': {'final': {'no_records': True, 'forbid': SAFE}}},
+    {'id': 'Y23', 'title': 'y: أمر بعلامة «01… ⏎ 500 ⏎ ممكن؟» → ينفذ فوراً', 'turns': [{'text': f'{P1}\n500\nممكن؟'}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 500}], 'forbid': SAFE}}},
+    # fee / reference wording
+    {'id': 'Y24', 'title': 'y: «الرسوم عليا» → لا مبلغ ثاني', 'turns': [{'text': f'{P1}\n5000\nالرسوم عليا 15'}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 5000}], 'no_creates': [{'account': P1, 'value': 15}], 'forbid': SAFE}}},
+    {'id': 'Y25', 'title': 'y: «اتحمل الـ 20 بتوع الخدمة» → لا مبلغ ثاني', 'turns': [{'text': f'{P1}\n5000\nاتحمل الـ 20 بتوع الخدمة'}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 5000}], 'no_creates': [{'account': P1, 'value': 20}], 'forbid': SAFE}}},
+    {'id': 'Y26', 'title': 'y: «كود 4444» → ليس مبلغ', 'turns': [{'text': f'{P1}\n5000\nكود 4444'}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 5000}], 'no_creates': [{'account': P1, 'value': 4444}], 'forbid': SAFE}}},
+    # cancel wording
+    {'id': 'Y27', 'title': 'y: «خلاص متبعتش» بعد رقم بلا مبلغ → لا تنفيذ', 'turns': [{'text': P1}, {'text': 'خلاص متبعتش', 'gap': 5}, {'text': '700', 'gap': 10}],
+     'expect': {'2': {'no_creates': [{'account': P1, 'value': 700}], 'forbid': SAFE}}},
+    {'id': 'Y28', 'title': 'y: «سيبك منها» بعد رقم بلا مبلغ → لا تنفيذ', 'turns': [{'text': P1}, {'text': 'سيبك منها', 'gap': 5}, {'text': '700', 'gap': 10}],
+     'expect': {'2': {'no_creates': [{'account': P1, 'value': 700}], 'forbid': SAFE}}},
+    # reroute wording
+    {'id': 'Y29', 'title': 'y: بعد إشعار المحفظة «حطها على 01… بدل الأول»', 'setup': {'prior_create': {'account': P1, 'value': 5000}, 'system_notice': 'no_wallet'},
+     'turns': [{'text': f'حطها على {P2} بدل الأول'}],
+     'expect': {'final': {'creates': [{'account': P2, 'value': 5000}], 'forbid': SAFE}}},
+    {'id': 'Y30', 'title': 'y: بعد الإشعار رقم جديد بمبلغ مختلف → المبلغ المكتوب', 'setup': {'prior_create': {'account': P1, 'value': 5000}, 'system_notice': 'no_wallet'},
+     'turns': [{'text': f'{P2}\n3000'}],
+     'expect': {'final': {'creates': [{'account': P2, 'value': 3000}], 'no_creates': [{'account': P2, 'value': 5000}], 'forbid': SAFE}}},
+]

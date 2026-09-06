@@ -36,9 +36,31 @@ SRC_NOT_LINKED_TOOL = 'tool_1781113475079'
 THINKER_TOOLS = (
     'whatsapp_reply_to_message', 'qurtoba_send_customer_balance_to_chat', 'qurtoba_get_customer_daily_transactions',
     'qurtoba_check_transaction_status', 'qurtoba_check_payment_status', 'qurtoba_clear_pending_transfers',
-    'qurtoba_confirm_pending_repeats', 'alert_qurtoba_human', 'qurtoba_send_static_message',
-    'qurtoba_create_new_transactions_bulk',
+    'alert_qurtoba_human', 'qurtoba_send_static_message',
+    'qurtoba_create_new_transactions_bulk', 'qurtoba_answer_pending',
 )
+
+
+def _ensure_tool_definitions(names):
+    """A ToolDefinition row per registered @tool the thinker uses (the agent node selects by id)."""
+    from modules.aistudio.models import ToolDefinition
+    from modules.aistudio.tools.decorators import ToolRegistry
+    import qurtoba.tools  # noqa: F401  (registers the extension's tools)
+    created = []
+    for name in names:
+        if ToolDefinition.objects.filter(name=name).exists():
+            continue
+        info = ToolRegistry.get_tool(name)
+        if info is None:
+            continue
+        ToolDefinition.objects.create(
+            name=info.name, display_name=info.display_name or info.name, description=info.description or '',
+            category=info.category or 'qurtoba', module_path=info.module_path, function_name=info.function_name,
+            parameters_schema=info.parameters_schema or {}, return_schema=info.return_schema or {},
+            requires_auth=bool(info.requires_auth), is_active=True,
+        )
+        created.append(name)
+    return created
 
 _PROMPT_PATH = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, 'prompts', 'agents', 'thinker', 'prompt.md')
 
@@ -157,6 +179,9 @@ class Command(BaseCommand):
         if wf is None or src is None:
             raise CommandError(f'workflow {wf_id} or {src_id} not found')
         src_nodes = {n.node_id: n for n in WorkflowNode.objects.filter(workflow=src)}
+        new_defs = _ensure_tool_definitions(THINKER_TOOLS)
+        if new_defs:
+            self.stdout.write(f'tool definitions created: {new_defs}')
         tool_ids = dict(ToolDefinition.objects.filter(name__in=THINKER_TOOLS).values_list('name', 'id'))
         missing = [t for t in THINKER_TOOLS if t not in tool_ids]
         if missing:
