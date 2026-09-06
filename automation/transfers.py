@@ -523,29 +523,26 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     for rj in summary.pop('_rejected', []):
         leftovers.append({**rj, 'text': (_text_of(rows[rj['message_id']]) if rj.get('message_id') in rows else '')[:80]})
 
-    # Rows that carried nothing for the money path (a name line, a greeting next to the
-    # numbers) are finished with — never let them linger into the next burst.
-    noise = [mid for mid, m in rows.items() if m.type == 'text' and mid not in pre_consume
-             and not _classify_message(_text_of(m))['phones'] and not _classify_message(_text_of(m))['amounts']
-             and mid not in fallback_amounts and not any(a.get('message_id') == mid for a in plan.get('answers') or [])]
-    if noise:
-        consume(conversation, noise)
-
     # Everything the customer wrote that the money path did not settle goes to the AI.
+    # Python judges nothing here: only a bare single word / punctuation / emoji is dropped.
     others = []
-    for mid in route.get('batch_ids') or []:
-        m = rows.get(mid)
-        if m is None:
+    answered = {a.get('message_id') for a in plan.get('answers') or []}
+    for mid, m in rows.items():
+        if mid in (decision.get('consume') or []) or mid in {i.get('source_message_id') for i in created_items}:
             continue
-        if mid in noise or mid in (decision.get('consume') or []) or mid in {i.get('source_message_id') for i in created_items}:
+        if mid in answered or mid in fallback_amounts or mid in pre_consume:
             continue
         if any(l.get('message_id') == mid for l in leftovers):
             continue
         txt = _text_of(m)
+        cls = _classify_message(txt) if m.type == 'text' else {'phones': [], 'amounts': []}
+        if cls['phones'] or cls['amounts']:
+            continue                     # still part of the money path (an orphan / a held pair)
         if m.type == 'text' and _is_noise_line(txt):
             consume(conversation, [mid])
             continue
         others.append({'message_id': mid, 'type': m.type, 'text': txt[:200]})
+        consume(conversation, [mid])     # the model answers it this turn; never re-read next turn
 
     summary.update({
         'created': [{'account_number': i.get('account_number'), 'value': i.get('value'), 'type': i.get('type')} for i in created_items],
