@@ -343,3 +343,12 @@ class NonCashResolutionTests(SimpleTestCase):
         self.assertEqual(_multi_number('01012345678 01098765432 قسم 1000 عليهم')['mode'], 'split')
         self.assertEqual(_multi_number('01012345678\n01098765432\n1000')['mode'], 'ask')
         self.assertIsNone(_multi_number('01012345678\n500'))
+
+    def test_broken_phone_next_to_an_amount_is_never_routed_to_a_registered_account(self):
+        # 2026-09-06 test line: «0106001000 ⏎ 590» created فورى 590 to the registered account
+        plan = {'success': True, 'pairs': [], 'answers': [], 'ambiguous': [], 'needs_resend': False,
+                'orphans': [{'kind': 'amount', 'value': 590.0, 'message_id': 'a'}],
+                'ignored': [{'message_id': 'a', 'text': '0106001000', 'reason': 'broken_phone'}]}
+        d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute=None, texts={}, accounts=[('فورى', '2924523')])
+        self.assertEqual(d['items'], [])
+        self.assertEqual(d['replies'], [('a', 'الرقم ده مش صحيح — ابعت رقم صحيح 11 رقم')])

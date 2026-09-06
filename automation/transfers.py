@@ -45,9 +45,12 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending: bool,
         return out
     accounts = accounts or []
     # «Amount only, no phone (محتاج 500) → the registered-accounts view: exactly one → use it;
-    # more than one → أي حساب؟; none → ask for the number.»
+    # more than one → أي حساب؟; none → ask for the number.» A BROKEN phone next to the amount
+    # («0106001000 ⏎ 590», 10 digits) is a cash attempt, never an amount for a registered account:
+    # the customer gets «ابعت رقم صحيح 11 رقم» on that message and nothing is created.
+    broken_phone_mids = {i.get('message_id') for i in plan.get('ignored') or [] if i.get('reason') == 'broken_phone'}
     no_phone_anywhere = not (plan.get('pairs') or []) and not any(
-        o.get('kind') == 'phone' for o in plan.get('orphans') or [])
+        o.get('kind') == 'phone' for o in plan.get('orphans') or []) and not broken_phone_mids
 
     pairs = [dict(p) for p in plan.get('pairs') or []]
     yes_phones, no_phones = set(), set()
@@ -120,6 +123,9 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending: bool,
                 continue
             replies.append((mid, R.ORPHAN_PHONE.format(phone=val)))
         else:
+            if mid in broken_phone_mids:
+                replies.append((mid, R.BAD_NUMBER))
+                continue
             if no_phone_anywhere and len(accounts) == 1:
                 ty, acc = accounts[0]
                 items.append({'type': ty, 'value': float(val), 'account_number': acc, 'source_message_id': mid})

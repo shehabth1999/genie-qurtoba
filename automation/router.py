@@ -214,16 +214,28 @@ def _row_dict(m) -> Dict[str, Any]:
 
 
 def load_batch_rows(conversation, input_data: Dict[str, Any]):
-    """The rows of this batch (any type), in send order; falls back to the newest inbound."""
+    """The rows of this turn, in send order.
+
+    Union of (a) the ids the channel marked in the input («[message_id: …]») and (b) every
+    still-unconsumed inbound row of the last window, any type. (b) is what makes the turn
+    robust: the state does not always carry every marker (2026-09-06: «حسابي كام» sent 2 s
+    after a transfer was missing from the markers and never answered), and a row that was
+    not consumed by an earlier turn is by definition still waiting for an answer.
+    """
+    from django.conf import settings as dj
+    from django.utils import timezone
     from modules.chat.models import Message
-    ids = batch_ids_from_input(input_data)
+    ids = set(batch_ids_from_input(input_data))
+    cut = timezone.now() - timedelta(minutes=getattr(dj, 'AI_UNPROCESSED_WINDOW_MIN', 6))
     qs = Message.objects_all.filter(conversation=conversation, direction='inbound', active=True).select_related('reply_to')
-    if ids:
-        rows = list(qs.filter(id__in=ids))
-    else:
-        rows = list(qs.order_by('-created_at')[:1])
-    rows.sort(key=lambda m: (getattr(m, 'social_sent_at', None) or m.created_at, m.created_at, str(m.id)))
-    return rows
+    rows = {str(m.id): m for m in qs.filter(id__in=ids)} if ids else {}
+    for m in qs.filter(ai_consumed_at__isnull=True, created_at__gte=cut).exclude(type__in=('tool', 'tool_call')):
+        rows.setdefault(str(m.id), m)
+    if not rows:
+        rows = {str(m.id): m for m in qs.order_by('-created_at')[:1]}
+    out = list(rows.values())
+    out.sort(key=lambda m: (getattr(m, 'social_sent_at', None) or m.created_at, m.created_at, str(m.id)))
+    return out
 
 
 def unprocessed_text_rows(conversation):
