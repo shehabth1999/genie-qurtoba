@@ -433,7 +433,8 @@ class LayoutNotMeaningTests(SimpleTestCase):
         for t in ('انا بعت لـ 01012345678 امبارح 500 وصلت؟', '01012345678 500 ده اتحول ولا لسه', 'ابعت 500 على 01012345678 لو سمحت'):
             self.assertTrue(_number_inside_prose(t, _classify_message(t)), t)
         for t in ('01012345678\n500', '01012345678 500', '01012345678\n5000\nعاصم كاش محمد سعد الرباط', '01012345678 كاش 500',
-                  '01012345678\n500 جنيه\nطارق', 'رقم المستلم: 01090878331\nالقيمة: 15,014'):
+                  '01012345678\n500 جنيه\nطارق', 'رقم المستلم: 01090878331\nالقيمة: 15,014',
+                  '01017154397 المبلغ  20 ألف  اسامه البنا', 'الرقم 01011637469\n\nالقيمه 30000ج.م فدفون كاش'):
             self.assertFalse(_number_inside_prose(t, _classify_message(t)), t)
 
 
@@ -456,3 +457,13 @@ class ThousandAndTests(SimpleTestCase):
                             '01148485123\n50 ألف \n💰كاش🔟 - وفا(843)': 50000}.items():
             cls = _classify_message(text)
             self.assertEqual(cls['amounts'], [value], text)
+
+
+class TallyLineTests(SimpleTestCase):
+
+    def test_a_line_with_a_fraction_is_a_label_line(self):
+        cls = _classify_message('W2405\n01069214107\n35.343 ج م\nفودافون\n961 نصار 6.08')
+        self.assertEqual(cls['phones'], ['01069214107'])
+        self.assertEqual(cls['amounts'], [35343])
+        cls = _classify_message('W2399\n01276956929\n39.125 مصري مصري\nفودافوان\nعامر فون 6.08')
+        self.assertEqual(cls['amounts'], [39125])

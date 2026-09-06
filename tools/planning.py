@@ -278,12 +278,16 @@ def _classify_message(text: str) -> Dict[str, Any]:
         elif r['ok']:
             _ignore(rest_text, 'fraction')     # «13.75» — a tally, never a transfer amount
         elif r.get('reason') == 'multiple_numbers':
-            for tok in re.findall(r'\d[\d.,]*', rest_text):
-                rr = normalize_amount(tok)
+            toks = [(tok, normalize_amount(tok)) for tok in re.findall(r'\d[\d.,]*', rest_text)]
+            if any(rr['ok'] and not float(rr['value']).is_integer() for _t, rr in toks):
+                # a line with a FRACTION is a tally / label line («961 نصار 6.08», «عمار 13.75 ك 12»):
+                # none of its numbers is a transfer amount (2026-09-06: «961» was asked about)
+                has_name = True
+                _ignore(rest_text, 'fraction')
+                continue
+            for tok, rr in toks:
                 if rr['ok'] and float(rr['value']).is_integer():
                     amounts.append(rr['value'])
-                elif rr['ok']:
-                    _ignore(tok, 'fraction')
         elif re.sub(r'[\d\s.,+\-]', '', rest_text):
             has_name = True
             _ignore(rest_text, 'words')

@@ -540,21 +540,27 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     return summary
 
 
-_LAYOUT_OK_WORDS = {'كاش', 'فودافون', 'اتصالات', 'اورانج', 'وي', 'محفظه', 'جنيه', 'جنيها', 'ج', 'م', 'مصري',
-                    'الف', 'الاف', 'مبلغ', 'المبلغ', 'رقم', 'الرقم', 'القيمه', 'قيمه', 'حواله', 'تحويل', 'فوري', 'امان', 'طاير'}
+_LAYOUT_OK_WORDS = {'كاش', 'فودافون', 'فدفون', 'اتصالات', 'اورانج', 'وي', 'محفظه', 'المحفظه', 'جنيه', 'جنيها', 'ج', 'م', 'مصري',
+                    'الف', 'الاف', 'مبلغ', 'المبلغ', 'رقم', 'الرقم', 'القيمه', 'قيمه', 'القيمة', 'حواله', 'تحويل', 'فوري', 'امان', 'طاير',
+                    'المستلم', 'المرسل', 'مستلم', 'حساب', 'الحساب', 'تليفون', 'موبايل', 'نمره', 'النمره', 'النوع', 'صافي'}
 
 
 def _number_inside_prose(text: str, cls: Dict[str, Any]) -> bool:
-    """Layout, not meaning: the phone shares its LINE with two or more words that are not
-    money/wallet words («انا بعت لـ 01… امبارح 500 وصلت»). A number on its own line, or with
-    just the amount / a wallet word / one name, is the office's order format."""
+    """Layout, not meaning: on the line that holds the phone, words BEFORE the number
+    («انا بعت لـ 01…») or four or more words after it («… ده اتحول ولا لسه») make it a
+    sentence. A number first, then the amount and a short name («01… المبلغ 20 ألف اسامه البنا»)
+    is the office's order format."""
     import re
     for raw in str(text or '').splitlines():
         line = L.norm(raw)
-        if not any(ph[-9:] in re.sub(r'\D', '', line) for ph in cls['phones']):
+        digits_line = re.sub(r'\D', '', line)
+        ph = next((p for p in cls['phones'] if p[-9:] in digits_line), None)
+        if ph is None:
             continue
-        words = [w for w in re.findall(r'[a-z\u0600-\u06ff]+', line) if w not in _LAYOUT_OK_WORDS and len(w) > 1]
-        if len(words) >= 2:
+        pos = line.find(ph[-9:])
+        before = [w for w in re.findall(r'[a-z\u0600-\u06ff]+', line[:max(pos, 0)]) if w not in _LAYOUT_OK_WORDS and len(w) > 1]
+        after = [w for w in re.findall(r'[a-z\u0600-\u06ff]+', line[pos:]) if w not in _LAYOUT_OK_WORDS and len(w) > 1]
+        if len(before) >= 1 or len(after) >= 4:
             return True
     return False
 
