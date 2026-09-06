@@ -497,3 +497,13 @@ class ListConfirmScopeTests(SimpleTestCase):
         d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute=None, texts={})
         self.assertEqual([i['account_number'] for i in d['items']], ['01012345678', '01098765432'])
         self.assertEqual(d['list_confirm']['phones'], ['01055512345'])
+
+
+class PendingLifetimeTests(SimpleTestCase):
+
+    def test_a_stale_marker_is_not_pending(self):
+        import time
+        from qurtoba.automation import pending as P
+        self.assertTrue(P._fresh({'ts': time.time() - 60}))
+        self.assertFalse(P._fresh({'ts': time.time() - 20 * 60}))
+        self.assertFalse(P._fresh({}))

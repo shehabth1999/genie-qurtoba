@@ -267,7 +267,50 @@ def _text_of(m) -> str:
 
 # ── the run ──────────────────────────────────────────────────────────────────
 
+_RUN_LOCK_TTL = 90
+_RUN_LOCK_WAIT = 45
+
+
+def _acquire_run_lock(conv_key: str) -> bool:
+    """WhatsApp can split one burst into two batches seconds apart; the second run must wait for
+    the first to finish creating (both would otherwise plan the same rows and wake the model twice
+    — 2026-09-06 13:01). Returns True when the lock is held (or could not be checked)."""
+    import time
+    try:
+        from django.core.cache import cache
+    except Exception:
+        return True
+    key = f'qurtoba:money_path_lock:{conv_key}'
+    deadline = time.time() + _RUN_LOCK_WAIT
+    while True:
+        try:
+            if cache.add(key, time.time(), _RUN_LOCK_TTL):
+                return True
+        except Exception:
+            return True
+        if time.time() >= deadline:
+            return True      # never block a turn forever; the create tool is idempotent anyway
+        time.sleep(1.0)
+
+
+def _release_run_lock(conv_key: str) -> None:
+    try:
+        from django.core.cache import cache
+        cache.delete(f'qurtoba:money_path_lock:{conv_key}')
+    except Exception:
+        pass
+
+
 def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
+    conv_key = str(getattr(conversation, 'id', ''))
+    _acquire_run_lock(conv_key)
+    try:
+        return _run(conversation, partner, route)
+    finally:
+        _release_run_lock(conv_key)
+
+
+def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     from qurtoba.tools.planning import qurtoba_plan_transactions
     from qurtoba.tools.transactions import (_high_value_threshold, _list_repeat_pending,
                                              _clear_repeat_pending, qurtoba_confirm_pending_repeats,
@@ -477,6 +520,8 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         if decision['reroute_used'] and created_result.get('success'):
             cache_delete(REROUTE_KEY.format(conv=conv_key))
         if created_items:
+            from .pending import clear_pending
+            clear_pending(conversation)          # a created transfer ends any «حول»/list question
             # «The expectation expires: any other transaction since → a bare number is a normal op.»
             # The customer moved on — a rejected message older than what was just created is retired,
             # so a later bare number can never pick up its amount by mistake.

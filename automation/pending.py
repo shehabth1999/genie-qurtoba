@@ -16,6 +16,22 @@ from .context import cache_delete, cache_get, call_tool, consume, log, send_quot
 
 CORRECTION_KEY = 'qurtoba:correction_pending:{conv}'
 LIST_KEY = 'qurtoba:list_confirm:{conv}'
+PENDING_MAX_AGE = 15 * 60   # a yes/no question the customer did not answer in 15 min is over
+
+
+def _fresh(marker) -> bool:
+    import time
+    try:
+        return bool(marker) and (time.time() - float(marker.get('ts') or 0)) <= PENDING_MAX_AGE
+    except Exception:
+        return False
+
+
+def clear_pending(conversation) -> None:
+    """The customer moved on (a transfer was created since): nothing is waiting any more."""
+    key = _conv_key(conversation)
+    cache_delete(CORRECTION_KEY.format(conv=key))
+    cache_delete(LIST_KEY.format(conv=key))
 
 
 def _conv_key(conversation) -> str:
@@ -29,11 +45,15 @@ def pending_state(conversation) -> Dict[str, Any]:
     key = _conv_key(conversation)
     out: Dict[str, Any] = {}
     c = cache_get(CORRECTION_KEY.format(conv=key))
-    if c:
+    if c and _fresh(c):
         out['correction'] = c
+    elif c:
+        cache_delete(CORRECTION_KEY.format(conv=key))
     lst = cache_get(LIST_KEY.format(conv=key))
-    if lst and lst.get('pairs'):
+    if lst and lst.get('pairs') and _fresh(lst):
         out['list'] = lst
+    elif lst:
+        cache_delete(LIST_KEY.format(conv=key))
     hv_phone, hv_src = _hv_question_pending(conversation)
     if hv_phone:
         out['high_value'] = {'account_number': hv_phone, 'source_message_id': hv_src}
