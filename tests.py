@@ -384,3 +384,15 @@ class BrokenNumberTests(SimpleTestCase):
                 'ignored': [{'message_id': 'b', 'text': '0106013464', 'reason': 'broken_phone'}]}
         d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute=None, texts={})
         self.assertEqual(d['replies'], [('b', 'الرقم ده مش صحيح — ابعت رقم صحيح 11 رقم')])
+
+
+class GateEchoTests(SimpleTestCase):
+
+    def test_verbatim_echo_of_the_customer_is_blocked(self):
+        from unittest import mock
+        from qurtoba import ai_guard
+        with mock.patch.object(ai_guard, '_last_inbound_text', return_value='حاضر ف الانتظار'):
+            self.assertTrue(ai_guard.is_pure_echo('حاضر ف الانتظار', 'c'))
+            self.assertTrue(ai_guard.is_pure_echo('حاضر ف الانتظار.', 'c'))
+            self.assertFalse(ai_guard.is_pure_echo('تمام، تحت أمرك', 'c'))
+            self.assertFalse(ai_guard.is_pure_echo('', 'c'))

@@ -371,6 +371,20 @@ def is_echo_with_note(output: str, conversation_id) -> bool:
     return bool(rest) and bool(_TRAILING_PAREN_RE.match(rest))
 
 
+def is_pure_echo(output: str, conversation_id) -> bool:
+    """The customer's last message repeated back verbatim — nothing else.
+
+    2026-09-06: the customer wrote «حاضر ف الانتظار» and the model's turn ended with the
+    same words, which the channel delivered as a reply. An echo is never an answer."""
+    text = str(output or '').strip()
+    if not text or not conversation_id:
+        return False
+    inbound = (_last_inbound_text(conversation_id) or '').strip()
+    if len(inbound) < 3:
+        return False
+    return _dedupe_key_text(text) == _dedupe_key_text(inbound)
+
+
 # ── Duplicate suppression ────────────────────────────────────────────────────
 
 _DUPLICATE_WINDOW = 30  # seconds
@@ -572,6 +586,8 @@ def decide(content, message_type, conversation, system_partner, *,
         return _block('internal_note')
     if conv_id and is_echo_with_note(text, conv_id):
         return _block('echo_with_note')
+    if conv_id and is_pure_echo(text, conv_id):
+        return _block('echo')
     if is_self_narration(text):
         return _block('self_narration')
     if conv_id and _is_duplicate_send(conv_id, text):

@@ -23,7 +23,7 @@ from . import lexicon as L
 from . import replies as R
 from .arabic_numbers import parse_arabic_amount
 from .context import (alert_human, asked_recently, cache_delete, cache_get, cache_set, call_tool,
-                      consume, log, send_quoted)
+                      consume, log, said_recently, send_quoted)
 
 REROUTE_KEY = 'qurtoba:reroute_owed:{conv}'      # set by tasks._send_reroute_ask / _send_cancel_notice
 REROUTE_TTL = 24 * 3600
@@ -428,8 +428,10 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         if replies_enabled:
             if send_quoted(conversation, mid, text):
                 summary['replies'] += 1
-        elif mid and asked_recently(conversation, mid, minutes=15):
+        elif mid and (asked_recently(conversation, mid, minutes=15) or said_recently(conversation, mid, text, minutes=360)):
             log('leftover_already_asked', conversation, mid=str(mid)[:8])   # never ask twice
+            if kind == 'planner' and text == R.BAD_NUMBER:
+                consume(conversation, [mid])       # a reported bad number is finished with
         else:
             leftovers.append({'message_id': mid, 'kind': kind, 'text': (_text_of(rows[mid]) if mid in rows else '')[:80],
                               'suggested_reply': text})
