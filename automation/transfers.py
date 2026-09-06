@@ -141,6 +141,14 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
         if hv_pending and phone == hv_pending and phone not in yes_phones and value is not None \
                 and float(value) >= hv_threshold:
             continue                                   # held by the high-value question — waiting for «تأكيد»
+        if hv_pending and phone == hv_pending and value is not None and float(value) < hv_threshold:
+            # a re-valued pair on the HELD number (an amount typed as the answer to «مبلغ كبير»):
+            # never a transfer of that smaller amount — ask what they meant (2026-09-06 D3: 100 was created)
+            src_txt = texts.get(src, '')
+            orig = (_classify_message(src_txt).get('amounts') or [value])[0]
+            replies.append((p.get('answer_message_id') or src,
+                            R.UNCLEAR_HV_ANSWER.format(text=R._fmt(value), amount=R._fmt(orig))))
+            continue
         if reason == 'separator_ambiguous':
             raw = _last_line(texts.get(src, ''))
             replies.append((src, R.UNREADABLE_AMOUNT.format(raw=raw or value)))

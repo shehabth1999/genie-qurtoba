@@ -93,6 +93,17 @@ def answer_pending(conversation, partner, decision: str, answer_message_id: Opti
     yes = decision == 'yes'
     result: Dict[str, Any] = {'success': True, 'handled': False, 'kind': 'none', 'created': [], 'note': ''}
 
+    # The customer's newest message quoting one of THEIR OWN other messages is about that
+    # message, not about what we are holding («تأكيد» quoted on a different transfer).
+    held_src = (st.get('correction') or {}).get('source_message_id') or (st.get('high_value') or {}).get('source_message_id')
+    newest = _newest_inbound(conversation)
+    q = getattr(newest, 'reply_to', None) if newest is not None else None
+    if yes and st and q is not None and getattr(q, 'direction', None) == 'inbound' and held_src and str(q.id) != str(held_src):
+        result['note'] = ('the reply quotes another customer message, not the held one — ask what they mean '
+                          'before settling; nothing was executed')
+        log('pending_answer', conversation, kind='quoted_elsewhere', yes=yes)
+        return result
+
     if st.get('correction'):
         c = st['correction']
         cache_delete(CORRECTION_KEY.format(conv=key))
@@ -160,8 +171,25 @@ def answer_pending(conversation, partner, decision: str, answer_message_id: Opti
         log('pending_answer', conversation, kind='repeat', yes=yes)
         return result
 
+    if not yes:
+        # Nothing held, but an open (uncreated) number or amount is waiting for its other half —
+        # «خلاص متبعتش» / «سيبك منها»: scrap it so a later stray amount can never complete it.
+        from qurtoba.tools.conversation import qurtoba_clear_pending_transfers
+        res = call_tool(conversation, partner, qurtoba_clear_pending_transfers)
+        if res.get('cleared'):
+            result.update(handled=True, kind='open_burst', note='the open number/amount was scrapped; the customer was told')
+            return result
     result['note'] = 'nothing is pending'
     return result
+
+
+def _newest_inbound(conversation):
+    try:
+        from modules.chat.models import Message
+        return (Message.objects_all.filter(conversation=conversation, direction='inbound', active=True)
+                .select_related('reply_to').order_by('-created_at').first())
+    except Exception:
+        return None
 
 
 def _created(res: Dict[str, Any]) -> List[Dict[str, Any]]:

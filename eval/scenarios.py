@@ -102,13 +102,12 @@ SCENARIOS = [
         }},
     },
     {
-        'id': 'C2', 'title': 'قائمتان: أرقام ثم مبالغ → تأكيد المطابقة بلا تنفيذ',
+        'id': 'C2', 'title': 'قائمتان: أرقام ثم مبالغ في لحظة واحدة (≤3) → تنفيذ بالترتيب (قرار المكتب 2026-07-14)',
         'turns': [{'text': P1}, {'text': P2, 'gap': 0}, {'text': '500', 'gap': 0}, {'text': '600', 'gap': 0}],
         'expect': {'final': {
             'tools': [{'name': 'qurtoba_plan_transactions', 'must': True}],
-            'no_creates': [{'account': P1, 'value': None}, {'account': P2, 'value': None}],
-            'reply': 'question', 'contains_any': ['تأكيد', 'أكد', 'صح'], 'quoted_replies': 1,
-            'no_success_list': True, 'forbid': NARRATION_FORBID,
+            'creates': [{'account': P1, 'value': 500}, {'account': P2, 'value': 600}],
+            'reply': 'silent', 'forbid': NARRATION_FORBID,
         }},
     },
     {
@@ -409,8 +408,8 @@ SCENARIOS += [
     },
     {   # 4 split pairs in one second → over the limit → nothing created, resend asked
         'id': 'X2', 'title': 'x: 4 عمليات مقسومة في نفس الثانية → لا تنفيذ، طلب إعادة',
-        'turns': [{'text': P1}, {'text': P2, 'gap': 0}, {'text': P3, 'gap': 0}, {'text': P4, 'gap': 0},
-                  {'text': '100', 'gap': 0}, {'text': '200', 'gap': 0}, {'text': '300', 'gap': 0}, {'text': '400', 'gap': 0}],
+        'turns': [{'text': P1}, {'text': P2, 'gap': 0, 'offset': 0}, {'text': P3, 'gap': 0, 'offset': 0}, {'text': P4, 'gap': 0, 'offset': 0},
+                  {'text': '100', 'gap': 0, 'offset': 0}, {'text': '200', 'gap': 0, 'offset': 0}, {'text': '300', 'gap': 0, 'offset': 0}, {'text': '400', 'gap': 0, 'offset': 0}],
         'expect': {'final': {'no_records': True, 'contains_any': ['رسالة واحدة', 'كل رقم ومبلغه', 'المطابقة'], 'forbid': SAFE}},
     },
     {   # two amounts, one number → never two transfers from one number, never the wrong one
@@ -641,7 +640,7 @@ SCENARIOS += [
      'expect': {'final': {'no_records': True, 'forbid': SAFE}}},
     {'id': 'Z19', 'title': 'z: رقم مبلغ رقم مبلغ متداخلة (≤3) → تنفيذ', 'turns': [{'text': P1}, {'text': '600', 'gap': 0}, {'text': P2, 'gap': 0}, {'text': '500', 'gap': 0}],
      'expect': {'final': {'creates': [{'account': P1, 'value': 600}, {'account': P2, 'value': 500}], 'forbid': SAFE}}},
-    {'id': 'Z20', 'title': 'z: 5 عمليات مقسومة في نفس الثانية → إعادة إرسال', 'turns': [{'text': P1}, {'text': '100', 'gap': 0}, {'text': P2, 'gap': 0}, {'text': '200', 'gap': 0}, {'text': P3, 'gap': 0}, {'text': '300', 'gap': 0}, {'text': P4, 'gap': 0}, {'text': '400', 'gap': 0}, {'text': P5, 'gap': 0}, {'text': '500', 'gap': 0}],
+    {'id': 'Z20', 'title': 'z: 5 عمليات مقسومة في نفس الثانية → إعادة إرسال', 'turns': [{'text': P1}] + [{'text': t, 'gap': 0, 'offset': 0} for t in ('100', P2, '200', P3, '300', P4, '400', P5, '500')],
      'expect': {'final': {'no_records': True, 'forbid': SAFE}}},
     {'id': 'Z22', 'title': 'z: صورة بلا كلام (إيصال؟)', 'turns': [{'text': 'صورة', 'type': 'image'}], 'expect': {'final': {'no_records': True, 'forbid': SAFE}}},
     {'id': 'Z23', 'title': 'z: صوتية «حسابي كام» → الرصيد', 'turns': [{'text': 'حسابي كام يا باشا', 'type': 'audio'}],

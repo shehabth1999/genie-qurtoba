@@ -543,3 +543,13 @@ class AttackRoundTwoTests(SimpleTestCase):
     def test_duplicate_guard_is_per_quoted_message(self):
         from qurtoba import ai_guard
         self.assertNotEqual(ai_guard._duplicate_key('c', 'x', 'a'), ai_guard._duplicate_key('c', 'x', 'b'))
+
+
+class HighValueRevalueGuardTests(SimpleTestCase):
+
+    def test_a_smaller_amount_on_the_held_number_is_never_created(self):
+        plan = {'success': True, 'ambiguous': [], 'ignored': [], 'orphans': [], 'answers': [], 'needs_resend': False,
+                'pairs': [{'account_number': '01012345678', 'value': 100.0, 'source_message_id': 's', 'confidence': 'high'}]}
+        d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute=None, texts={'s': '01012345678\n\n100الف'}, hv_pending='01012345678')
+        self.assertEqual(d['items'], [])
+        self.assertIn('100,000', d['replies'][0][1])
