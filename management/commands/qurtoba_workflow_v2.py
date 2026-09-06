@@ -37,6 +37,7 @@ THINKER_TOOLS = (
     'whatsapp_reply_to_message', 'qurtoba_send_customer_balance_to_chat', 'qurtoba_get_customer_daily_transactions',
     'qurtoba_check_transaction_status', 'qurtoba_check_payment_status', 'qurtoba_clear_pending_transfers',
     'qurtoba_confirm_pending_repeats', 'alert_qurtoba_human', 'qurtoba_send_static_message',
+    'qurtoba_create_new_transactions_bulk',
 )
 
 _PROMPT_PATH = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, 'prompts', 'agents', 'thinker', 'prompt.md')
@@ -78,7 +79,7 @@ def build_spec(src_nodes, tool_ids):
     thinker['max_tokens'] = 1500
     thinker['temperature'] = 0.2
     thinker['reasoning_mode'] = 'none'
-    thinker['description'] = 'Thinking model: runs after the system created the clean transfers; no money tools.'
+    thinker['description'] = 'Thinking model: runs after the system created the clean transfers; creates only what the system could not read.'
 
     not_linked = src_cfg(SRC_NOT_LINKED_TOOL)
     not_linked['arguments'] = {'message': R.NOT_LINKED}

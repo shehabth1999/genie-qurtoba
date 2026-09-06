@@ -527,3 +527,11 @@ SCENARIOS += [
         'expect': {'1': {'creates': [{'account': P2, 'value': 700}]}, '2': {'no_creates': [{'account': P1, 'value': 2000}], 'no_records': True, 'forbid': SAFE}},
     },
 ]
+
+SCENARIOS += [
+    {   # spelled amount over two numbers — meaning, the model creates it
+        'id': 'X25', 'title': 'x: رقمين و«الفين لكل رقم» → الموديل يفهم وينشئ الاثنين',
+        'turns': [{'text': f'{P1}\n{P2}\n\nالفين لكل رقم'}],
+        'expect': {'final': {'creates': [{'account': P1, 'value': 2000}, {'account': P2, 'value': 2000}], 'forbid': SAFE}},
+    },
+]
