@@ -579,6 +579,17 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             cache_delete(REROUTE_KEY.format(conv=conv_key))
         if corrections and created_result.get('success'):
             consume(conversation, [c['correction_of'] for c in corrections])   # the rejected message is settled
+        elif created_items:
+            # «The expectation expires: any other transaction since → a bare number is a normal op.»
+            # The customer moved on — a rejected message older than what was just created is retired,
+            # so a later bare number can never pick up its amount by mistake.
+            newest_created = max((rows[i['source_message_id']].created_at for i in created_items
+                                  if i.get('source_message_id') in rows), default=None)
+            stale = [mid for mid, m in rows.items() if m.type == 'text' and newest_created is not None
+                     and m.created_at < newest_created and _broken_number_amount(_text_of(m))]
+            if stale:
+                consume(conversation, stale)
+                log('correction_expired', conversation, mids=[x[:8] for x in stale])
 
     for mid, text in decision['replies']:
         _say(mid, text, 'planner')
