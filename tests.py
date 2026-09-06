@@ -507,3 +507,20 @@ class PendingLifetimeTests(SimpleTestCase):
         self.assertTrue(P._fresh({'ts': time.time() - 60}))
         self.assertFalse(P._fresh({'ts': time.time() - 20 * 60}))
         self.assertFalse(P._fresh({}))
+
+
+class QuotePairingTests(SimpleTestCase):
+    """2026-09-06: «1000 جنى» quoted on the customer's own «01275362968» was asked «الرقم للمبلغ 1,000؟»."""
+
+    def test_amount_quoted_on_a_number_is_that_numbers_amount(self):
+        msgs = [{'text': '01275362968', 'message_id': 'n'}, {'text': '1000 جنى', 'message_id': 'a'}]
+        pairs, mids, orphans, _amb, _lp = _pair_events(_build_events(msgs, {}, None, {'a': ('n', '01275362968')}))
+        self.assertEqual([(p['account_number'], p['value'], p['source_message_id']) for p in pairs], [('01275362968', 1000.0, 'n')])
+        self.assertEqual(mids, [{'n', 'a'}])
+        self.assertEqual(orphans, [])
+
+    def test_number_quoted_on_an_amount_is_the_same_pair(self):
+        msgs = [{'text': '500', 'message_id': 'a'}, {'text': '01012345678', 'message_id': 'n'}]
+        pairs, mids, orphans, _amb, _lp = _pair_events(_build_events(msgs, {}, None, {'n': ('a', '500')}))
+        self.assertEqual([(p['account_number'], p['value'], p['source_message_id']) for p in pairs], [('01012345678', 500.0, 'n')])
+        self.assertEqual(orphans, [])

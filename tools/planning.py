@@ -378,7 +378,7 @@ def _same_time_overflow_mids(events, msg_sent, window_s, max_tx):
     return overflow
 
 
-def _build_events(messages, msg_text, msg_fallback=None):
+def _build_events(messages, msg_text, msg_fallback=None, msg_quote=None):
     """Ordered event stream from a message list. Each event is one of:
     ('pair', phone, amount, mid, amb) | ('phone', phone, mid) |
     ('amount', value, mid) | ('name', mid). Shared by the planner tool and
@@ -389,14 +389,42 @@ def _build_events(messages, msg_text, msg_fallback=None):
     words): the LLM's number fills the slot so the value is never lost. When the parser
     already found an amount, the fallback is ignored (Python wins)."""
     msg_fallback = msg_fallback or {}
+    msg_quote = msg_quote or {}
+    # the quoted message of a quote-linked pair is absorbed by that pair — it must not also
+    # stand alone as an orphan number / amount
+    absorbed = set()
+    for item in messages:
+        if isinstance(item, dict) and item.get('message_id') and msg_quote.get(str(item['message_id']).strip()):
+            mid0 = str(item['message_id']).strip()
+            q_id, q_text = msg_quote[mid0]
+            c0 = _classify_message((msg_text or {}).get(mid0) or item.get('text') or '')
+            qc0 = _classify_message(q_text)
+            if (not c0['phones'] and len(c0['amounts']) == 1 and len(qc0['phones']) == 1) or \
+                    (not c0['amounts'] and len(c0['phones']) == 1 and not qc0['phones'] and len(qc0['amounts']) == 1):
+                absorbed.add(q_id)
     events = []
     for item in messages:
         if not isinstance(item, dict):
             continue
         mid = str(item.get('message_id') or '').strip() or None
+        if mid in absorbed:
+            continue
         text = (msg_text or {}).get(mid) or item.get('text') or ''
         cls = _classify_message(text)
         phones, amounts, amb = cls['phones'], cls['amounts'], cls['ambiguous']
+        # A WhatsApp QUOTE is a link the customer drew: «1000 جنى» quoted on their own «01275362968»
+        # is that number's amount (2026-09-06: it was asked «الرقم للمبلغ 1,000؟»). The reverse
+        # (a number quoting an amount) is the same pair. Source = the number's message.
+        q = msg_quote.get(mid) if mid else None
+        if q:
+            q_id, q_text = q
+            q_cls = _classify_message(q_text)
+            if not phones and len(amounts) == 1 and len(q_cls['phones']) == 1:
+                events.append(('pair', q_cls['phones'][0], amounts[0], q_id, bool(amb), {q_id, mid}))
+                continue
+            if not amounts and len(phones) == 1 and not q_cls['phones'] and len(q_cls['amounts']) == 1:
+                events.append(('pair', phones[0], q_cls['amounts'][0], mid, False, {q_id, mid}))
+                continue
         # A message with a BROKEN number («0106013464 ⏎ الفين جنيه», 10 digits) is one unit:
         # its amount belongs to that bad number, never to the next bare number in the burst.
         # 2026-09-06: the loose 2,000 shifted every split pair after it. The message is a
@@ -499,9 +527,10 @@ def _pair_events(events, msg_sent=None, gap_s=None):
         if kind == 'name':
             continue  # names never occupy a slot
         if kind == 'pair':
-            # self-contained phone+amount in one message — unambiguous
+            # self-contained phone+amount in one message — unambiguous (a quote-linked pair
+            # carries both message ids so the create path watermarks both rows)
             emit(ev[1], ev[2], ev[3], 'low' if ev[4] else 'high',
-                 'separator_ambiguous' if ev[4] else None, mids=[ev[3]])
+                 'separator_ambiguous' if ev[4] else None, mids=list(ev[5]) if len(ev) > 5 else [ev[3]])
         elif kind == 'phone':
             phone, mid = ev[1], ev[2]
             if pending_amounts:
@@ -728,7 +757,7 @@ def consumed_ids_by_source(conv):
             # An applied amount answer belongs to its number's pair: watermark it too.
             if a.get('about_message_id') and a.get('kind') == 'amount_reply':
                 out.setdefault(a['about_message_id'], set()).add(a['message_id'])
-        messages, msg_text, msg_sent = [], {}, {}
+        messages, msg_text, msg_sent, msg_quote = [], {}, {}, {}
         for r in rows:
             mid = str(r.id)
             txt = (r.content.get('text') if isinstance(r.content, dict) else '') or ''
@@ -737,9 +766,13 @@ def consumed_ids_by_source(conv):
             _s = getattr(r, 'social_sent_at', None) or getattr(r, 'created_at', None)
             if _s is not None:
                 msg_sent[mid] = _s
+            _q = getattr(r, 'reply_to', None)
+            if _q is not None and getattr(_q, 'direction', None) == 'inbound':
+                _qc = _q.content if isinstance(_q.content, dict) else {}
+                msg_quote[mid] = (str(_q.id), str(_qc.get('text') or ''))
         _gap = getattr(_dj, 'AI_BURST_GAP_SEC', 45)
         pairs, pair_mids, _orph, _amb, _lp = _pair_events(
-            _build_events(messages, msg_text), msg_sent, _gap)
+            _build_events(messages, msg_text, None, msg_quote), msg_sent, _gap)
         for op, mids in zip(pairs, pair_mids):
             sid = op.get('source_message_id')
             if sid:
@@ -882,19 +915,24 @@ def qurtoba_plan_transactions(
     # can't guarantee.
     msg_text: Dict[str, str] = {}
     msg_sent: Dict[str, Any] = {}
+    msg_quote: Dict[str, Any] = {}
     if conv is not None:
         try:
             from modules.chat.models import Message
             ids = [str(m.get('message_id')).strip()
                    for m in messages if isinstance(m, dict) and m.get('message_id')]
             if ids:
-                for mm in Message.objects_all.filter(conversation=conv, id__in=ids):
+                for mm in Message.objects_all.filter(conversation=conv, id__in=ids).select_related('reply_to'):
                     c = mm.content
                     if isinstance(c, dict) and isinstance(c.get('text'), str):
                         msg_text[str(mm.id)] = c['text']
                     _sent = getattr(mm, 'social_sent_at', None) or getattr(mm, 'created_at', None)
                     if _sent is not None:
                         msg_sent[str(mm.id)] = _sent
+                    _q = getattr(mm, 'reply_to', None)
+                    if _q is not None and getattr(_q, 'direction', None) == 'inbound':
+                        _qc = _q.content if isinstance(_q.content, dict) else {}
+                        msg_quote[str(mm.id)] = (str(_q.id), str(_qc.get('text') or ''))
         except Exception:
             logger.warning('qurtoba_plan_transactions: text re-fetch failed', exc_info=True)
 
@@ -904,7 +942,7 @@ def qurtoba_plan_transactions(
     # earlier burst can't grab a phone in a new one.
     from django.conf import settings as _dj0
     _gap = getattr(_dj0, 'AI_BURST_GAP_SEC', 45)
-    events = _build_events(messages, msg_text, msg_fallback)
+    events = _build_events(messages, msg_text, msg_fallback, msg_quote)
     pairs, pair_mids, orphans, ambiguous_out, list_pattern = _pair_events(events, msg_sent, _gap)
     # An amount the customer sent in answer to our question about a number IS that
     # number's amount — it replaces whatever we had parsed for it and is never an orphan.

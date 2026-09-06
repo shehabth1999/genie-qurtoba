@@ -98,9 +98,15 @@ def ai_context_node(input_data, conversation, partner) -> Dict[str, Any]:
         customer = getattr(partner, 'qurtoba_customer', None)
         from modules.chat.models import Message
         texts = []
-        for m in Message.objects_all.filter(conversation=conversation, id__in=route.get('batch_ids') or []).order_by('created_at'):
+        for m in Message.objects_all.filter(conversation=conversation, id__in=route.get('batch_ids') or []).select_related('reply_to').order_by('created_at'):
             c = m.content if isinstance(m.content, dict) else {}
-            texts.append(f"[message_id: {m.id}] ({m.type}) {str(c.get('text') or c.get('transcription') or c.get('caption') or '')[:300]}")
+            q = getattr(m, 'reply_to', None)
+            quote = ''
+            if q is not None:
+                qc = q.content if isinstance(q.content, dict) else {}
+                who = 'you' if getattr(q, 'direction', None) == 'outbound' else 'the customer'
+                quote = f' [replying to {who}: «{str(qc.get("text") or qc.get("caption") or "")[:60]}»]'
+            texts.append(f"[message_id: {m.id}] ({m.type}){quote} {str(c.get('text') or c.get('transcription') or c.get('caption') or '')[:300]}")
         return {
             'now': timezone.localtime().strftime('%Y-%m-%d %H:%M (%A)'),
             'partner_name': getattr(partner, 'name', '') or '',
