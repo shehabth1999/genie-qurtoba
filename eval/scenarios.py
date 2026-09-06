@@ -504,7 +504,7 @@ SCENARIOS += [
     {   # a sentence with a number in it is not a transfer
         'id': 'X20', 'title': 'x: جملة فيها رقم مش تحويل',
         'turns': [{'text': f'انا بعت لـ {P1} امبارح 500 وصلت؟'}],
-        'expect': {'final': {'no_records': True, 'contains_any': ['حول', 'سؤال'], 'forbid': SAFE}},
+        'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_check_transaction_status', 'must': True}], 'forbid': SAFE}},
     },
     {   # instapay with a valid phone and amount → never a cash transfer
         'id': 'X21', 'title': 'x: انستاباي مع رقم صحيح ومبلغ → لا تنفيذ',
