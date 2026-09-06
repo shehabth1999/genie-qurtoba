@@ -445,6 +445,14 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                 summary['replies'] += 1
             log('correction_asked', conversation, phone=c['account_number'], value=c['value'])
 
+    # An orphan amount the MODEL already used (it created a transfer of that value, from another
+    # message, after the amount arrived) is finished with — never «الرقم للمبلغ X؟» again.
+    if plan.get('success') and any(o.get('kind') == 'amount' for o in plan.get('orphans') or []):
+        used = _amounts_used_since(conversation, partner, rows)
+        if used:
+            consume(conversation, used)
+            plan['orphans'] = [o for o in plan['orphans'] if o.get('message_id') not in used]
+
     reroute = cache_get(REROUTE_KEY.format(conv=conv_key))
     if reroute and not _reroute_still_valid(conversation, partner, reroute):
         cache_delete(REROUTE_KEY.format(conv=conv_key)); reroute = None
@@ -666,6 +674,28 @@ def render_ai_summary(summary: Dict[str, Any]) -> str:
     if not lines:
         lines.append('Nothing open: every message was a clean transfer and is created.')
     return '\n'.join(lines)
+
+
+def _amounts_used_since(conversation, partner, rows) -> List[str]:
+    """Ids of amount-only rows whose value was created as a transfer AFTER they arrived."""
+    out: List[str] = []
+    try:
+        from qurtoba.models import QurtobaRecord
+        customer = getattr(partner, 'qurtoba_customer', None)
+        if customer is None:
+            return out
+        for mid, m in rows.items():
+            if m.type != 'text':
+                continue
+            cls = _classify_message(_text_of(m))
+            if cls['phones'] or len(cls['amounts']) != 1:
+                continue
+            if QurtobaRecord.objects.filter(customer=customer, value=float(cls['amounts'][0]),
+                                            created_at__gt=m.created_at).exists():
+                out.append(mid)
+    except Exception:
+        pass
+    return out
 
 
 def _replied_on(conversation, message_id, *, minutes: int = 360) -> bool:
