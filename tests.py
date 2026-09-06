@@ -133,3 +133,213 @@ class BurstPairingTests(SimpleTestCase):
         self.assertEqual(out['orphans'], [])
         self.assertEqual(out['ignored'], [])
         self.assertEqual(out['note'], 'كل رقم متطابق مع مبلغه.')
+
+
+# ═══════════════════════════ workflow v2 automation ═══════════════════════════
+
+from qurtoba.automation import lexicon as L  # noqa: E402
+from qurtoba.automation.arabic_numbers import parse_arabic_amount  # noqa: E402
+from qurtoba.automation.router import Intent, classify_rows, classify_text, batch_ids_from_input  # noqa: E402
+from qurtoba.automation.transfers import decide, resolve_noncash, _multi_number  # noqa: E402
+
+
+class LexiconTests(SimpleTestCase):
+
+    def test_yes_no_answers(self):
+        for t in ('أيوة', 'ايوه كرر', 'تمام', 'تأكيد', 'اه', 'نعم يا باشا', 'ok', 'ماشي كده'):
+            self.assertTrue(L.is_yes(t), t)
+            self.assertFalse(L.is_no(t), t)
+        for t in ('لأ', 'لا خلاص', 'بلاش', 'no'):
+            self.assertTrue(L.is_no(t), t)
+            self.assertFalse(L.is_yes(t), t)
+        for t in ('100 ج', 'ايوة بس الرقم التاني', 'عايز اعرف'):
+            self.assertFalse(L.is_yes(t), t)
+
+    def test_norm_unifies_spellings(self):
+        self.assertEqual(L.norm('إلغاء التحويلة'), 'الغاء التحويله')
+        self.assertEqual(L.norm('٥٠٠ جنيه'), '500 جنيه')
+
+
+class RouterTests(SimpleTestCase):
+
+    def _i(self, text, **kw):
+        return classify_text(text, **kw)['intent']
+
+    def test_info_intents(self):
+        self.assertEqual(self._i('الحساب كام'), Intent.BALANCE)
+        self.assertEqual(self._i('حسابي كام؟'), Intent.BALANCE)
+        self.assertEqual(self._i('عليا كام دلوقتي'), Intent.BALANCE)
+        self.assertEqual(self._i('كشف حساب النهارده'), Intent.STATEMENT)
+        self.assertEqual(self._i('تقرير امبارح'), Intent.STATEMENT)
+        self.assertTrue(classify_text('تقرير امبارح')['flags']['yesterday'])
+        self.assertEqual(self._i('تم؟'), Intent.STATUS)
+        self.assertEqual(self._i('وصل ولا لسه؟'), Intent.STATUS)
+        self.assertEqual(classify_text('اللي متمتش؟')['sub'], 'subset')
+        self.assertEqual(self._i('الغي التحويل'), Intent.CANCEL)
+        self.assertEqual(self._i('غلط الغيها'), Intent.CANCEL)
+
+    def test_money_intents(self):
+        self.assertEqual(classify_text('01023551947\n*مبلغ15.100مصري*')['sub'], 'cash')
+        self.assertEqual(classify_text('1000 فوري')['flags'], {'type': 'فورى'})
+        self.assertEqual(classify_text('انستاباي 500')['sub'], 'instapay')
+        self.assertEqual(self._i('محتاج 500'), Intent.TRANSFER)
+        self.assertEqual(self._i('01012345678 خمسمائة'), Intent.TRANSFER)
+        # an amount with «تم» inside a transfer message is still a transfer
+        self.assertEqual(self._i('01012345678\n500\nتم'), Intent.TRANSFER)
+
+    def test_receipt_words_without_a_phone(self):
+        self.assertEqual(self._i('دفعت 500 سداد'), Intent.RECEIPT)
+        self.assertEqual(self._i('الإيصال اهو'), Intent.RECEIPT)
+
+    def test_social_and_noise(self):
+        self.assertEqual(classify_text('السلام عليكم')['sub'], 'greeting')
+        self.assertEqual(classify_text('صباح الخير')['sub'], 'morning')
+        self.assertEqual(classify_text('شكرا جدا')['sub'], 'thanks')
+        self.assertEqual(classify_text('شغالين؟')['sub'], 'availability')
+        self.assertEqual(classify_text('ازيك يا باشا')['sub'], 'wellbeing')
+        self.assertEqual(self._i('👍'), Intent.NOISE)
+        self.assertEqual(self._i('احمد'), Intent.NOISE)
+
+    def test_free_text_goes_to_the_model(self):
+        self.assertEqual(self._i('عايز اعرف ليه الرصيد زاد كده من غير ما احول حاجه'), Intent.FREETEXT)
+        self.assertEqual(self._i('ممكن تبعتلي صورة الايصال بتاع امبارح تاني'), Intent.FREETEXT)
+        self.assertEqual(self._i('فين الايصال؟'), Intent.STATUS)
+
+    def test_answers_to_our_question_join_the_money_path(self):
+        self.assertEqual(classify_text('أيوة', quotes_our_question=True)['sub'], 'answer')
+        self.assertEqual(classify_text('700', pending_question=True)['sub'], 'answer')
+        self.assertEqual(classify_text('أيوة')['intent'], Intent.NOISE)
+
+    def test_batch_priority_and_secondary(self):
+        rows = [{'id': 'a', 'type': 'text', 'text': 'السلام عليكم'},
+                {'id': 'b', 'type': 'text', 'text': '01012345678\n500'},
+                {'id': 'c', 'type': 'text', 'text': 'وحسابي كام'}]
+        r = classify_rows(rows)
+        self.assertEqual(r['intent'], Intent.TRANSFER)
+        self.assertEqual(r['primary_id'], 'b')
+        self.assertEqual([s['intent'] for s in r['secondary']], [Intent.SOCIAL, Intent.BALANCE])
+        r = classify_rows([{'id': 'x', 'type': 'image', 'text': ''}, {'id': 'y', 'type': 'text', 'text': '01012345678 500'}])
+        self.assertEqual(r['intent'], Intent.RECEIPT)
+        r = classify_rows([{'id': 'v', 'type': 'audio', 'text': 'حول لرقم 01012345678 خمسمية'}])
+        self.assertEqual(r['intent'], Intent.TRANSFER)
+        self.assertTrue(r['flags'].get('voice'))
+
+    def test_off_hours_only_blocks_what_is_not_balance_or_statement(self):
+        self.assertEqual(classify_rows([{'id': 'a', 'type': 'text', 'text': 'حسابي كام'}], off_hours=True)['intent'], Intent.BALANCE)
+        self.assertEqual(classify_rows([{'id': 'a', 'type': 'text', 'text': '01012345678 500'}], off_hours=True)['intent'], Intent.OFF_HOURS)
+
+    def test_batch_ids_from_channel_markers(self):
+        data = {'message': '[message_id: 5e884d7d-4073-4b1d-91aa-e042809f48ce]\n01009021516',
+                'content': [{'role': 'user', 'content': [{'type': 'text', 'text': '[message_id: f88bd2f1-422b-4117-8d23-ab31a2caa067]\n15,014'}]}]}
+        self.assertEqual(batch_ids_from_input(data), ['5e884d7d-4073-4b1d-91aa-e042809f48ce', 'f88bd2f1-422b-4117-8d23-ab31a2caa067'])
+
+
+class ArabicNumberTests(SimpleTestCase):
+
+    def test_spelled_amounts(self):
+        cases = {'خمسين الف': 50000, 'خمسمائة': 500, 'الفين جنيه': 2000, 'الف و خمسميه': 1500, '27 الف': 27000,
+                 'مية و خمسين': 150, 'تلاتة الاف': 3000, 'ألف': 1000, '٢٧٠٠٠ ألف': 27000, 'خمسة و عشرين الف': 25000,
+                 'مليون': 1000000, 'اتنين مليون': 2000000}
+        for text, value in cases.items():
+            self.assertEqual(parse_arabic_amount(text), value, text)
+
+    def test_names_and_unknown_words_are_refused(self):
+        for text in ('سمية', 'حلمية', 'تلاته الاف و نص', 'خمسين الف تقريبا', ''):
+            self.assertIsNone(parse_arabic_amount(text), text)
+
+
+class TransferDecisionTests(SimpleTestCase):
+
+    def _plan(self, **kw):
+        base = {'success': True, 'pairs': [], 'orphans': [], 'ambiguous': [], 'ignored': [], 'answers': [],
+                'needs_resend': False, 'list_pattern': False}
+        base.update(kw)
+        return base
+
+    def test_clean_pairs_become_items_low_pairs_become_questions(self):
+        plan = self._plan(pairs=[
+            {'account_number': '01009021516', 'value': 44880.0, 'source_message_id': 'm1', 'confidence': 'high'},
+            {'account_number': '01023551947', 'value': 20200.0, 'source_message_id': 'm4', 'confidence': 'low', 'reason': 'list_pairing'},
+        ], orphans=[{'kind': 'phone', 'value': '01127969725', 'message_id': 'm6'}])
+        d = decide(plan, hv_threshold=100000, repeat_pending=False, reroute=None, texts={})
+        self.assertEqual([(i['account_number'], i['value']) for i in d['items']], [('01009021516', 44880.0)])
+        self.assertEqual(d['replies'], [('m4', 'تأكيد: 01023551947 ← 20,200؟'), ('m6', 'المبلغ لـ 01127969725؟')])
+
+    def test_orphan_phone_with_a_label_candidate_gets_a_targeted_question(self):
+        plan = self._plan(orphans=[{'kind': 'phone', 'value': '01023551947', 'message_id': 'a'}],
+                          ignored=[{'message_id': 'a', 'text': 'عبدالله15100', 'reason': 'name_label'}])
+        d = decide(plan, hv_threshold=100000, repeat_pending=False, reroute=None, texts={})
+        self.assertEqual(d['replies'], [('a', 'المبلغ لـ 01023551947 هو 15,100؟')])
+
+    def test_unreadable_separator_is_asked_never_executed(self):
+        plan = self._plan(pairs=[{'account_number': '01012345678', 'value': 460010.0, 'source_message_id': 's',
+                                  'confidence': 'low', 'reason': 'separator_ambiguous'}])
+        d = decide(plan, hv_threshold=100000, repeat_pending=False, reroute=None, texts={'s': '01012345678\n46,0010 مصرى'})
+        self.assertEqual(d['items'], [])
+        self.assertIn('46,0010', d['replies'][0][1])
+
+    def test_yes_answer_confirms_a_held_high_value_or_a_list_pairing(self):
+        plan = self._plan(pairs=[{'account_number': '01012345678', 'value': 150000.0, 'source_message_id': 's', 'confidence': 'high'}],
+                          answers=[{'message_id': 'ans', 'text': 'تأكيد', 'kind': 'confirmation_reply', 'about_phone': '01012345678'}])
+        d = decide(plan, hv_threshold=100000, repeat_pending=False, reroute=None, texts={})
+        self.assertTrue(d['items'][0].get('confirm_high_value'))
+        self.assertIn('ans', d['consume'])
+        plan = self._plan(pairs=[{'account_number': '01012345678', 'value': 500.0, 'source_message_id': 's', 'confidence': 'low', 'reason': 'list_pairing'}],
+                          answers=[{'message_id': 'ans', 'text': 'أيوة', 'kind': 'reply', 'about_phone': '01012345678'}])
+        d = decide(plan, hv_threshold=100000, repeat_pending=False, reroute=None, texts={})
+        self.assertEqual(len(d['items']), 1)
+        self.assertEqual(d['replies'], [])
+
+    def test_yes_and_no_to_a_repeat_question(self):
+        plan = self._plan(answers=[{'message_id': 'ans', 'text': 'أيوة كرر', 'kind': 'reply', 'about_phone': None}])
+        self.assertTrue(decide(plan, hv_threshold=1e5, repeat_pending=True, reroute=None, texts={})['confirm_repeats'])
+        plan = self._plan(answers=[{'message_id': 'ans', 'text': 'لأ', 'kind': 'reply', 'about_phone': None}])
+        d = decide(plan, hv_threshold=1e5, repeat_pending=True, reroute=None, texts={})
+        self.assertTrue(d['clear_repeats'])
+        self.assertEqual(d['replies'], [('ans', 'تمام، مش هتتكرر.')])
+
+    def test_bare_phone_after_a_reroute_notice_takes_the_owed_amount(self):
+        plan = self._plan(orphans=[{'kind': 'phone', 'value': '01006004320', 'message_id': 'n'}])
+        d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute={'amount': 13100.0}, texts={})
+        self.assertEqual(d['items'], [{'type': 'كاش', 'value': 13100.0, 'account_number': '01006004320',
+                                       'source_message_id': 'n', 'reroute': True}])
+        self.assertTrue(d['reroute_used'])
+        # a phone WITH an amount is a complete op, never the reroute answer
+        plan = self._plan(pairs=[{'account_number': '01006004320', 'value': 5.0, 'source_message_id': 'n', 'confidence': 'high'}])
+        d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute={'amount': 100000.0}, texts={})
+        self.assertEqual(d['items'][0]['value'], 5.0)
+        self.assertFalse(d['reroute_used'])
+
+    def test_amount_only_uses_the_single_registered_account(self):
+        plan = self._plan(orphans=[{'kind': 'amount', 'value': 500.0, 'message_id': 'a'}])
+        d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute=None, texts={}, accounts=[('فورى', '6081844')])
+        self.assertEqual(d['items'], [{'type': 'فورى', 'value': 500.0, 'account_number': '6081844', 'source_message_id': 'a'}])
+        d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute=None, texts={}, accounts=[('فورى', '111'), ('أمان', '222')])
+        self.assertEqual(d['items'], [])
+        self.assertIn('أي حساب؟', d['replies'][0][1])
+        self.assertEqual(d['pending']['amount'], 500.0)
+        d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute=None, texts={}, accounts=[])
+        self.assertEqual(d['replies'], [('a', 'الرقم للمبلغ 500؟')])
+
+
+class NonCashResolutionTests(SimpleTestCase):
+
+    def test_account_guard(self):
+        acc = [('فورى', '6081844'), ('أمان', '970604')]
+        self.assertEqual(resolve_noncash('1000 فوري', 'فورى', acc), {'item': {'type': 'فورى', 'value': 1000.0, 'account_number': '6081844'}})
+        self.assertEqual(resolve_noncash('فوري 6081844 700', 'فورى', acc)['item']['value'], 700.0)
+        self.assertIn('مسجل كحساب فورى وليس أمان', resolve_noncash('امان 6081844 500', 'أمان', acc)['reply'])
+        self.assertIn('غير مسجل', resolve_noncash('فوري 5555555 500', 'فورى', [('فورى', '6081844')])['reply'])
+        self.assertIn('لا يوجد حساب طاير', resolve_noncash('طاير 300', 'طاير', acc)['reply'])
+        r = resolve_noncash('فوري 700', 'فورى', [('فورى', '111'), ('فورى', '222')])
+        self.assertEqual(r['reply'], 'أي حساب فورى؟ 1) 111 2) 222')
+        self.assertEqual(r['pending']['amount'], 700.0)
+        self.assertEqual(resolve_noncash('فوري', 'فورى', [('فورى', '111')])['reply'], 'المبلغ لـ فورى 111؟')
+        self.assertEqual(resolve_noncash('الفين فوري', 'فورى', [('فورى', '111')])['item']['value'], 2000.0)
+
+    def test_multi_number_messages(self):
+        m = _multi_number('01012345678\n01098765432\n500 لكل رقم')
+        self.assertEqual((m['mode'], m['amount'], len(m['phones'])), ('each', 500.0, 2))
+        self.assertEqual(_multi_number('01012345678 01098765432 قسم 1000 عليهم')['mode'], 'split')
+        self.assertEqual(_multi_number('01012345678\n01098765432\n1000')['mode'], 'ask')
+        self.assertIsNone(_multi_number('01012345678\n500'))

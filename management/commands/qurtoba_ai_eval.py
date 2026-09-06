@@ -15,8 +15,10 @@ class Command(BaseCommand):
         parser.add_argument('--out', help='output directory (default: /home/genie_qurtoba/ai_eval_<timestamp>)')
         parser.add_argument('--keep', action='store_true', help='leave the sandbox rows of the LAST scenario in place')
         parser.add_argument('--list', action='store_true', help='list scenarios and exit')
+        parser.add_argument('--workflow', type=int, help='workflow id to drive (default: the runner\'s WORKFLOW_ID, 2)')
 
     def handle(self, *args, **opts):
+        from qurtoba.eval import runner as _runner
         from qurtoba.eval.runner import get_sandbox, run_scenario
         from qurtoba.eval.scenarios import SCENARIOS
 
@@ -25,6 +27,8 @@ class Command(BaseCommand):
                 self.stdout.write(f"{s['id']:4s} {s['title']}")
             return
 
+        if opts.get('workflow'):
+            _runner.WORKFLOW_ID = int(opts['workflow'])
         only = {x.strip() for x in (opts['only'] or '').split(',') if x.strip()}
         chosen = [s for s in SCENARIOS if not only or s['id'] in only]
         out = opts['out'] or f"/home/genie_qurtoba/ai_eval_{datetime.now().strftime('%Y%m%d_%H%M')}"
@@ -32,7 +36,7 @@ class Command(BaseCommand):
 
         sandbox = get_sandbox()
         partner, customer, conversation, *_ = sandbox
-        self.stdout.write(f'sandbox: partner={partner.pk} customer={customer.pk} conversation={conversation.id} → {out}')
+        self.stdout.write(f'sandbox: workflow={_runner.WORKFLOW_ID} partner={partner.pk} customer={customer.pk} conversation={conversation.id} → {out}')
 
         results = []
         started = time.time()

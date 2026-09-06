@@ -714,6 +714,28 @@ def send_text_reply_for_record(record, text):
         return False
 
 
+def _set_reroute_marker(conversation, amount, kind, record):
+    """Remember that the customer owes us a NEW NUMBER for `amount`.
+
+    The workflow-v2 automation (qurtoba.automation.transfers) reads this: while the
+    notice is the last thing that happened, the customer's next BARE phone number is
+    the reroute answer and is created with this amount — exactly the rule the prompt
+    gave the model («the amount is ALREADY KNOWN — never ask المبلغ كام»).
+    """
+    try:
+        if conversation is None or not amount or float(amount) <= 0:
+            return
+        import time as _time
+        from django.core.cache import cache
+        cache.set(f'qurtoba:reroute_owed:{conversation.id}',
+                  {'amount': float(amount), 'record_id': getattr(record, 'pk', None),
+                   'kind': kind, 'ts': _time.time()},
+                  24 * 3600)
+    except Exception:
+        logger.warning('[CashSys Notify] reroute marker not set for record=%s', getattr(record, 'pk', None),
+                       exc_info=True)
+
+
 def _send_reroute_ask(record, fulfilled, reroute_amount):
     """
     Tell the customer their recipient number is over its receive limit and we
@@ -750,6 +772,7 @@ def _send_reroute_ask(record, fulfilled, reroute_amount):
         )
         logger.info('[CashSys Notify] reroute ask sent record=%d fulfilled=%s remainder=%s',
                     record.pk, fulfilled, reroute_amount)
+        _set_reroute_marker(ctx['conv'], reroute_amount, 'reroute', record)
     except Exception as exc:
         logger.exception('[CashSys Notify] reroute ask failed record=%d: %s', record.pk, exc)
 
@@ -786,6 +809,9 @@ def _send_cancel_notice(record, reason):
             websocket=True,
         )
         logger.info('[CashSys Notify] cancel notice sent record=%d reason=%s', record.pk, reason)
+        if reason == 'no_wallet':
+            # the whole transfer was reversed → the owed amount is the FULL original amount
+            _set_reroute_marker(ctx['conv'], getattr(record, 'value', None), 'no_wallet', record)
     except Exception as exc:
         logger.exception('[CashSys Notify] cancel notice failed record=%d: %s', record.pk, exc)
 

@@ -324,3 +324,75 @@ SCENARIOS.append({
         'no_success_list': True, 'forbid': NARRATION_FORBID,
     }},
 })
+
+
+# ── V. workflow v2 (automation-first) — router intents, no model on these turns ──
+# Automation replies are SYSTEM sends (fixed lines through the system-send path), so they
+# show up under `tool_texts_contain`, never as agent paragraphs; `reply: silent` therefore
+# asserts that no MODEL text was produced at all on the turn.
+SCENARIOS += [
+    {
+        'id': 'V1', 'title': 'v2: سؤال الرصيد → أداة الرصيد فقط، بدون موديل',
+        'turns': [{'text': 'حسابي كام؟'}],
+        'expect': {'final': {
+            'tools': [{'name': 'qurtoba_send_customer_balance_to_chat', 'must': True}],
+            'no_records': True, 'reply': 'silent', 'forbid': NARRATION_FORBID,
+        }},
+    },
+    {
+        'id': 'V2', 'title': 'v2: تحية → رد ثابت مقتبس، بدون موديل',
+        'turns': [{'text': 'السلام عليكم'}],
+        'expect': {'final': {
+            'no_records': True, 'reply': 'silent', 'tool_texts_contain': ['السلام'], 'forbid': NARRATION_FORBID,
+        }},
+    },
+    {
+        'id': 'V3', 'title': 'v2: «تم؟» → أداة الحالة، سطر واحد',
+        'turns': [{'text': f'{P1}\n\n500'}, {'text': 'تم؟', 'gap': 60, 'reply_to': 0}],
+        'expect': {'1': {
+            'tools': [{'name': 'qurtoba_check_transaction_status', 'must': True}],
+            'reply': 'silent', 'forbid': NARRATION_FORBID,
+        }},
+    },
+    {
+        'id': 'V4', 'title': 'v2: إلغاء دفعة لم تُنشأ → أداة المسح، رسالة الإيقاف',
+        'turns': [{'text': P1}, {'text': 'الغي', 'gap': 5}],
+        'expect': {'1': {
+            'tools': [{'name': 'qurtoba_clear_pending_transfers', 'must': True}],
+            'no_records': True, 'tool_texts_contain': ['تم الإيقاف'], 'reply': 'silent', 'forbid': NARRATION_FORBID,
+        }},
+    },
+    {
+        'id': 'V5', 'title': 'v2: مبلغ بالحروف بدون موديل → إنشاء صامت',
+        'turns': [{'text': f'{P1}\nخمسين الف'}],
+        'expect': {'final': {'creates': [{'account': P1, 'value': 50000}], 'reply': 'silent', 'forbid': NARRATION_FORBID}},
+    },
+    {
+        'id': 'V6', 'title': 'v2: كلمة المبلغ ملزوقة بالرقم (حادثة 5 سبتمبر) → إنشاء صحيح',
+        'turns': [{'text': f'{P1}\n*مبلغ15.100مصري*'}, {'text': '0 10 98765432', 'gap': 0}, {'text': '٢٠٢٠٠', 'gap': 0}],
+        'expect': {'final': {
+            'creates': [{'account': P1, 'value': 15100}, {'account': P2, 'value': 20200}],
+            'no_creates': [{'account': P1, 'value': 20200}], 'reply': 'silent', 'forbid': NARRATION_FORBID,
+        }},
+    },
+    {
+        'id': 'V7', 'title': 'v2: رقم مع اسم ملزوق برقم → سؤال موجّه بدل «المبلغ؟»',
+        'turns': [{'text': f'{P1}\nعبدالله15100'}],
+        'expect': {'final': {'no_records': True, 'tool_texts_contain': ['هو 15,100'], 'reply': 'silent', 'forbid': NARRATION_FORBID}},
+    },
+    {
+        'id': 'V8', 'title': 'v2: انستاباي → رسالة غير مدعوم، بدون إنشاء',
+        'turns': [{'text': f'انستاباي {P1} 500'}],
+        'expect': {'final': {'no_records': True, 'tool_texts_contain': ['انستاباي'], 'reply': 'silent', 'forbid': NARRATION_FORBID}},
+    },
+    {
+        'id': 'V9', 'title': 'v2: نص حر → الموديل الصغير فقط (بدون أدوات مال)',
+        'turns': [{'text': 'عايز اعرف ليه الرصيد زاد كده من غير ما احول حاجه'}],
+        'expect': {'final': {
+            'no_records': True,
+            'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': False},
+                      {'name': 'qurtoba_plan_transactions', 'must': False}],
+            'forbid': NARRATION_FORBID,
+        }},
+    },
+]
