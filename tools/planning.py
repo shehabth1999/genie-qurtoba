@@ -288,6 +288,9 @@ def _classify_message(text: str) -> Dict[str, Any]:
             has_name = True
             _ignore(rest_text, 'words')
 
+    # The same number written twice in one message is ONE number («01… ⏎ 01… ⏎ 800»);
+    # otherwise it becomes two phones and one amount → a bogus «لكل رقم ولا تقسيم؟».
+    phones = list(dict.fromkeys(phones))
     return {
         'phones': phones,
         'amounts': amounts,

@@ -394,3 +394,136 @@ SCENARIOS += [
         }},
     },
 ]
+
+
+# ── X. adversarial — try to make the money path do the WRONG thing ──────────
+P4 = '01011061657'
+P5 = '01275362968'
+SAFE = NARRATION_FORBID + ['Done', 'Output empty']
+SCENARIOS += [
+    {   # amount arrives BEFORE its number, twice, interleaved with names
+        'id': 'X1', 'title': 'x: مبلغ قبل الرقم مرتين مع أسماء بينهم',
+        'turns': [{'text': '500'}, {'text': 'طارق', 'gap': 0}, {'text': P1, 'gap': 0}, {'text': '600', 'gap': 0}, {'text': 'جمال', 'gap': 0}, {'text': P2, 'gap': 0}],
+        'expect': {'final': {'creates': [{'account': P1, 'value': 500}, {'account': P2, 'value': 600}],
+                             'no_creates': [{'account': P1, 'value': 600}, {'account': P2, 'value': 500}], 'forbid': SAFE}},
+    },
+    {   # 4 split pairs in one second → over the limit → nothing created, resend asked
+        'id': 'X2', 'title': 'x: 4 عمليات مقسومة في نفس الثانية → لا تنفيذ، طلب إعادة',
+        'turns': [{'text': P1}, {'text': P2, 'gap': 0}, {'text': P3, 'gap': 0}, {'text': P4, 'gap': 0},
+                  {'text': '100', 'gap': 0}, {'text': '200', 'gap': 0}, {'text': '300', 'gap': 0}, {'text': '400', 'gap': 0}],
+        'expect': {'final': {'no_records': True, 'contains_any': ['رسالة واحدة', 'كل رقم ومبلغه', 'المطابقة'], 'forbid': SAFE}},
+    },
+    {   # two amounts, one number → never two transfers from one number, never the wrong one
+        'id': 'X3', 'title': 'x: رقم واحد ومبلغين → سؤال، لا تخمين',
+        'turns': [{'text': f'{P1}\n500\n700'}],
+        'expect': {'final': {'no_creates': [{'account': P1, 'value': 700}], 'forbid': SAFE}},
+    },
+    {   # zero / negative / fraction amounts must never become transfers
+        'id': 'X4', 'title': 'x: صفر وسالب وكسر → لا تحويل',
+        'turns': [{'text': f'{P1}\n0'}, {'text': f'{P2}\n-500', 'gap': 0}, {'text': f'{P3}\n13.75', 'gap': 0}],
+        'expect': {'final': {'no_records': True, 'forbid': SAFE}},
+    },
+    {   # 12-digit number with an amount → nothing, ask for a correct number; amount must not float
+        'id': 'X5', 'title': 'x: رقم 12 خانة مع مبلغ ثم رقم صحيح مجرد → سؤال «حول» لا تنفيذ صامت',
+        'turns': [{'text': '011188888099\n900'}, {'text': P1, 'gap': 20}],
+        'expect': {'1': {'no_records': True, 'contains_any': ['حول', 'المبلغ'], 'forbid': SAFE}},
+    },
+    {   # «حول» with nothing pending must not create anything
+        'id': 'X6', 'title': 'x: «حول» بدون سؤال معلق → لا شيء',
+        'turns': [{'text': 'حول'}],
+        'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': False}], 'forbid': SAFE}},
+    },
+    {   # «أيوة» with nothing pending must not create anything
+        'id': 'X7', 'title': 'x: «أيوة» بدون سؤال معلق → لا شيء',
+        'turns': [{'text': 'أيوة'}],
+        'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': False}], 'forbid': SAFE}},
+    },
+    {   # two rejected numbers, then one bare number → ambiguous → must ask, never guess
+        'id': 'X8', 'title': 'x: رقمين غلط ثم رقم مجرد → غموض → سؤال لا تنفيذ',
+        'turns': [{'text': '0106013464\n2000'}, {'text': '0100600100\n300', 'gap': 0}, {'text': P1, 'gap': 25}],
+        'expect': {'1': {'no_records': True, 'contains_any': ['المبلغ', 'حول'], 'forbid': SAFE}},
+    },
+    {   # cancel word inside the burst: nothing after it should be created blindly? (office: cancel = alert / clear)
+        'id': 'X9', 'title': 'x: «الغي» وسط دفعة لم تُنشأ',
+        'turns': [{'text': P1}, {'text': 'الغي', 'gap': 3}],
+        'expect': {'1': {'no_records': True, 'forbid': SAFE}},
+    },
+    {   # same burst twice → repeats held, then «لا» → nothing extra created
+        'id': 'X10', 'title': 'x: نفس الدفعة مرتين ثم «لا» → لا تكرار',
+        'turns': [{'text': f'{P1}\n500'}, {'text': f'{P2}\n600', 'gap': 0},
+                  {'text': f'{P1}\n500', 'gap': 70}, {'text': f'{P2}\n600', 'gap': 0}, {'text': 'لا', 'gap': 20}],
+        'expect': {'4': {'no_records': True, 'tools': [{'name': 'qurtoba_confirm_pending_repeats', 'must': False}], 'forbid': SAFE}},
+    },
+    {   # same burst twice then «اها كرر الكل» → exactly 2 more
+        'id': 'X11', 'title': 'x: نفس الدفعة مرتين ثم «اها كرر الكل» → تكرار الاثنين',
+        'turns': [{'text': f'{P1}\n500'}, {'text': f'{P2}\n600', 'gap': 0},
+                  {'text': f'{P1}\n500', 'gap': 70}, {'text': f'{P2}\n600', 'gap': 0}, {'text': 'اها كرر الكل', 'gap': 20}],
+        'expect': {'4': {'creates': [{'account': P1, 'value': 500}, {'account': P2, 'value': 600}], 'forbid': SAFE}},
+    },
+    {   # high value, then customer sends «تأكيد» for a DIFFERENT number → must not execute the held one
+        'id': 'X12', 'title': 'x: مبلغ كبير محجوز ثم «تأكيد» مقتبس على رسالة أخرى',
+        'turns': [{'text': f'{P1}\n150000'}, {'text': f'{P2}\n500', 'gap': 30}, {'text': 'تأكيد', 'gap': 20, 'reply_to': 1}],
+        'expect': {'1': {'creates': [{'account': P2, 'value': 500}]}, '2': {'no_creates': [{'account': P1, 'value': 150000}], 'no_records': True, 'forbid': SAFE}},
+    },
+    {   # answer to an old question after the window expired → a bare amount is an orphan, not the old number's amount
+        'id': 'X13', 'title': 'x: رد بعد انتهاء النافذة (8 دقائق) → لا ربط بالرقم القديم',
+        'turns': [{'text': P1}, {'text': '700', 'gap': 1200}],
+        'expect': {'1': {'no_creates': [{'account': P1, 'value': 700}], 'forbid': SAFE}},
+    },
+    {   # arabic-indic digits + spaces + country code + thousands dot, all in one burst
+        'id': 'X14', 'title': 'x: أرقام هندية ومسافات وكود دولة ونقطة آلاف',
+        'turns': [{'text': '٠١٠١٢٣٤٥٦٧٨\n١٫٥٠٠'}, {'text': '+20 109 876 5432\n2.500', 'gap': 0}],
+        'expect': {'final': {'creates': [{'account': P1, 'value': 1500}, {'account': P2, 'value': 2500}], 'forbid': SAFE}},
+    },
+    {   # number written twice in the same message with one amount → one transfer only
+        'id': 'X15', 'title': 'x: نفس الرقم مكرر في رسالة واحدة مع مبلغ → عملية واحدة',
+        'turns': [{'text': f'{P1}\n{P1}\n800'}],
+        'expect': {'final': {'records_count': {'account': P1, 'value': 800, 'count': 1}, 'forbid': SAFE}},
+    },
+    {   # a phone-looking amount (10 digits) and an amount-looking phone
+        'id': 'X16', 'title': 'x: مبلغ ضخم بيشبه رقم (9 خانات) → لا يُقرأ كرقم',
+        'turns': [{'text': f'{P1}\n123456789'}],
+        'expect': {'final': {'no_creates': [{'account': '0123456789', 'value': None}], 'forbid': SAFE}},
+    },
+    {   # «لكل رقم» with three numbers → three creates of the same amount
+        'id': 'X17', 'title': 'x: ثلاث أرقام و«500 لكل رقم» → ثلاث عمليات',
+        'turns': [{'text': f'{P1}\n{P2}\n{P3}\n500 لكل رقم'}],
+        'expect': {'final': {'creates': [{'account': P1, 'value': 500}, {'account': P2, 'value': 500}, {'account': P3, 'value': 500}], 'forbid': SAFE}},
+    },
+    {   # «قسم» → nothing created, human alerted
+        'id': 'X18', 'title': 'x: «قسم 1500 على الأرقام» → لا تنفيذ، تنبيه بشري',
+        'turns': [{'text': f'{P1}\n{P2}\n{P3}\nقسم 1500 عليهم'}],
+        'expect': {'final': {'no_records': True, 'tools': [{'name': 'alert_qurtoba_human', 'must': True}], 'forbid': SAFE}},
+    },
+    {   # greeting + transfer + balance in one burst → transfer created, balance answered, greeting not a transfer
+        'id': 'X19', 'title': 'x: تحية + تحويل + سؤال رصيد في دفعة واحدة',
+        'turns': [{'text': 'السلام عليكم'}, {'text': f'{P1}\n500', 'gap': 0}, {'text': 'وحسابي كام', 'gap': 0}],
+        'expect': {'final': {'records_count': {'account': P1, 'value': 500, 'count': 1},
+                             'tools': [{'name': 'qurtoba_send_customer_balance_to_chat', 'must': True}], 'forbid': SAFE}},
+    },
+    {   # a sentence with a number in it is not a transfer
+        'id': 'X20', 'title': 'x: جملة فيها رقم مش تحويل',
+        'turns': [{'text': f'انا بعت لـ {P1} امبارح 500 وصلت؟'}],
+        'expect': {'final': {'no_records': True, 'contains_any': ['حول', 'سؤال'], 'forbid': SAFE}},
+    },
+    {   # instapay with a valid phone and amount → never a cash transfer
+        'id': 'X21', 'title': 'x: انستاباي مع رقم صحيح ومبلغ → لا تنفيذ',
+        'turns': [{'text': f'انستا باي\n{P1}\n500'}],
+        'expect': {'final': {'no_records': True, 'contains_any': ['انستاباي', 'غير مدعوم'], 'forbid': SAFE}},
+    },
+    {   # voice message with a number → never executed
+        'id': 'X22', 'title': 'x: رسالة صوتية فيها رقم ومبلغ → لا تنفيذ',
+        'turns': [{'text': f'حول لرقم {P1} خمسمية', 'type': 'audio'}],
+        'expect': {'final': {'no_records': True, 'forbid': SAFE}},
+    },
+    {   # the same amount answer arrives for a number, then the number again with a different amount
+        'id': 'X23', 'title': 'x: رقم ثم مبلغ (إجابة) ثم نفس الرقم بمبلغ مختلف → عمليتان مختلفتان',
+        'turns': [{'text': P1}, {'text': '300', 'gap': 15}, {'text': f'{P1}\n450', 'gap': 70}],
+        'expect': {'1': {'creates': [{'account': P1, 'value': 300}]}, '2': {'creates': [{'account': P1, 'value': 450}], 'forbid': SAFE}},
+    },
+    {   # bad number then a NEW complete transfer then a bare number → the bare number is NOT the correction
+        'id': 'X24', 'title': 'x: رقم غلط ثم تحويل جديد كامل ثم رقم مجرد → لا تصحيح متأخر',
+        'turns': [{'text': '0106013464\n2000'}, {'text': f'{P2}\n700', 'gap': 30}, {'text': P1, 'gap': 30}],
+        'expect': {'1': {'creates': [{'account': P2, 'value': 700}]}, '2': {'no_creates': [{'account': P1, 'value': 2000}], 'no_records': True, 'forbid': SAFE}},
+    },
+]

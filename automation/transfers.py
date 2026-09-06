@@ -240,11 +240,10 @@ def match_corrections(orphan_phones: List[Dict[str, Any]], rejected: List[Dict[s
     items: List[Dict[str, Any]] = []
     used = set()
     for o in sorted(orphan_phones, key=lambda x: x['at']):
-        cands = [r for r in rejected if r['message_id'] not in used and r.get('asked') and r.get('amount')
-                 and r['at'] < o['at']]
-        if len(cands) != 1:
-            continue
-        r = cands[0]
+        before = [r for r in rejected if r['message_id'] not in used and r.get('amount') and r['at'] < o['at']]
+        if len(before) != 1 or not before[0].get('asked'):
+            continue                       # two rejected messages → ambiguous; not yet told → not a correction
+        r = before[0]
         used.add(r['message_id'])
         items.append({'type': 'كاش', 'value': float(r['amount']), 'account_number': o['value'],
                       'source_message_id': o['message_id'], 'correction_of': r['message_id']})
@@ -404,17 +403,26 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             pre_replies.append((mid, R.INSTAPAY))
             pre_consume.append(mid)
             continue
+        if cls['phones'] and cls['amounts'] and L.is_question(text) and len(cls['phones']) == 1 and len(cls['amounts']) == 1:
+            # «انا بعت لـ 01… امبارح 500 وصلت؟» — a QUESTION with a number and an amount in it is not
+            # an order. Confirm first; «حول» creates it (2026-09-06 adversarial test X20 created it).
+            pre_replies.append((mid, R.QUESTION_CONFIRM.format(amount=R._fmt(cls['amounts'][0]), phone=cls['phones'][0])))
+            cache_set(CORRECTION_KEY.format(conv=conv_key),
+                      {'type': 'كاش', 'value': float(cls['amounts'][0]), 'account_number': cls['phones'][0],
+                       'source_message_id': mid, 'correction_of': None, 'ts': time.time()}, PENDING_TTL)
+            pre_consume.append(mid)
+            continue
         if correction_pending and mid in (route.get('batch_ids') or []) and not cls['phones'] and not cls['amounts']:
             if L.is_yes(text):
                 pre_items.append({'type': 'كاش', 'value': float(correction_pending['value']),
                                   'account_number': correction_pending['account_number'],
                                   'source_message_id': correction_pending['source_message_id']})
-                pre_consume += [mid, correction_pending.get('correction_of')]
+                pre_consume += [x for x in (mid, correction_pending.get('correction_of')) if x]
                 cache_delete(CORRECTION_KEY.format(conv=conv_key)); correction_pending = None
                 continue
             if L.is_no(text):
                 pre_replies.append((mid, R.CORRECTION_DECLINED))
-                pre_consume += [mid, correction_pending.get('correction_of'), correction_pending.get('source_message_id')]
+                pre_consume += [x for x in (mid, correction_pending.get('correction_of'), correction_pending.get('source_message_id')) if x]
                 cache_delete(CORRECTION_KEY.format(conv=conv_key)); correction_pending = None
                 continue
         if multi_pending and mid in (route.get('batch_ids') or []) and not cls['phones']:
@@ -512,7 +520,7 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         amt = _broken_number_amount(_text_of(m))
         if amt:
             rejected.append({'message_id': mid, 'amount': amt, 'at': m.created_at,
-                             'asked': said_recently(conversation, mid, R.BAD_NUMBER, minutes=360)})
+                             'asked': _replied_on(conversation, mid, minutes=360)})
     if plan.get('success') and rejected and any(o.get('kind') == 'phone' for o in plan.get('orphans') or []):
         orphan_phones = [{'message_id': o['message_id'], 'value': o['value'], 'at': rows[o['message_id']].created_at}
                          for o in plan['orphans'] if o.get('kind') == 'phone' and o.get('message_id') in rows]
@@ -552,6 +560,10 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                                                    'about_message_id': hv_src, 'question_text': R.HIGH_VALUE})
             continue
         if not (L.is_yes(text) or L.is_no(text)):
+            continue
+        # a yes/no quoted on ANOTHER customer message is about that message, not our question
+        q = getattr(m, 'reply_to', None)
+        if q is not None and getattr(q, 'direction', None) == 'inbound' and str(q.id) != (hv_src or ''):
             continue
         about = None
         if repeat_pending:
@@ -734,26 +746,39 @@ def _noncash_answer(text: str, pending: Dict[str, Any]) -> Optional[Dict[str, An
     return None
 
 
-def _hv_question_pending(conversation):
-    """(phone, source message id) of the transfer our last «مبلغ كبير — محتاج تأكيد» line (≤ 6 h)
-    is holding, else (None, None)."""
+def _replied_on(conversation, message_id, *, minutes: int = 360) -> bool:
+    """True if any outbound text quotes `message_id` within `minutes` (whatever its wording)."""
     try:
         from datetime import timedelta
         from django.utils import timezone
         from modules.chat.models import Message
-        m = (Message.objects_all.filter(conversation=conversation, direction='outbound', type='text', active=True,
-                                        created_at__gte=timezone.now() - timedelta(hours=6))
-             .select_related('reply_to').order_by('-created_at').first())
-        if m is None:
-            return None, None
-        txt = (m.content or {}).get('text') if isinstance(m.content, dict) else ''
-        if not txt or not str(txt).startswith('مبلغ كبير'):
-            return None, None
-        q = m.reply_to
-        if q is None or getattr(q, 'direction', None) != 'inbound':
-            return None, None
-        phones = _classify_message(_text_of(q)).get('phones') or []
-        return (phones[0], str(q.id)) if phones else (None, None)
+        return Message.objects_all.filter(conversation=conversation, direction='outbound', type='text',
+                                          reply_to_id=str(message_id),
+                                          created_at__gte=timezone.now() - timedelta(minutes=minutes)).exists()
+    except Exception:
+        return False
+
+
+def _hv_question_pending(conversation):
+    """(phone, source message id) of the transfer our «مبلغ كبير — محتاج تأكيد» line (≤ 6 h, among the
+    last 12 outbound lines) is holding — as long as that transfer's message is still unconsumed —
+    else (None, None)."""
+    try:
+        from datetime import timedelta
+        from django.utils import timezone
+        from modules.chat.models import Message
+        for m in (Message.objects_all.filter(conversation=conversation, direction='outbound', type='text', active=True,
+                                             created_at__gte=timezone.now() - timedelta(hours=6))
+                  .select_related('reply_to').order_by('-created_at')[:12]):
+            txt = (m.content or {}).get('text') if isinstance(m.content, dict) else ''
+            if not txt or not str(txt).startswith('مبلغ كبير'):
+                continue
+            q = m.reply_to
+            if q is None or getattr(q, 'direction', None) != 'inbound' or getattr(q, 'ai_consumed_at', None):
+                return None, None
+            phones = _classify_message(_text_of(q)).get('phones') or []
+            return (phones[0], str(q.id)) if phones else (None, None)
+        return None, None
     except Exception:
         return None, None
 

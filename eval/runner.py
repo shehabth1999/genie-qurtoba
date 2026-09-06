@@ -314,7 +314,7 @@ def reset_sandbox(conversation, customer, keep_rows: bool = False):
                 pass
 
 
-def insert_inbound(conversation, partner, text: str, reply_to=None, sent_at=None):
+def insert_inbound(conversation, partner, text: str, reply_to=None, sent_at=None, msg_type: str = 'text'):
     """An inbound row exactly as the bridge writes it.
 
     Created WITHOUT a WhatsApp id (so chat.Message.post_create never schedules the
@@ -323,8 +323,9 @@ def insert_inbound(conversation, partner, text: str, reply_to=None, sent_at=None
     from django.contrib.contenttypes.models import ContentType
     from modules.chat.models import Message
     sa = conversation.social_account
+    content = {'text': text} if msg_type == 'text' else {'transcription': text} if msg_type in ('audio', 'voice') else {'caption': text}
     row = Message.objects_all.create(
-        conversation=conversation, sender=partner, type='text', content={'text': text},
+        conversation=conversation, sender=partner, type=msg_type, content=content,
         direction='inbound', status='saved', reply_to=reply_to,
         social_sent_at=sent_at or timezone.now(),
         social_account_content_type=ContentType.objects.get_for_model(sa) if sa else None,
@@ -636,7 +637,7 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
                 batch_clock = timezone.now() - timedelta(seconds=3 * (n_batch - 1))
             else:
                 batch_clock = batch_clock + timedelta(seconds=t.get('offset', 3))
-            row = insert_inbound(conversation, partner, t['text'], reply_to=reply_to, sent_at=batch_clock)
+            row = insert_inbound(conversation, partner, t['text'], reply_to=reply_to, sent_at=batch_clock, msg_type=t.get('type', 'text'))
             rows_by_turn[i] = row
             batch.append(row)
         if batch:

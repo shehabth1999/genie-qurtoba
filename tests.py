@@ -430,3 +430,25 @@ class CorrectionConfirmTests(SimpleTestCase):
         self.assertFalse(L.is_yes('حول 500'))
         self.assertEqual(R.CORRECTION_CONFIRM.format(amount='2,000', phone='01060134646'),
                          'الرقم اللي فات كان غلط 🙏\nتقصد تحويل 2,000 على الرقم ده 01060134646؟\nلو أيوة ابعت «حول» وننفذها فوراً.')
+
+
+class AdversarialFixTests(SimpleTestCase):
+
+    def test_two_rejected_numbers_make_a_correction_ambiguous(self):
+        items = match_corrections(
+            [{'message_id': 'n', 'value': '01012345678', 'at': 10}],
+            [{'message_id': 'a', 'amount': 2000.0, 'at': 5, 'asked': True},
+             {'message_id': 'b', 'amount': 300.0, 'at': 6, 'asked': False}])
+        self.assertEqual(items, [])
+
+    def test_question_confirm_line(self):
+        from qurtoba.automation import replies as R
+        line = R.QUESTION_CONFIRM.format(amount='500', phone='01012345678')
+        self.assertIn('«حول»', line)
+        self.assertIn('01012345678', line)
+
+    def test_same_number_twice_in_one_message_is_one_number(self):
+        cls = _classify_message('01012345678\n01012345678\n800')
+        self.assertEqual(cls['phones'], ['01012345678'])
+        self.assertEqual(cls['amounts'], [800])
+        self.assertIsNone(_multi_number('01012345678\n01012345678\n800'))

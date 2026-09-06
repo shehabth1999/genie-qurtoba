@@ -69,6 +69,8 @@ CORRECTION_CONFIRM = ('الرقم اللي فات كان غلط 🙏\n'
                       'تقصد تحويل {amount} على الرقم ده {phone}؟\n'
                       'لو أيوة ابعت «حول» وننفذها فوراً.')
 CORRECTION_DECLINED = 'تمام، مفيش تحويل على الرقم ده.'
+QUESTION_CONFIRM = ('الرسالة دي سؤال ولا طلب تحويل؟ 🙏\n'
+                    'لو عايز تحويل {amount} على {phone} ابعت «حول» وننفذه فوراً.')
 NEITHER_OPTION = 'تمام، يبقى {amount} على {phone}؟'
 UNCLEAR_ANSWER = 'رديت بـ«{text}» على «{question}» — قصدك أيوة ولا لأ؟'
 UNCLEAR_HV_ANSWER = 'رديت بـ«{text}» على تأكيد الـ{amount} — قصدك نأكد الـ{amount} ولا المبلغ {text} بس؟'
