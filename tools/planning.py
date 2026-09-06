@@ -76,14 +76,47 @@ _GLUE_OK_WORDS = (set(_CURRENCY_WORDS) | _THOUSAND_FORMS | _THOUSAND_DUAL
                      'فودافون', 'اتصالات', 'اورانج', 'وي', 'k', 'm'})
 
 
-def _is_glued_name_label(tok: str) -> bool:
-    """True if `tok` is an Arabic NAME with digits glued to its END — «عبدالله12», «طه13» —
-    so those digits are a serial/label, NEVER a transfer amount.
+# Amount-LABEL words a customer writes right before the number, sometimes glued to it:
+# «مبلغ15.100مصري», «القيمه11.088», «حواله24000», «المطلوب5000». These name the VALUE, so a
+# token led by one of them is an amount, never a name+serial. (2026-09-05: «مبلغ15.100» was
+# dropped as a name label, which orphaned its phone and mis-paired the next amount.)
+# Spellings are the `_arabic_normalize` forms (أ/إ/آ→ا, ى→ي); ة/ه variants are listed.
+_AMOUNT_LABEL_WORDS = {
+    'مبلغ', 'قيمه', 'قيمة', 'حواله', 'حوالة', 'تحويل', 'حول', 'ارسال', 'ابعت', 'رصيد',
+    'تسليم', 'مطلوب', 'اجمالي', 'مجموع', 'سعر', 'ثمن', 'نقدي', 'نقدا',
+}
 
-    Rule: a real amount token LEADS with its number («2350..اسامة», «13300جنيه», «30الف»);
-    a token that leads with Arabic LETTERS and has the digits trailing is a name+serial.
-    The leading letters are checked against `_GLUE_OK_WORDS` so «كاش12080» / «30الف» (a type
-    or multiplier lead) are still read as amounts, not labels."""
+# Letters that may PRECEDE a label/glue word without changing it: و/ف (conjunction),
+# ب/ل/ك (preposition), ال / لل (article) — «بمبلغ», «والقيمه», «للمبلغ», «بالكاش».
+_LEAD_PREFIX_RE = re.compile(r'^(?:و|ف)?(?:لل|(?:ب|ل|ك)?(?:ال)?)')
+
+
+def _lead_is_amount_words(lead: str) -> bool:
+    """True if `lead` (letters only, normalized) is made ONLY of words that legitimately sit
+    before an amount — label words (مبلغ/قيمه/حواله…), type/wallet/currency/multiplier words —
+    each optionally carrying a prefix (بـ/الـ/و…). Words are peeled from the START so a
+    NAME that merely contains such letters («بلال», «سمية») is never accepted."""
+    words = sorted(_GLUE_OK_WORDS | _AMOUNT_LABEL_WORDS, key=len, reverse=True)
+    rest = lead
+    while rest:
+        hit = next((w for w in words if rest.startswith(w)), None)
+        if hit is None:
+            stripped = _LEAD_PREFIX_RE.sub('', rest, count=1)
+            if stripped == rest or not stripped:
+                return False                  # a real word we don't know, or a bare prefix («ك29») → a label
+            rest = stripped
+            continue
+        rest = rest[len(hit):]
+    return True
+
+
+def _is_glued_name_label(tok: str) -> bool:
+    """True if `tok` is an Arabic NAME with digits glued to its END — «عبدالله12», «طه13.40» —
+    so those digits are a serial/label/tally, NEVER a transfer amount.
+
+    Rule: a real amount token LEADS with its number («2350..اسامة», «13300جنيه», «30الف»)
+    or with a word that NAMES an amount («مبلغ15.100», «القيمه11.088», «كاش12080», «30الف»);
+    a token that leads with any OTHER letters and has the digits trailing is a name+serial."""
     t = _arabic_normalize(_ar_to_ascii(tok or '')).lower().strip()
     if not re.search(r'\d', t):
         return False
@@ -91,9 +124,7 @@ def _is_glued_name_label(tok: str) -> bool:
     lead = re.sub('[^a-z؀-ۿ]', '', m.group(1) if m else '')
     if not lead:
         return False                          # number leads → real amount candidate
-    for w in _GLUE_OK_WORDS:
-        lead = lead.replace(w, '')
-    return bool(lead)                          # leftover real letters before the digit → a name label
+    return not _lead_is_amount_words(lead)    # unknown letters before the digit → a name label
 
 
 def _is_phone(s: str) -> Optional[str]:
@@ -158,15 +189,32 @@ def _classify_message(text: str) -> Dict[str, Any]:
     correctly while a spaced phone ("+20 100 280 4814") stays one number. A
     fractional value (13.75, 6.08) is a commission tally, NOT a transfer amount —
     it is dropped here, never read as an amount.
+
+    `ignored` lists every DIGIT-bearing piece the classifier treated as a comment rather
+    than a value — [{text, reason}] with reason one of: bracketed «(124)», broken_phone
+    «0100600100», name_label «عبدالله12», fee_note «لو هيخصم 15», reference_note
+    «رقم العملية 5», fraction «طه 13.75», words (a sentence with a number in it). The
+    planner hands these to the agent so it can tell a comment from a value instead of
+    guessing; digit-less noise (names, currency words) is not listed.
     """
     text = _merge_multiplier_lines(text or '')
     text = _ar_to_ascii(text)
+    ignored: List[Dict[str, str]] = []
+
+    def _ignore(piece: str, reason: str) -> None:
+        piece = ' '.join(str(piece or '').split())
+        if piece and re.search(r'\d', piece):
+            ignored.append({'text': piece[:60], 'reason': reason})
+
     # Drop bracketed/parenthesised content — it's a serial / device tag / reference note
     # («(vivo - shehab - 652)», «(124)», «[3]»), NEVER a transfer amount. Removing it stops
     # its digits from being read as an amount. Balanced brackets only (repeat to peel nesting);
     # an amount is never written inside brackets, so this is safe.
+    _BRACKET_RE = re.compile(r'\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}')
     for _ in range(3):
-        _new = re.sub(r'\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}', ' ', text)
+        for _br in _BRACKET_RE.findall(text):
+            _ignore(_br, 'bracketed')
+        _new = _BRACKET_RE.sub(' ', text)
         if _new == text:
             break
         text = _new
@@ -200,8 +248,10 @@ def _classify_message(text: str) -> Dict[str, Any]:
         for _tok in rest:
             if re.fullmatch(r'0\d{9,11}', _tok):
                 has_name = True            # broken phone → noise, not a giant amount
+                _ignore(_tok, 'broken_phone')
             elif _is_glued_name_label(_tok):
                 has_name = True            # «عبدالله12» → name+serial, its digit is NOT an amount
+                _ignore(_tok, 'name_label')
             else:
                 _kept_rest.append(_tok)
         rest = _kept_rest
@@ -212,27 +262,38 @@ def _classify_message(text: str) -> Dict[str, Any]:
         # Fee-deduction instruction («لو هيخصم 15 اخصمها», «اخصم الرسوم») → the number here
         # is a FEE reference, not a transfer amount. Treat the line as a note; extract nothing.
         # Same for a reference/receipt-serial phrase («رقم العملية 5», «الرقم المرجعي 12345»).
-        if _FEE_NOTE_RE.search(rest_text) or _REF_NOTE_RE.search(rest_text):
+        if _FEE_NOTE_RE.search(rest_text):
             has_name = True
+            _ignore(rest_text, 'fee_note')
+            continue
+        if _REF_NOTE_RE.search(rest_text):
+            has_name = True
+            _ignore(rest_text, 'reference_note')
             continue
         r = normalize_amount(rest_text)
         if r['ok'] and float(r['value']).is_integer():
             amounts.append(r['value'])
             if r.get('ambiguous'):
                 ambiguous.append(r['value'])
+        elif r['ok']:
+            _ignore(rest_text, 'fraction')     # «13.75» — a tally, never a transfer amount
         elif r.get('reason') == 'multiple_numbers':
             for tok in re.findall(r'\d[\d.,]*', rest_text):
                 rr = normalize_amount(tok)
                 if rr['ok'] and float(rr['value']).is_integer():
                     amounts.append(rr['value'])
+                elif rr['ok']:
+                    _ignore(tok, 'fraction')
         elif re.sub(r'[\d\s.,+\-]', '', rest_text):
             has_name = True
+            _ignore(rest_text, 'words')
 
     return {
         'phones': phones,
         'amounts': amounts,
         'ambiguous': ambiguous,
         'has_name': has_name,
+        'ignored': ignored,
     }
 
 
@@ -704,6 +765,12 @@ def consumed_ids_by_source(conv):
         'number/amount in SEPARATE messages). Withheld items are NOT in pairs; do NOT reconstruct '
         'them — relay the `note` (your words: resend each number+amount in one message, ≤3 at a '
         'time). A same-second split of ≤3 comes back as normal pairs → execute, no confirmation. '
+        '- ignored: [{message_id, text, reason}] — digit-bearing pieces the tool treated as a '
+        'COMMENT, not a value: name_label («عبدالله12», «طه13.40»), fraction (a tally «13.75»), '
+        'bracketed («(124)»), reference_note («رقم العملية 5»), fee_note («لو هيخصم 15»), '
+        'broken_phone, words (a sentence with a number). Never create from them. When an orphan '
+        'PHONE\'s own message carries one, do not ask a blank «المبلغ؟» — ask the customer to '
+        'confirm THAT number as the amount («المبلغ لـ {الرقم} هو {X}؟») and create only on yes. '
         '- read_amounts: [{message_id, text}] — amounts written in Arabic WORDS the tool could not '
         'convert (usually orphan their phone). Read the value yourself and create the op; do NOT '
         'ask for an amount already present in words, and ignore any stray number for those lines. '
@@ -916,6 +983,22 @@ def qurtoba_plan_transactions(
                 'text': ' '.join(str(txt).split()),
             })
 
+    # --- Digit-bearing pieces the classifier treated as COMMENTS, per message ------------
+    # Surfaced verbatim so the agent can tell a comment («طه13.40», «(124)», «رقم العملية 5»)
+    # from a value without guessing — and, for an orphan phone whose own message carried one,
+    # confirm THAT number with the customer instead of asking a blank «المبلغ؟».
+    ignored_out: List[Dict[str, Any]] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get('message_id') or '').strip() or None
+        txt = (msg_text.get(mid) if mid else None) or m.get('text') or ''
+        for ig in _classify_message(txt).get('ignored') or []:
+            ignored_out.append({'message_id': mid, **ig})
+    ignored_out = ignored_out[:40]
+    _orphan_phone_mids = {o.get('message_id') for o in orphans if o.get('kind') == 'phone'}
+    orphan_hints = [ig for ig in ignored_out if ig.get('message_id') in _orphan_phone_mids]
+
     note = 'كل رقم متطابق مع مبلغه.'
     if blocked_overflow:
         note = ('وصلت رسائل كتير في نفس اللحظة (أكتر من 3 تحويلات) والأرقام والمبالغ في رسائل '
@@ -925,6 +1008,11 @@ def qurtoba_plan_transactions(
                 'ووضّح له السبب باختصار.')
     elif orphans:
         note = 'بعض الأرقام أو المبالغ بدون مقابل — اسأل عنها قبل التنفيذ.'
+        if orphan_hints:
+            _hint = '؛ '.join(f"«{h['text']}» ({h['reason']})" for h in orphan_hints[:6])
+            note += (f' رسالة رقم بدون مبلغ فيها كمان أجزاء اتجاهلت كتعليق: {_hint}. لو الجزء ده '
+                     'ممكن يكون هو المبلغ، ما تسألش «المبلغ؟» على الفاضي — اسأل العميل يأكد الرقم '
+                     'ده بالذات («المبلغ لـ {الرقم} هو {X}؟») وما تنفذش غير على تأكيد صريح.')
     elif any(a.get('reason') == 'separator_ambiguous' for a in ambiguous_out):
         _unreadable = '، '.join(
             f"{a['account_number']} (المبلغ كما وصل: «{(msg_text.get(a.get('source_message_id')) or '').strip().splitlines()[-1][:20] if msg_text.get(a.get('source_message_id')) else a['value']}»)"
@@ -967,6 +1055,7 @@ def qurtoba_plan_transactions(
             orphans=[{'kind': o['kind'], 'val': o['value']} for o in orphans] or None,
             fb_used={k[:8]: v for k, v in msg_fallback.items()} or None,
             read_amounts=[r['text'] for r in read_amounts] or None,
+            ignored=[{'t': i['text'], 'r': i['reason']} for i in ignored_out] or None,
             list_pattern=list_pattern or None,
             overflow=blocked_overflow or None,
             resend=[{'acc': r['account_number'], 'val': r['value']} for r in resend] or None,
@@ -984,6 +1073,7 @@ def qurtoba_plan_transactions(
         'same_time_overflow': blocked_overflow,
         'resend': resend,
         'read_amounts': read_amounts,
+        'ignored': ignored_out,
         'answers': answers,
         'summary': {
             'pairs_count': len(pairs),
