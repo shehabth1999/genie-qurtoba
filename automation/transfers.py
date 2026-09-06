@@ -505,15 +505,15 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     # and takes its amount (2026-09-06: «0106013464 ⏎ الفين جنيه» → «01060134646» was asked
     # «المبلغ؟» again — a person would never ask).
     corrections: List[Dict[str, Any]] = []
-    if plan.get('success') and any(o.get('kind') == 'phone' for o in plan.get('orphans') or []):
-        rejected = []
-        for mid, m in rows.items():
-            if m.type != 'text':
-                continue
-            amt = _broken_number_amount(_text_of(m))
-            if amt:
-                rejected.append({'message_id': mid, 'amount': amt, 'at': m.created_at,
-                                 'asked': said_recently(conversation, mid, R.BAD_NUMBER, minutes=360)})
+    rejected: List[Dict[str, Any]] = []          # bad-number messages still in the window
+    for mid, m in rows.items():
+        if m.type != 'text':
+            continue
+        amt = _broken_number_amount(_text_of(m))
+        if amt:
+            rejected.append({'message_id': mid, 'amount': amt, 'at': m.created_at,
+                             'asked': said_recently(conversation, mid, R.BAD_NUMBER, minutes=360)})
+    if plan.get('success') and rejected and any(o.get('kind') == 'phone' for o in plan.get('orphans') or []):
         orphan_phones = [{'message_id': o['message_id'], 'value': o['value'], 'at': rows[o['message_id']].created_at}
                          for o in plan['orphans'] if o.get('kind') == 'phone' and o.get('message_id') in rows]
         for c in match_corrections(orphan_phones, rejected):
@@ -600,10 +600,13 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             # «The expectation expires: any other transaction since → a bare number is a normal op.»
             # The customer moved on — a rejected message older than what was just created is retired,
             # so a later bare number can never pick up its amount by mistake.
+            # Only a rejection the customer was ALREADY told about (an earlier turn) expires: the
+            # other transfers of the same burst are not «moving on» (2026-09-06 10:37: the ten
+            # creates of the burst retired its own rejected message before it could be corrected).
             newest_created = max((rows[i['source_message_id']].created_at for i in created_items
                                   if i.get('source_message_id') in rows), default=None)
-            stale = [mid for mid, m in rows.items() if m.type == 'text' and newest_created is not None
-                     and m.created_at < newest_created and _broken_number_amount(_text_of(m))]
+            stale = [r['message_id'] for r in rejected
+                     if r['asked'] and newest_created is not None and r['at'] < newest_created]
             if stale:
                 consume(conversation, stale)
                 cache_delete(CORRECTION_KEY.format(conv=conv_key))
