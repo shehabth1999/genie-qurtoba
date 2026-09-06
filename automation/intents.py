@@ -109,7 +109,8 @@ def cancel(conversation, partner, route: Dict[str, Any]) -> str:
     from .router import unprocessed_text_rows
     primary = _primary(route)
     batch_ids = set(route.get('batch_ids') or [])
-    pending_rows = [m for m in unprocessed_text_rows(conversation) if str(m.id) not in batch_ids]
+    cancel_ids = {r['id'] for r in route.get('rows') or [] if r.get('intent') == 'cancel'} | {primary}
+    pending_rows = [m for m in unprocessed_text_rows(conversation) if str(m.id) not in cancel_ids]
     money_pending = any(_classify_message(str((m.content or {}).get('text') or ''))['phones']
                         or _classify_message(str((m.content or {}).get('text') or ''))['amounts']
                         for m in pending_rows)
@@ -122,7 +123,7 @@ def cancel(conversation, partner, route: Dict[str, Any]) -> str:
         note = 'العميل يطلب إلغاء: «' + ' | '.join(texts.values())[:200] + f'» [message_id: {primary}]'
         alert_human(conversation, partner, note)
         send_quoted(conversation, primary, R.WAIT)
-    consume(conversation, batch_ids)
+    consume(conversation, cancel_ids)
     return ''
 
 
@@ -142,6 +143,8 @@ def social(conversation, partner, route: Dict[str, Any]) -> str:
         line = R.pick(R.MORNING, seed)
     elif sub == 'evening':
         line = R.pick(R.EVENING, seed)
+    elif sub == 'salam':
+        line = R.pick(R.SALAM, seed)
     else:
         line = R.pick(R.GREETINGS, seed)
     send_quoted(conversation, primary, line)
@@ -158,6 +161,16 @@ def off_hours(conversation, partner, route: Dict[str, Any]) -> str:
 
 
 def noise(conversation, partner, route: Dict[str, Any]) -> str:
+    consume(conversation, route.get('batch_ids') or [])
+    return ''
+
+
+def freetext_secondary(conversation, partner, route: Dict[str, Any]) -> str:
+    """Free text riding next to a transaction: the money path already ran; a human reads the rest."""
+    texts = _batch_texts(conversation, route)
+    text = ' | '.join(texts.values())[:200]
+    if text.strip():
+        alert_human(conversation, partner, f'رسالة حرة بجانب معاملة: «{text}» [message_id: {_primary(route)}]')
     consume(conversation, route.get('batch_ids') or [])
     return ''
 
@@ -200,4 +213,5 @@ HANDLERS = {
     'social': social,
     'off_hours': off_hours,
     'noise': noise,
+    'freetext': freetext_secondary,
 }

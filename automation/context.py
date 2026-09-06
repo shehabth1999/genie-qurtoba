@@ -7,6 +7,7 @@
   (the outbound gate lets system text through untouched) and mark the turn answered.
 * ``consume`` watermarks inbound rows the automation has finished with.
 """
+import contextvars
 import json
 import logging
 import time
@@ -16,6 +17,13 @@ from typing import Any, Callable, Dict, Iterable, Optional
 logger = logging.getLogger(__name__)
 
 AUTOMATION_TAG = 'qurtoba_automation'
+_REPLYING = contextvars.ContextVar('qurtoba_automation_reply', default=False)
+
+
+def in_automation_reply() -> bool:
+    """True while the automation is delivering one of its own customer-facing lines
+    (the eval scorer counts those as the agent's replies)."""
+    return bool(_REPLYING.get())
 
 
 def tool_context(conversation, partner):
@@ -85,7 +93,11 @@ def send_quoted(conversation, message_id: Optional[str], text: str, *, once_minu
         return False
     from qurtoba.tools.transactions import _send_quoted_text
     partner = getattr(conversation, 'social_partner', None)
-    ok = bool(_send_quoted_text(conversation, partner, message_id, text))
+    token = _REPLYING.set(True)
+    try:
+        ok = bool(_send_quoted_text(conversation, partner, message_id, text))
+    finally:
+        _REPLYING.reset(token)
     log('reply', conversation, mid=str(message_id)[:8] if message_id else None, text=text[:60], ok=ok)
     return ok
 
@@ -98,11 +110,15 @@ def send_plain(conversation, text: str) -> bool:
         from modules.chat.services.omnichannel_send_service import OmnichannelSendService
         from qurtoba.ai_guard import mark_reply_delivered, system_send
         from qurtoba.extensions import _get_system_partner
-        with system_send():
-            OmnichannelSendService().send_and_broadcast(
-                partner=conversation.social_partner, content={'text': str(text)}, message_type='text',
-                conversation=conversation, system_partner=_get_system_partner(conversation), websocket=True,
-            )
+        token = _REPLYING.set(True)
+        try:
+            with system_send():
+                OmnichannelSendService().send_and_broadcast(
+                    partner=conversation.social_partner, content={'text': str(text)}, message_type='text',
+                    conversation=conversation, system_partner=_get_system_partner(conversation), websocket=True,
+                )
+        finally:
+            _REPLYING.reset(token)
         mark_reply_delivered(conversation)
         log('reply', conversation, text=text[:60], ok=True, plain=True)
         return True

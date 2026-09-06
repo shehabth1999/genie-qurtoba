@@ -22,14 +22,15 @@ REROUTE_KEY = 'qurtoba:reroute_owed:{conv}'      # set by tasks._send_reroute_as
 REROUTE_TTL = 24 * 3600
 MULTI_KEY = 'qurtoba:multi_pending:{conv}'       # «تقصد X لكل رقم ولا تقسيمه؟» waiting for its answer
 NONCASH_KEY = 'qurtoba:noncash_pending:{conv}'   # «أي حساب فورى؟ 1) … 2) …» waiting for its answer
+LIST_KEY = 'qurtoba:list_confirm:{conv}'         # «تأكيد المطابقة» for a positional list, waiting for أيوة/لأ
 PENDING_TTL = 3600
 
 
 # ── pure decision table ──────────────────────────────────────────────────────
 
-def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending: bool,
+def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
            reroute: Optional[Dict[str, Any]], texts: Dict[str, str],
-           accounts: Optional[List[tuple]] = None) -> Dict[str, Any]:
+           accounts: Optional[List[tuple]] = None, list_pending: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Planner output → actions. No I/O.
 
     Returns {'items': [...create items...], 'replies': [(message_id, text)],
@@ -40,7 +41,7 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending: bool,
     replies: List[tuple] = []
     consumed: List[str] = []
     out = {'items': items, 'replies': replies, 'confirm_repeats': False, 'clear_repeats': False,
-           'consume': consumed, 'reroute_used': False, 'pending': None}
+           'consume': consumed, 'reroute_used': False, 'pending': None, 'list_confirm': None}
     if not plan or not plan.get('success'):
         return out
     accounts = accounts or []
@@ -53,24 +54,56 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending: bool,
         o.get('kind') == 'phone' for o in plan.get('orphans') or []) and not broken_phone_mids
 
     pairs = [dict(p) for p in plan.get('pairs') or []]
+    # The planner keeps a pair's reason in `ambiguous` (separator_ambiguous / list_pairing),
+    # not on the pair itself.
+    reasons = {a.get('source_message_id'): a.get('reason') for a in plan.get('ambiguous') or [] if a.get('reason')}
+    for p in pairs:
+        p.setdefault('reason', reasons.get(p.get('source_message_id')))
     yes_phones, no_phones = set(), set()
+    # Pairs the create tool is HOLDING as a same-day repeat («تحب أكررها؟» already asked):
+    # never re-submit them — the tool would ask again on every turn. `repeat_pending` may be the
+    # dict of pending signatures ({'كاش|01…|10100.00': {...}}) or a bool.
+    held = {}
+    if isinstance(repeat_pending, dict):
+        held = {(v.get('account_number'), float(v.get('value') or 0)): k for k, v in repeat_pending.items() if isinstance(v, dict)}
+    held_phones = {acc for acc, _v in held}
+    # «list_pattern=true → the numbers and amounts arrived as two separate lists, paired by
+    # position → CONFIRM the matching before executing» — every positional pair, as ONE question.
+    list_confirm = bool(plan.get('list_pattern')) and not (list_pending or {}).get('confirmed')
 
     # «Answers are not requests» — an inbound quoting our question, or a bare yes/no/amount
     # right after it, is the ANSWER (planner `answers`). Apply it, never re-ask.
+    unclear_answers = set()
     for a in plan.get('answers') or []:
         kind, text, phone = a.get('kind'), a.get('text') or '', a.get('about_phone')
+        if kind == 'amount_reply' and 'مبلغ كبير' in (a.get('question_text') or ''):
+            # «100 ج» to «مبلغ كبير — محتاج تأكيد» → «قصدك نأكد الـ100,000 ولا المبلغ 100 بس؟»
+            src_txt = texts.get(a.get('about_message_id') or '', '')
+            orig = (_classify_message(src_txt).get('amounts') or [None])[0]
+            replies.append((a['message_id'], R.UNCLEAR_HV_ANSWER.format(text=text[:20], amount=R._fmt(orig or '?'))))
+            unclear_answers.add(a['message_id'])
+            continue
         if kind == 'amount_reply' and a.get('applied_to'):
             continue                                   # already folded into its pair
         if L.is_yes(text):
             if repeat_pending:
-                out['confirm_repeats'] = True          # «تحب أكررها؟» → أيوة
+                out['confirm_repeats'] = True          # «تحب أكررها؟» → أيوة (the tool creates it)
+                no_phones.update(held_phones)          # …so this turn must not create it again
+            elif list_pending and list_pending.get('phones'):
+                yes_phones.update(list_pending['phones'])   # «تأكيد المطابقة» → the whole list
+                list_confirm = False
             elif phone:
                 yes_phones.add(phone)                  # «تأكيد» on a held high value / a list pairing
             consumed.append(a['message_id'])
         elif L.is_no(text):
             if repeat_pending:
                 out['clear_repeats'] = True
+                no_phones.update(held_phones)          # dropped: never re-submit the held pair
                 replies.append((a['message_id'], R.REPEAT_DECLINED))
+            elif list_pending and list_pending.get('phones'):
+                no_phones.update(list_pending['phones'])
+                list_confirm = False
+                replies.append((a['message_id'], R.DECLINED))
             elif phone:
                 no_phones.add(phone)
                 replies.append((a['message_id'], R.DECLINED))
@@ -86,12 +119,17 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending: bool,
     # amount + the new number as a brand-new transaction». A phone WITH an amount is never it.
     reroute_amount = float(reroute['amount']) if reroute and reroute.get('amount') else None
 
+    to_confirm: List[Dict[str, Any]] = []
     for p in pairs:
         src, phone, value = p.get('source_message_id'), p.get('account_number'), p.get('value')
         reason, conf = p.get('reason'), p.get('confidence')
         if phone in no_phones:
             consumed.append(src)
             continue
+        if (phone, float(value or 0)) in held:
+            continue                                   # waiting for أيوة/لأ — the tool already asked
+        if p.get('answer_message_id') in unclear_answers:
+            continue                                   # re-valued by an unclear reply — asked instead
         if reason == 'separator_ambiguous':
             raw = _last_line(texts.get(src, ''))
             replies.append((src, R.UNREADABLE_AMOUNT.format(raw=raw or value)))
@@ -99,14 +137,20 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending: bool,
         if reason == 'answer_matches_neither_option' and phone not in yes_phones:
             replies.append((p.get('answer_message_id') or src, R.NEITHER_OPTION.format(amount=R._fmt(value), phone=phone)))
             continue
-        if conf == 'low' and phone not in yes_phones:
+        if (conf == 'low' or list_confirm) and phone not in yes_phones and reason != 'answer_to_question':
             # «list_pattern=true OR any low pair → positional guess → CONFIRM the matching»
-            replies.append((src, R.LIST_CONFIRM.format(phone=phone, amount=R._fmt(value))))
+            to_confirm.append(p)
             continue
         item = {'type': 'كاش', 'value': value, 'account_number': phone, 'source_message_id': src}
         if value is not None and float(value) >= hv_threshold and phone in yes_phones:
             item['confirm_high_value'] = True
         items.append(item)
+
+    if to_confirm:
+        # ONE question for the whole positional list, quoted on its first number message.
+        lines = [R.LIST_CONFIRM_HEADER] + [f"{p['account_number']} ← {R._fmt(p['value'])}" for p in to_confirm] + [R.LIST_CONFIRM_TAIL]
+        replies.append((to_confirm[0].get('source_message_id'), '\n'.join(lines)))
+        out['list_confirm'] = {'phones': [p['account_number'] for p in to_confirm]}
 
     for o in plan.get('orphans') or []:
         mid, kind, val = o.get('message_id'), o.get('kind'), o.get('value')
@@ -138,6 +182,13 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending: bool,
                 consumed.append(mid)
                 continue
             replies.append((mid, R.ORPHAN_AMOUNT.format(amount=R._fmt(val))))
+
+    if reroute_amount and not out['reroute_used']:
+        # «A number that arrives WITH an amount is NOT the reroute answer … create exactly what the
+        # message says, then ask ONE quoted question about the still-owed reroute amount.»
+        first = next((i for i in items if i.get('type') == 'كاش' and not i.get('reroute')), None)
+        if first is not None:
+            replies.append((first.get('source_message_id'), R.REROUTE_OWED_QUESTION.format(amount=R._fmt(reroute_amount))))
 
     if plan.get('needs_resend'):
         target = max((m for m in texts), default=None)
@@ -366,9 +417,43 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     reroute = cache_get(REROUTE_KEY.format(conv=conv_key))
     if reroute and not _reroute_still_valid(conversation, partner, reroute):
         cache_delete(REROUTE_KEY.format(conv=conv_key)); reroute = None
+    if reroute is None:
+        reroute = _reroute_from_chat(conversation, partner)
 
-    decision = decide(plan, hv_threshold=_high_value_threshold(), repeat_pending=bool(_list_repeat_pending(conversation)),
-                      reroute=reroute, texts={mid: _text_of(m) for mid, m in rows.items()}, accounts=accounts)
+    # A bare «أيوة» / «لا» / «تأكيد» that quotes nothing is not in the planner's `answers`
+    # (it only extracts quoted replies and bare amounts) — attach it to whatever we are waiting
+    # for: a held repeat, a list confirmation, or a high-value hold.
+    repeat_pending = _list_repeat_pending(conversation) or {}
+    list_pending = cache_get(LIST_KEY.format(conv=conv_key))
+    hv_phone = _hv_question_pending(conversation)
+    answered_ids = {a.get('message_id') for a in plan.get('answers') or []}
+    for mid in route.get('batch_ids') or []:
+        m = rows.get(mid)
+        if m is None or m.type != 'text' or mid in answered_ids:
+            continue
+        text = _text_of(m)
+        if not (L.is_yes(text) or L.is_no(text)):
+            continue
+        about = None
+        if repeat_pending:
+            held = [v.get('account_number') for v in repeat_pending.values() if isinstance(v, dict)]
+            about = held[0] if len(held) == 1 else None
+        elif list_pending:
+            about = None
+        elif hv_phone:
+            about = hv_phone
+        else:
+            continue
+        plan.setdefault('answers', []).append({'message_id': mid, 'text': text, 'kind': 'reply',
+                                               'about_phone': about, 'question_text': ''})
+
+    decision = decide(plan, hv_threshold=_high_value_threshold(), repeat_pending=repeat_pending,
+                      reroute=reroute, texts={mid: _text_of(m) for mid, m in rows.items()}, accounts=accounts,
+                      list_pending=list_pending)
+    if decision.get('list_confirm'):
+        cache_set(LIST_KEY.format(conv=conv_key), {**decision['list_confirm'], 'ts': time.time()}, PENDING_TTL)
+    elif list_pending:
+        cache_delete(LIST_KEY.format(conv=conv_key))
     if decision.get('pending'):
         pend = decision['pending']
         cache_set(NONCASH_KEY.format(conv=conv_key),
@@ -449,6 +534,81 @@ def _noncash_answer(text: str, pending: Dict[str, Any]) -> Optional[Dict[str, An
     return None
 
 
+def _hv_question_pending(conversation) -> Optional[str]:
+    """The phone of the transfer our last «مبلغ كبير — محتاج تأكيد» line (≤ 6 h) is holding, else None."""
+    try:
+        from datetime import timedelta
+        from django.utils import timezone
+        from modules.chat.models import Message
+        m = (Message.objects_all.filter(conversation=conversation, direction='outbound', type='text', active=True,
+                                        created_at__gte=timezone.now() - timedelta(hours=6))
+             .select_related('reply_to').order_by('-created_at').first())
+        if m is None:
+            return None
+        txt = (m.content or {}).get('text') if isinstance(m.content, dict) else ''
+        if not txt or not str(txt).startswith('مبلغ كبير'):
+            return None
+        q = m.reply_to
+        if q is None or getattr(q, 'direction', None) != 'inbound':
+            return None
+        phones = _classify_message(_text_of(q)).get('phones') or []
+        return phones[0] if phones else None
+    except Exception:
+        return None
+
+
+_REROUTE_LINE = 'محتاجين رقم تانى'
+_REMAINDER_RE = None
+
+
+def _reroute_from_chat(conversation, partner) -> Optional[Dict[str, Any]]:
+    """Derive the owed reroute amount from the LAST outbound notice when no cache marker exists
+    (worker restart, notice sent before v2, sandbox): «… الباقى ( X ) …» → X; the no-wallet
+    notice → the full amount of the transfer it quotes."""
+    global _REMAINDER_RE
+    try:
+        import re
+        from django.utils import timezone
+        from modules.chat.models import Message
+        if _REMAINDER_RE is None:
+            _REMAINDER_RE = re.compile(r'الباقى\s*\(\s*([\d,\.]+)\s*\)')
+        day_start = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
+        last = (Message.objects_all.filter(conversation=conversation, direction='outbound', type='text', active=True,
+                                           created_at__gte=day_start)
+                .select_related('reply_to').order_by('-created_at').first())
+        if last is None:
+            return None
+        txt = str((last.content or {}).get('text') or '') if isinstance(last.content, dict) else ''
+        if _REROUTE_LINE not in txt:
+            return None
+        amount = None
+        m = _REMAINDER_RE.search(txt)
+        if m:
+            amount = float(m.group(1).replace(',', ''))
+        else:
+            q = last.reply_to
+            rec = getattr(q, 'qurtoba_record', None) if q is not None else None
+            if rec is not None and getattr(rec, 'value', None):
+                amount = float(rec.value)
+            elif q is not None:
+                amts = _classify_message(_text_of(q)).get('amounts') or []
+                amount = float(amts[0]) if amts else None
+            if amount is None and q is not None:
+                from qurtoba.models import QurtobaRecord
+                customer = getattr(partner, 'qurtoba_customer', None)
+                phones = _classify_message(_text_of(q)).get('phones') or []
+                if customer is not None and phones:
+                    r = QurtobaRecord.objects.filter(customer=customer, account_number=phones[0]).order_by('-id').first()
+                    if r is not None and getattr(r, 'original_value', None) or getattr(r, 'value', None):
+                        amount = float(getattr(r, 'original_value', None) or r.value)
+        if not amount or amount <= 0:
+            return None
+        marker = {'amount': amount, 'ts': last.created_at.timestamp(), 'kind': 'chat', 'record_id': None}
+        return marker if _reroute_still_valid(conversation, partner, marker) else None
+    except Exception:
+        return None
+
+
 def _reroute_still_valid(conversation, partner, marker: Dict[str, Any]) -> bool:
     """«The reroute expectation expires: a new day, any other transaction, or any other reply
     since → a bare number is a normal incomplete op.»"""
@@ -479,8 +639,9 @@ def _handle_create_result(conversation, partner, result: Dict[str, Any], items: 
         idx = r.get('index')
         src = r.get('source_message_id') or (items[idx].get('source_message_id') if isinstance(idx, int) and idx < len(items) else None)
         status = r.get('status')
-        if status == 'needs_confirmation' and (r.get('high_value') or r.get('needs_confirmation')):
-            if not r.get('already_asked') and not asked_recently(conversation, src):
+        if status == 'needs_confirmation' and r.get('confirm_kind', 'high_value') == 'high_value':
+            # «Held → on the transfer message: مبلغ كبير — محتاج منك كلمة «تأكيد» …» — once.
+            if not r.get('already_asked') and not asked_recently(conversation, src, minutes=360):
                 if send_quoted(conversation, src, R.HIGH_VALUE):
                     summary['replies'] += 1
         elif status == 'rejected':

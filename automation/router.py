@@ -103,7 +103,8 @@ def classify_text(text: str, *, quotes_our_question: bool = False, pending_quest
         return {'intent': Intent.SOCIAL, 'sub': 'availability', 'flags': flags}
     if L.GREETING.search(t):
         sub = 'wellbeing' if re.search(r'ازيك|عامل|اخبار|كيف', t) else \
-              'morning' if 'صباح' in t else 'evening' if 'مساء' in t else 'greeting'
+              'morning' if 'صباح' in t else 'evening' if 'مساء' in t else \
+              'salam' if 'سلام' in t else 'greeting'
         return {'intent': Intent.SOCIAL, 'sub': sub, 'flags': flags}
     if L.is_only_emoji(raw) or L.is_yes(raw) or L.is_no(raw):
         return {'intent': Intent.NOISE, 'sub': 'ack', 'flags': flags}
@@ -158,7 +159,7 @@ def classify_rows(rows: List[Dict[str, Any]], *, pending_question: bool = False,
         intent = Intent.OFF_HOURS
 
     secondary = [p for p in per_row
-                 if p['id'] != primary['id'] and p['intent'] in (Intent.BALANCE, Intent.STATEMENT, Intent.STATUS, Intent.SOCIAL)
+                 if p['id'] != primary['id'] and p['intent'] in (Intent.BALANCE, Intent.STATEMENT, Intent.STATUS, Intent.SOCIAL, Intent.FREETEXT)
                  and p['intent'] != primary['intent']]
     return {
         'intent': intent,
@@ -200,10 +201,18 @@ def _iter_text_blocks(input_data):
                 yield entry['text']
 
 
+_PUNCT_ONLY_RE = re.compile(r'^[\s.,؟?!،…]+$')
+
+
 def _row_dict(m) -> Dict[str, Any]:
     c = m.content if isinstance(m.content, dict) else {}
     text = c.get('text') or c.get('transcription') or c.get('caption') or ''
     q = getattr(m, 'reply_to', None)
+    # «؟» / «.» quoted on one of the customer's own messages = «you ignored this — again»:
+    # the quoted text is what must be answered.
+    if q is not None and getattr(q, 'direction', None) == 'inbound' and _PUNCT_ONLY_RE.match(str(text or '')):
+        qc = q.content if isinstance(q.content, dict) else {}
+        text = qc.get('text') or qc.get('transcription') or text
     return {
         'id': str(m.id), 'type': m.type, 'text': str(text),
         'quotes_outbound': bool(q is not None and getattr(q, 'direction', None) == 'outbound'),

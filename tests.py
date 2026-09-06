@@ -192,7 +192,8 @@ class RouterTests(SimpleTestCase):
         self.assertEqual(self._i('الإيصال اهو'), Intent.RECEIPT)
 
     def test_social_and_noise(self):
-        self.assertEqual(classify_text('السلام عليكم')['sub'], 'greeting')
+        self.assertEqual(classify_text('السلام عليكم')['sub'], 'salam')
+        self.assertEqual(classify_text('اهلا')['sub'], 'greeting')
         self.assertEqual(classify_text('صباح الخير')['sub'], 'morning')
         self.assertEqual(classify_text('شكرا جدا')['sub'], 'thanks')
         self.assertEqual(classify_text('شغالين؟')['sub'], 'availability')
@@ -263,7 +264,10 @@ class TransferDecisionTests(SimpleTestCase):
         ], orphans=[{'kind': 'phone', 'value': '01127969725', 'message_id': 'm6'}])
         d = decide(plan, hv_threshold=100000, repeat_pending=False, reroute=None, texts={})
         self.assertEqual([(i['account_number'], i['value']) for i in d['items']], [('01009021516', 44880.0)])
-        self.assertEqual(d['replies'], [('m4', 'تأكيد: 01023551947 ← 20,200؟'), ('m6', 'المبلغ لـ 01127969725؟')])
+        self.assertEqual([r[0] for r in d['replies']], ['m4', 'm6'])
+        self.assertIn('01023551947 ← 20,200', d['replies'][0][1])
+        self.assertEqual(d['replies'][1][1], 'المبلغ لـ 01127969725؟')
+        self.assertEqual(d['list_confirm'], {'phones': ['01023551947']})
 
     def test_orphan_phone_with_a_label_candidate_gets_a_targeted_question(self):
         plan = self._plan(orphans=[{'kind': 'phone', 'value': '01023551947', 'message_id': 'a'}],
@@ -352,3 +356,56 @@ class NonCashResolutionTests(SimpleTestCase):
         d = decide(plan, hv_threshold=1e5, repeat_pending=False, reroute=None, texts={}, accounts=[('فورى', '2924523')])
         self.assertEqual(d['items'], [])
         self.assertEqual(d['replies'], [('a', 'الرقم ده مش صحيح — ابعت رقم صحيح 11 رقم')])
+
+
+class RepeatHoldTests(SimpleTestCase):
+    """2026-09-06 test line: a held same-day repeat was re-submitted on every turn and re-asked."""
+
+    PAIR = {'account_number': '01118696547', 'value': 10100.0, 'source_message_id': 's', 'confidence': 'high'}
+    HELD = {'كاش(10)|01118696547|10100.00': {'type': 'كاش(10)', 'value': 10100.0, 'account_number': '01118696547'}}
+
+    def _plan(self, answers=None):
+        return {'success': True, 'pairs': [dict(self.PAIR)], 'orphans': [], 'ambiguous': [], 'ignored': [],
+                'answers': answers or [], 'needs_resend': False, 'list_pattern': False}
+
+    def test_held_pair_is_not_resubmitted(self):
+        d = decide(self._plan(), hv_threshold=1e5, repeat_pending=self.HELD, reroute=None, texts={})
+        self.assertEqual(d['items'], [])
+        self.assertEqual(d['replies'], [])
+
+    def test_no_drops_the_held_pair_and_yes_leaves_it_to_the_tool(self):
+        no = [{'message_id': 'a', 'text': 'لا تجاهل', 'kind': 'reply', 'about_phone': '01118696547'}]
+        d = decide(self._plan(no), hv_threshold=1e5, repeat_pending=self.HELD, reroute=None, texts={})
+        self.assertTrue(d['clear_repeats'])
+        self.assertEqual(d['items'], [])
+        self.assertIn('s', d['consume'])
+        yes = [{'message_id': 'a', 'text': 'أيوة', 'kind': 'reply', 'about_phone': '01118696547'}]
+        d = decide(self._plan(yes), hv_threshold=1e5, repeat_pending=self.HELD, reroute=None, texts={})
+        self.assertTrue(d['confirm_repeats'])
+        self.assertEqual(d['items'], [])
+
+    def test_punctuation_quoting_own_message_reclassifies_the_quoted_text(self):
+        rows = [{'id': 'x', 'type': 'text', 'text': '.', 'quotes_outbound': False}]
+        # the DB wrapper substitutes the quoted text before classify_rows; here we assert the classifier side
+        self.assertEqual(classify_rows([{'id': 'x', 'type': 'text', 'text': 'حسابي كام'}])['intent'], Intent.BALANCE)
+        self.assertEqual(classify_rows(rows)['intent'], Intent.NOISE)
+
+
+class HighValueAndRerouteTests(SimpleTestCase):
+
+    def test_amount_reply_to_the_high_value_question_is_unclear(self):
+        plan = {'success': True, 'ambiguous': [], 'ignored': [], 'orphans': [], 'needs_resend': False,
+                'pairs': [{'account_number': '01012345678', 'value': 100.0, 'source_message_id': 's', 'confidence': 'high',
+                           'reason': 'answer_to_question', 'answer_message_id': 'a'}],
+                'answers': [{'message_id': 'a', 'text': '100 ج', 'kind': 'amount_reply', 'value': 100.0, 'about_phone': '01012345678',
+                             'about_message_id': 's', 'question_text': 'مبلغ كبير — محتاج منك كلمة «تأكيد» على الرسالة دي', 'applied_to': '01012345678'}]}
+        d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute=None, texts={'s': '01012345678\n100الف'})
+        self.assertEqual(d['items'], [])
+        self.assertEqual(d['replies'], [('a', 'رديت بـ«100 ج» على تأكيد الـ100,000 — قصدك نأكد الـ100,000 ولا المبلغ 100 ج بس؟')])
+
+    def test_self_contained_pair_while_a_reroute_is_owed_creates_and_asks_once(self):
+        plan = {'success': True, 'ambiguous': [], 'ignored': [], 'orphans': [], 'answers': [], 'needs_resend': False,
+                'pairs': [{'account_number': '01098765432', 'value': 5.0, 'source_message_id': 'n', 'confidence': 'high'}]}
+        d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute={'amount': 5000.0}, texts={})
+        self.assertEqual([(i['account_number'], i['value']) for i in d['items']], [('01098765432', 5.0)])
+        self.assertEqual(d['replies'], [('n', 'والـ 5,000 بتاع التحويل اللي اترفض — يتحول على نفس الرقم ده ولا رقم تاني؟')])

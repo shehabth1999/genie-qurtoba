@@ -895,6 +895,11 @@ def qurtoba_plan_transactions(
     # An amount the customer sent in answer to our question about a number IS that
     # number's amount — it replaces whatever we had parsed for it and is never an orphan.
     _apply_answers(pairs, answers, orphans)
+    # A pair CREATED by an answer («المبلغ لـ N؟» → «700») is appended without a mids entry;
+    # the zip below would silently drop it (2026-09-06: the answered transfer was never created).
+    while len(pair_mids) < len(pairs):
+        _np = pairs[len(pair_mids)]
+        pair_mids.append({m for m in (_np.get('source_message_id'), _np.get('answer_message_id')) if m})
 
     # --- Same-time split-ambiguity guard ---------------------------------
     # WhatsApp timestamps only to the second and does NOT guarantee order for

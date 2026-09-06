@@ -72,6 +72,8 @@ def _is_agent_send(s: Dict[str, Any]) -> bool:
     """A customer-visible AGENT text: written by the AI partner outside a tool's
     ``system_send()`` and let through by the gate — delivered as-is ('send') or
     re-attached by the gate as a quote on the customer's message ('forward')."""
+    if s.get('kind') == 'text' and s.get('automation') and not s.get('blocked'):
+        return True     # workflow v2: the automation's fixed line IS the agent's reply
     return (s.get('kind') == 'text' and s.get('by_ai') and not s.get('system_send')
             and s.get('action', 'block' if s.get('blocked') else 'send') in ('send', 'forward'))
 
@@ -118,6 +120,11 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
         text = content.get('text') if isinstance(content, dict) else (content if isinstance(content, str) else None)
         by_ai = bool(getattr(system_partner, 'ai_agent', False))
         system_send = ai_guard.in_system_send()
+        try:
+            from qurtoba.automation.context import in_automation_reply
+            automation = in_automation_reply()
+        except Exception:
+            automation = False
         verdict = _gate_verdict(content, message_type, conversation, system_partner,
                                 reply_to_id=reply_to_id, reply_to_message_id=reply_to_message_id)
         action = verdict['action']
@@ -133,7 +140,7 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
             'n': capture.counter, 'kind': 'text' if message_type == 'text' else message_type,
             'text': text, 'caption': caption, 'filename': filename,
             'url': content.get('url') if isinstance(content, dict) else None,
-            'by_ai': by_ai, 'system_send': system_send,
+            'by_ai': by_ai, 'system_send': system_send, 'automation': automation,
             'action': action, 'blocked': blocked, 'forwarded': forwarded, 'quoted': quoted,
             'gate_reason': verdict.get('reason'), 'gate_contract': verdict.get('contract'),
             'reply_to_id': str(forward_to.id) if forwarded else (str(reply_to_id) if reply_to_id else None),
