@@ -484,3 +484,16 @@ class ThrottleRetryTests(SimpleTestCase):
         self.assertEqual(len(calls), 2)
         self.assertTrue(ai_guard._is_throttled({'success': False, 'error': 'تعذّر إرسال الرسالة عبر المزوّد. (#131056)'}))
         self.assertFalse(ai_guard._is_throttled({'success': False, 'error': 'invalid number'}))
+
+
+class ListConfirmScopeTests(SimpleTestCase):
+
+    def test_only_positional_guesses_are_confirmed_clean_pairs_are_created(self):
+        plan = {'success': True, 'orphans': [], 'ignored': [], 'answers': [], 'needs_resend': False, 'list_pattern': True,
+                'ambiguous': [{'account_number': '01055512345', 'value': 300.0, 'source_message_id': 'c', 'reason': 'list_pairing'}],
+                'pairs': [{'account_number': '01012345678', 'value': 500.0, 'source_message_id': 'a', 'confidence': 'high'},
+                          {'account_number': '01098765432', 'value': 600.0, 'source_message_id': 'b', 'confidence': 'high'},
+                          {'account_number': '01055512345', 'value': 300.0, 'source_message_id': 'c', 'confidence': 'low'}]}
+        d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute=None, texts={})
+        self.assertEqual([i['account_number'] for i in d['items']], ['01012345678', '01098765432'])
+        self.assertEqual(d['list_confirm']['phones'], ['01055512345'])

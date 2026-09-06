@@ -75,8 +75,10 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
         held = {(v.get('account_number'), float(v.get('value') or 0)): k for k, v in repeat_pending.items() if isinstance(v, dict)}
     held_phones = {acc for acc, _v in held}
     # «list_pattern=true → the numbers and amounts arrived as two separate lists, paired by
-    # position → CONFIRM the matching before executing» — every positional pair, as ONE question.
-    list_confirm = bool(plan.get('list_pattern')) and not (list_pending or {}).get('confirmed')
+    # position → CONFIRM the matching» — the POSITIONAL pairs (confidence low), as ONE question.
+    # Self-contained pairs in the same burst are clean and are created at once (2026-09-06 13:12:
+    # one guess held 25 clean transfers).
+    list_confirm = False
 
     # «Answers are not requests» — an inbound quoting our question, or a bare yes/no/amount
     # right after it, is the ANSWER (planner `answers`). Apply it, never re-ask.
@@ -386,6 +388,10 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     if plan.get('success') and rejected and any(o.get('kind') == 'phone' for o in plan.get('orphans') or []):
         orphan_phones = [{'message_id': o['message_id'], 'value': o['value'], 'at': rows[o['message_id']].created_at}
                          for o in plan['orphans'] if o.get('kind') == 'phone' and o.get('message_id') in rows]
+        # a correction is a number sent ON ITS OWN after the bad-number line — never a bare
+        # number inside a burst whose amount may simply be in the next batch (13:12: 01275362968)
+        if plan.get('pairs') or len(orphan_phones) > 1:
+            orphan_phones = []
         for c in match_corrections(orphan_phones, rejected):
             # Owner decision 2026-09-06: confirm first — «تقصد تحويل X على الرقم ده؟ ابعت «حول»» —
             # then «حول» creates it instantly (handled in the pre-pass above, no model).
