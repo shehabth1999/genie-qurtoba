@@ -140,7 +140,7 @@ class BurstPairingTests(SimpleTestCase):
 from qurtoba.automation import lexicon as L  # noqa: E402
 from qurtoba.automation.arabic_numbers import parse_arabic_amount  # noqa: E402
 from qurtoba.automation.router import batch_ids_from_input  # noqa: E402
-from qurtoba.automation.transfers import render_ai_summary, _is_noise_line  # noqa: E402
+from qurtoba.automation.transfers import render_ai_summary, _is_noise_line, _broken_number_amount, match_corrections  # noqa: E402
 from qurtoba.automation.transfers import decide, resolve_noncash, _multi_number  # noqa: E402
 
 
@@ -396,3 +396,26 @@ class GateEchoTests(SimpleTestCase):
             self.assertTrue(ai_guard.is_pure_echo('حاضر ف الانتظار.', 'c'))
             self.assertFalse(ai_guard.is_pure_echo('تمام، تحت أمرك', 'c'))
             self.assertFalse(ai_guard.is_pure_echo('', 'c'))
+
+
+class CorrectedNumberTests(SimpleTestCase):
+    """2026-09-06: after «ابعت رقم صحيح 11 رقم» the corrected number was asked «المبلغ؟» again."""
+
+    def test_amount_of_a_rejected_message(self):
+        self.assertEqual(_broken_number_amount('0106013464\nالفين جنيه'), 2000.0)
+        self.assertEqual(_broken_number_amount('0100600100\n590'), 590.0)
+        self.assertIsNone(_broken_number_amount('01006001000\n590'))     # valid number → not rejected
+        self.assertIsNone(_broken_number_amount('0106013464'))            # no amount
+
+    def test_bare_number_after_the_bad_number_line_takes_the_amount(self):
+        items = match_corrections(
+            [{'message_id': 'n', 'value': '01060134646', 'at': 10}],
+            [{'message_id': 'b', 'amount': 2000.0, 'at': 5, 'asked': True}])
+        self.assertEqual(items, [{'type': 'كاش', 'value': 2000.0, 'account_number': '01060134646',
+                                  'source_message_id': 'n', 'correction_of': 'b'}])
+        # not yet told it was wrong → not a correction; two rejected messages → ambiguous → ask
+        self.assertEqual(match_corrections([{'message_id': 'n', 'value': '01060134646', 'at': 10}],
+                                           [{'message_id': 'b', 'amount': 2000.0, 'at': 5, 'asked': False}]), [])
+        self.assertEqual(match_corrections([{'message_id': 'n', 'value': '01060134646', 'at': 10}],
+                                           [{'message_id': 'b', 'amount': 2000.0, 'at': 5, 'asked': True},
+                                            {'message_id': 'c', 'amount': 500.0, 'at': 6, 'asked': True}]), [])

@@ -214,6 +214,42 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
     return out
 
 
+def _broken_number_amount(text: str) -> Optional[float]:
+    """The amount written in a message whose number is BROKEN («0106013464 ⏎ الفين جنيه» → 2000):
+    digits, or Arabic words. None when the message carries no amount or a valid number."""
+    cls = _classify_message(text)
+    if cls['phones'] or not any(i.get('reason') == 'broken_phone' for i in cls.get('ignored') or []):
+        return None
+    if cls['amounts']:
+        return float(cls['amounts'][0])
+    if _looks_like_spelled_amount(text):
+        import re
+        val = parse_arabic_amount(re.sub(r'\d[\d\s.,]*', ' ', text))
+        return float(val) if val else None
+    return None
+
+
+def match_corrections(orphan_phones: List[Dict[str, Any]], rejected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pure. A bare number sent AFTER we asked for a correct number IS the correction: it takes
+    the amount of the rejected message. Only when the match is unambiguous (exactly one rejected
+    message with an amount before it, already told «ابعت رقم صحيح»).
+
+    orphan_phones: [{message_id, value(phone), at}], rejected: [{message_id, amount, at, asked}]
+    → [{type, value, account_number, source_message_id, correction_of}]"""
+    items: List[Dict[str, Any]] = []
+    used = set()
+    for o in sorted(orphan_phones, key=lambda x: x['at']):
+        cands = [r for r in rejected if r['message_id'] not in used and r.get('asked') and r.get('amount')
+                 and r['at'] < o['at']]
+        if len(cands) != 1:
+            continue
+        r = cands[0]
+        used.add(r['message_id'])
+        items.append({'type': 'كاش', 'value': float(r['amount']), 'account_number': o['value'],
+                      'source_message_id': o['message_id'], 'correction_of': r['message_id']})
+    return items
+
+
 def _hint_amount(text: Optional[str]) -> Optional[float]:
     """The whole amount hidden in an `ignored` piece («عبدالله15100» → 15100), if any."""
     import re
@@ -451,6 +487,27 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     if planner_input:
         plan = call_tool(conversation, partner, qurtoba_plan_transactions, messages=planner_input)
 
+    # «ابعت رقم صحيح» → the customer's next bare number is the CORRECTION of that message
+    # and takes its amount (2026-09-06: «0106013464 ⏎ الفين جنيه» → «01060134646» was asked
+    # «المبلغ؟» again — a person would never ask).
+    corrections: List[Dict[str, Any]] = []
+    if plan.get('success') and any(o.get('kind') == 'phone' for o in plan.get('orphans') or []):
+        rejected = []
+        for mid, m in rows.items():
+            if m.type != 'text':
+                continue
+            amt = _broken_number_amount(_text_of(m))
+            if amt:
+                rejected.append({'message_id': mid, 'amount': amt, 'at': m.created_at,
+                                 'asked': said_recently(conversation, mid, R.BAD_NUMBER, minutes=360)})
+        orphan_phones = [{'message_id': o['message_id'], 'value': o['value'], 'at': rows[o['message_id']].created_at}
+                         for o in plan['orphans'] if o.get('kind') == 'phone' and o.get('message_id') in rows]
+        corrections = match_corrections(orphan_phones, rejected)
+        if corrections:
+            done = {c['source_message_id'] for c in corrections}
+            plan['orphans'] = [o for o in plan['orphans'] if o.get('message_id') not in done]
+            log('correction', conversation, items=[(c['account_number'], c['value']) for c in corrections])
+
     reroute = cache_get(REROUTE_KEY.format(conv=conv_key))
     if reroute and not _reroute_still_valid(conversation, partner, reroute):
         cache_delete(REROUTE_KEY.format(conv=conv_key)); reroute = None
@@ -509,18 +566,20 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     if decision['clear_repeats']:
         _clear_repeat_pending(conversation)
 
-    items = pre_items + [i for i in decision['items']]
+    items = pre_items + corrections + [i for i in decision['items']]
     created_result = None
     held_items: List[Dict[str, Any]] = []
     created_items: List[Dict[str, Any]] = []
     if items:
-        clean = [{k: v for k, v in i.items() if k != 'reroute'} for i in items]
+        clean = [{k: v for k, v in i.items() if k not in ('reroute', 'correction_of')} for i in items]
         created_result = call_tool(conversation, partner, qurtoba_create_new_transactions_bulk, transactions=clean)
         summary['items'] = len(clean)
         held_items, created_items = _handle_create_result(conversation, partner, created_result, clean, summary,
                                                           replies_enabled=replies_enabled)
         if decision['reroute_used'] and created_result.get('success'):
             cache_delete(REROUTE_KEY.format(conv=conv_key))
+        if corrections and created_result.get('success'):
+            consume(conversation, [c['correction_of'] for c in corrections])   # the rejected message is settled
 
     for mid, text in decision['replies']:
         _say(mid, text, 'planner')
