@@ -208,6 +208,9 @@ class TransferDecisionTests(SimpleTestCase):
                           ignored=[{'message_id': 'a', 'text': 'عبدالله15100', 'reason': 'name_label'}])
         d = decide(plan, hv_threshold=100000, repeat_pending=False, reroute=None, texts={})
         self.assertEqual(d['replies'], [('a', 'المبلغ لـ 01023551947 هو 15,100؟')])
+        # the question is HELD so a bare «تمام» creates it (2026-09-08: it matched nothing and 11,000 was lost)
+        self.assertEqual(d['hint_pending'], {'type': 'كاش', 'value': 15100.0, 'account_number': '01023551947',
+                                             'source_message_id': 'a', 'kind': 'hint'})
 
     def test_unreadable_separator_is_asked_never_executed(self):
         plan = self._plan(pairs=[{'account_number': '01012345678', 'value': 460010.0, 'source_message_id': 's',
@@ -288,12 +291,14 @@ class HighValueAndRerouteTests(SimpleTestCase):
         self.assertEqual(d['items'], [])
         self.assertEqual(d['replies'], [('a', 'رديت بـ«100 ج» على تأكيد الـ100,000 — قصدك نأكد الـ100,000 ولا المبلغ 100 ج بس؟')])
 
-    def test_self_contained_pair_while_a_reroute_is_owed_creates_and_asks_once(self):
+    def test_self_contained_pair_while_a_reroute_is_owed_creates_and_never_asks(self):
+        # office rule 2026-09-08: a rejected transfer is never asked about
         plan = {'success': True, 'ambiguous': [], 'ignored': [], 'orphans': [], 'answers': [], 'needs_resend': False,
                 'pairs': [{'account_number': '01098765432', 'value': 5.0, 'source_message_id': 'n', 'confidence': 'high'}]}
         d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute={'amount': 5000.0}, texts={})
         self.assertEqual([(i['account_number'], i['value']) for i in d['items']], [('01098765432', 5.0)])
-        self.assertEqual(d['replies'], [('n', 'والـ 5,000 بتاع التحويل اللي اترفض — يتحول على نفس الرقم ده ولا رقم تاني؟')])
+        self.assertEqual(d['replies'], [])
+        self.assertFalse(d['reroute_used'])
 
     def test_pair_held_by_the_high_value_question_waits_for_the_confirmation(self):
         plan = {'success': True, 'ambiguous': [], 'ignored': [], 'orphans': [], 'answers': [], 'needs_resend': False,
@@ -553,3 +558,80 @@ class HighValueRevalueGuardTests(SimpleTestCase):
         d = decide(plan, hv_threshold=1e5, repeat_pending={}, reroute=None, texts={'s': '01012345678\n\n100الف'}, hv_pending='01012345678')
         self.assertEqual(d['items'], [])
         self.assertIn('100,000', d['replies'][0][1])
+
+
+class FeeNoiseTests(SimpleTestCase):
+    """Office rule 2026-09-08: fee wording is noise; the amount beside it is read as usual."""
+
+    def test_amount_beside_fee_words_is_read(self):
+        from qurtoba.tools.planning import _classify_message
+        c = _classify_message('سلم \n 01003707313\n11.000ج م بدون خصم \nفودافون')
+        self.assertEqual((c['phones'], c['amounts']), (['01003707313'], [11000.0]))
+        c = _classify_message('01012345678\n5000 والعموله عليا')
+        self.assertEqual(c['amounts'], [5000.0])
+        c = _classify_message('01012345678\n5000\nاخصم 30 من المبلغ')
+        self.assertEqual(c['amounts'], [5000.0])
+        self.assertEqual([i['reason'] for i in c['ignored']], ['fee_note'])
+
+    def test_fee_instruction_number_is_the_fee(self):
+        from qurtoba.tools.planning import _classify_message
+        c = _classify_message('لو هيخصم 15 اخصمها')
+        self.assertEqual(c['amounts'], [])
+        self.assertEqual(_classify_message('اخصم مصاريف الخدمة')['amounts'], [])
+
+    def test_fee_note_alone_is_noise_but_not_with_an_amount(self):
+        from qurtoba.automation.transfers import _is_noise_line
+        self.assertTrue(_is_noise_line('اخصم مصاريف الخدمة'))
+        self.assertTrue(_is_noise_line('بدون خصم'))
+        self.assertFalse(_is_noise_line('11000 بدون خصم'))
+
+
+class InlineAmountTests(SimpleTestCase):
+
+    def test_twenty_thousand_on_the_phone_line_is_not_a_country_code(self):
+        from qurtoba.tools.planning import _classify_message
+        c = _classify_message('01017154397 المبلغ  20 ألف  اسامه البنا')
+        self.assertEqual((c['phones'], c['amounts']), (['01017154397'], [20000.0]))
+        c = _classify_message('+20 102 550 2777\n27250 دم\nفودافون')
+        self.assertEqual((c['phones'], c['amounts']), (['01025502777'], [27250.0]))
+        c = _classify_message('+2 01012345678\n500')
+        self.assertEqual((c['phones'], c['amounts']), (['01012345678'], [500.0]))
+
+
+class TallyTrailerTests(SimpleTestCase):
+
+    def test_name_then_small_number_under_a_pair_is_a_tally(self):
+        from qurtoba.tools.planning import _classify_message
+        for t in ('01102840663\n6119\nعاصم كاش اشرف 18\nطه13.45', '01004375895\nكاش عاصم \n27000\nمدحت 2\nعمار 13.40',
+                  '01005371687\n7000\nعاصم كاش عابد \nمحمد 90 مستعجله'):
+            c = _classify_message(t)
+            self.assertEqual(len(c['amounts']), 1, t)
+            self.assertIn('name_label', [i['reason'] for i in c['ignored']])
+
+    def test_alone_it_is_still_an_amount_and_a_big_number_stays(self):
+        from qurtoba.tools.planning import _classify_message
+        self.assertEqual(_classify_message('محتاج 500')['amounts'], [500.0])
+        self.assertEqual(_classify_message('01012345678\nاشرف 18000')['amounts'], [18000.0])
+
+
+class QuotedNoticeRerouteTests(SimpleTestCase):
+
+    def test_bare_number_quoting_a_notice_takes_its_amount(self):
+        from types import SimpleNamespace as NS
+        from qurtoba.automation.transfers import _reroute_from_quote, _notice_amount
+        notice = NS(content={'text': '*تم تحويل ( 10,600 ) و الباقى ( 28,525 )*\n\nمحتاجين رقم تانى علشان نكمل'},
+                    direction='outbound', reply_to=None)
+        self.assertEqual(_notice_amount(notice, NS(qurtoba_customer=None)), 28525.0)
+        row = NS(type='text', content={'text': '01098765432'}, reply_to=notice)
+        r = _reroute_from_quote(None, NS(qurtoba_customer=None), {'m': row})
+        self.assertEqual((r['amount'], r['kind']), (28525.0, 'quoted'))
+        # a number WITH an amount quoting the notice is a complete order, not the answer
+        row = NS(type='text', content={'text': '01098765432\n500'}, reply_to=notice)
+        self.assertIsNone(_reroute_from_quote(None, NS(qurtoba_customer=None), {'m': row}))
+
+    def test_cancel_notice_amount_comes_from_the_quoted_order(self):
+        from types import SimpleNamespace as NS
+        from qurtoba.automation.transfers import _notice_amount
+        order = NS(content={'text': '01098765432\n22 ألف و 610'}, direction='inbound', qurtoba_record=None)
+        notice = NS(content={'text': 'تم الغاء التحويل\n\nو لم يتم تسجيل العمليه عليك'}, direction='outbound', reply_to=order)
+        self.assertEqual(_notice_amount(notice, NS(qurtoba_customer=None)), 22610.0)

@@ -267,13 +267,12 @@ SCENARIOS = [
         'expect': {'final': {'creates': [{'account': P2, 'value': 5000}], 'reply': 'silent', 'forbid': NARRATION_FORBID + ['المبلغ كام']}},
     },
     {
-        'id': 'J2', 'title': 'بعد الإشعار: رقم مع مبلغه → تنفيذ المبلغ المكتوب وسؤال واحد مقتبس عليه عن الـ5,000',
+        'id': 'J2', 'title': 'بعد الإشعار: رقم مع مبلغه → تنفيذ المبلغ المكتوب بصمت، ولا سؤال عن الـ5,000 (قاعدة 2026-09-08)',
         'setup': {'prior_create': {'account': P1, 'value': 5000}, 'system_notice': 'no_wallet'},
         'turns': [{'text': f'{P2}\n\n5'}],
         'expect': {'final': {
             'creates': [{'account': P2, 'value': 5}], 'no_creates': [{'account': P2, 'value': 5000}],
-            'reply': 'one_message', 'quoted_replies': 1, 'quoted_on': [0], 'contains_any': ['5,000', '5000', '٥٠٠٠'],
-            'no_success_list': True, 'forbid': NARRATION_FORBID + ['noise', 'ضجيج'],
+            'reply': 'silent', 'no_success_list': True, 'forbid': NARRATION_FORBID + ['اترفض', '5,000', 'نفس الرقم'],
         }},
     },
     {
@@ -282,10 +281,9 @@ SCENARIOS = [
         'turns': [{'text': f'{P1}\n\n700'}],
         'expect': {'final': {
             'creates': [{'account': P1, 'value': 700}], 'no_creates': [{'account': P1, 'value': 5000}],
-            # The 700 is registered silently; the agent MAY ask once (quoted) what to do
-            # with the still-owed 5,000 from the bounced transfer — never refuse the number.
-            'reply': 'any', 'no_success_list': True,
-            'forbid': NARRATION_FORBID + ['اترفض النهارده', 'ابعت رقم تاني', 'مش عليه محفظة'],
+            # The 700 is registered silently; the bounced 5,000 is NEVER asked about (2026-09-08).
+            'reply': 'silent', 'no_success_list': True,
+            'forbid': NARRATION_FORBID + ['اترفض', 'ابعت رقم تاني', 'مش عليه محفظة', '5,000'],
         }},
     },
 
@@ -707,5 +705,33 @@ SCENARIOS += [
     {'id': 'Z65', 'title': 'z: «عايز اكلم حد» → تنبيه و«لحظة»', 'turns': [{'text': 'عايز اكلم حد من المكتب'}],
      'expect': {'final': {'tools': [{'name': 'alert_qurtoba_human', 'must': True}], 'contains_any': ['لحظة'], 'forbid': SAFE}}},
     {'id': 'Z66', 'title': 'z: «الرقم ده اتحول عليه كام النهارده» 01…', 'turns': [{'text': f'{P1}\n500'}, {'text': f'الرقم {P1} اتحول عليه كام النهارده', 'gap': 30}],
+     'expect': {'1': {'no_records': True, 'forbid': SAFE}}},
+
+    # ── 2026-09-08 live chat 13f58d64: fee noise, inline «20 ألف», tally trailers, no reroute question ──
+    {'id': 'Z67', 'title': 'z: «11.000ج م بدون خصم» على سطر المبلغ → 11,000 بصمت بلا موديل',
+     'turns': [{'text': f'سلم \n {P1}\n11.000ج م بدون خصم \nفودافون'}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 11000}], 'reply': 'silent',
+                          'tools': [{'name': 'whatsapp_reply_to_message', 'must': False}], 'forbid': SAFE + ['هو 11']}}},
+    {'id': 'Z68', 'title': 'z: «01… المبلغ 20 ألف اسامه البنا» في سطر واحد → 20,000 بصمت',
+     'turns': [{'text': f'{P1} المبلغ  20 ألف  اسامه البنا'}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 20000}], 'reply': 'silent', 'forbid': SAFE}}},
+    {'id': 'Z69', 'title': 'z: سطر تالي «عاصم كاش اشرف 18 ⏎ طه13.45» → مبلغ واحد، لا 18، بصمت',
+     'turns': [{'text': f'{P1}\n6119\nعاصم كاش اشرف 18\nطه13.45'}, {'text': f'{P2}\n7000\nعاصم كاش عابد \nمحمد 90 مستعجله', 'offset': 1}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 6119}, {'account': P2, 'value': 7000}],
+                          'no_creates': [{'account': P1, 'value': 18}, {'account': P2, 'value': 90}], 'reply': 'silent', 'forbid': SAFE}}},
+    {'id': 'Z70', 'title': 'z: «بدون عموله» في سطر لوحده + «اخصم مصاريف الخدمة» رسالة لوحدها → 10,000 بصمت',
+     'turns': [{'text': f'ارجو تحويل \nفودافون كاش \n{P1}\n\n10,000 ج م \n\nبدون عموله'}, {'text': 'اخصم مصاريف الخدمة', 'offset': 2}],
+     'expect': {'final': {'creates': [{'account': P1, 'value': 10000}], 'reply': 'silent', 'forbid': SAFE}}},
+    {'id': 'Z71', 'title': 'z: رقم مجرد يقتبس إشعار الرفض بعد تحويل تاني → مبلغ الإشعار على الرقم الجديد',
+     'setup': {'prior_create': {'account': P1, 'value': 5000}, 'system_notice': 'no_wallet'},
+     'turns': [{'text': f'{P3}\n700'}, {'text': P2, 'gap': 40, 'reply_to': 'notice'}],
+     'expect': {'0': {'creates': [{'account': P3, 'value': 700}], 'reply': 'silent'},
+                '1': {'creates': [{'account': P2, 'value': 5000}], 'reply': 'silent', 'forbid': SAFE}}},
+    {'id': 'Z72', 'title': 'z: سؤال «هو 15,100؟» ثم «تمام» → ينفّذ 15,100 (السؤال محفوظ)',
+     'turns': [{'text': f'{P1}\nعبدالله15100'}, {'text': 'تمام', 'gap': 40}],
+     'expect': {'0': {'no_records': True, 'contains': ['هو 15,100']},
+                '1': {'creates': [{'account': P1, 'value': 15100}], 'forbid': SAFE}}},
+    {'id': 'Z73', 'title': 'z: سؤال «هو 15,100؟» ثم «لا» → يُسقط ويرد مرة',
+     'turns': [{'text': f'{P1}\nعبدالله15100'}, {'text': 'لا', 'gap': 40}],
      'expect': {'1': {'no_records': True, 'forbid': SAFE}}},
 ]

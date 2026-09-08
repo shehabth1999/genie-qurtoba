@@ -70,8 +70,8 @@ def describe(conversation) -> List[str]:
     lines: List[str] = []
     c = st.get('correction')
     if c:
-        lines.append(f"  - waiting for «حول»/no: create {R._fmt(c.get('value'))} → {c.get('account_number')} "
-                     f"({'a corrected number' if c.get('correction_of') else 'a question-shaped message'})")
+        lines.append(f"  - waiting for yes/no: create {R._fmt(c.get('value'))} → {c.get('account_number')} "
+                     f"({'a corrected number, «حول» is the yes' if c.get('correction_of') else 'the amount the system read beside the number'})")
     if st.get('list'):
         pairs = ', '.join(f"{p['account_number']} ← {R._fmt(p['value'])}" for p in st['list']['pairs'])
         lines.append(f'  - waiting for yes/no on the positional matching: {pairs}')
@@ -109,11 +109,15 @@ def answer_pending(conversation, partner, decision: str, answer_message_id: Opti
         cache_delete(CORRECTION_KEY.format(conv=key))
         result['kind'] = 'correction'
         if yes:
-            res = call_tool(conversation, partner, qurtoba_create_new_transactions_bulk, transactions=[{
-                'type': c.get('type') or 'كاش', 'value': float(c['value']), 'account_number': c['account_number'],
-                'source_message_id': c.get('source_message_id')}])
-            result.update(handled=True, created=_created(res), note='executed the held transfer')
-            consume(conversation, [x for x in (c.get('correction_of'),) if x])
+            from .transfers import _created_since
+            if _created_since(partner, c['account_number'], c['value'], c.get('ts')):
+                result.update(handled=True, note='that transfer was already created after the question; nothing to do')
+            else:
+                res = call_tool(conversation, partner, qurtoba_create_new_transactions_bulk, transactions=[{
+                    'type': c.get('type') or 'كاش', 'value': float(c['value']), 'account_number': c['account_number'],
+                    'source_message_id': c.get('source_message_id')}])
+                result.update(handled=True, created=_created(res), note='executed the held transfer')
+            consume(conversation, [x for x in (c.get('correction_of'), c.get('source_message_id')) if x])
         else:
             consume(conversation, [x for x in (c.get('correction_of'), c.get('source_message_id')) if x])
             send_quoted(conversation, answer_message_id or c.get('source_message_id'), R.CORRECTION_DECLINED)

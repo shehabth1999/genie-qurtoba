@@ -48,7 +48,8 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
     replies: List[tuple] = []
     consumed: List[str] = []
     out = {'items': items, 'replies': replies, 'confirm_repeats': False, 'clear_repeats': False,
-           'consume': consumed, 'reroute_used': False, 'pending': None, 'list_confirm': None, 'to_model': []}
+           'consume': consumed, 'reroute_used': False, 'pending': None, 'list_confirm': None, 'to_model': [],
+           'hint_pending': None}
     if not plan or not plan.get('success'):
         return out
     accounts = accounts or []
@@ -188,6 +189,10 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
             amt = _hint_amount(hint.get('text') if hint else None)
             if amt:
                 replies.append((mid, R.ORPHAN_PHONE_HINT.format(phone=val, amount=R._fmt(amt))))
+                # the question is HELD: a bare «تمام»/«أيوة» creates it, «لا» drops it (2026-09-08:
+                # «تمام» to this question matched nothing and 11,000 was never created)
+                out['hint_pending'] = {'type': 'كاش', 'value': float(amt), 'account_number': val,
+                                       'source_message_id': mid, 'kind': 'hint'}
                 continue
             replies.append((mid, R.ORPHAN_PHONE.format(phone=val)))
         else:
@@ -200,12 +205,9 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
         if not any(r[0] == mid for r in replies):
             replies.append((mid, R.BAD_NUMBER))
 
-    if reroute_amount and not out['reroute_used']:
-        # «A number that arrives WITH an amount is NOT the reroute answer … create exactly what the
-        # message says, then ask ONE quoted question about the still-owed reroute amount.»
-        first = next((i for i in items if i.get('type') == 'كاش' and not i.get('reroute')), None)
-        if first is not None:
-            replies.append((first.get('source_message_id'), R.REROUTE_OWED_QUESTION.format(amount=R._fmt(reroute_amount))))
+    # A number that arrives WITH an amount is a complete order: created as written, and NOTHING is
+    # asked about the still-owed reroute amount (office rule 2026-09-08: a rejected or cancelled
+    # transfer is never asked about; only a bare number — optionally quoting the notice — takes it).
 
     if plan.get('needs_resend'):
         target = max((m for m in texts), default=None)
@@ -370,10 +372,12 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if correction_pending and mid in (route.get('batch_ids') or []) and not cls['phones'] and not cls['amounts']:
             if L.is_bare_yes(text):
-                pre_items.append({'type': correction_pending.get('type') or 'كاش', 'value': float(correction_pending['value']),
-                                  'account_number': correction_pending['account_number'],
-                                  'source_message_id': correction_pending['source_message_id']})
-                pre_consume += [x for x in (mid, correction_pending.get('correction_of')) if x]
+                if not _created_since(partner, correction_pending['account_number'], correction_pending['value'],
+                                      correction_pending.get('ts')):
+                    pre_items.append({'type': correction_pending.get('type') or 'كاش', 'value': float(correction_pending['value']),
+                                      'account_number': correction_pending['account_number'],
+                                      'source_message_id': correction_pending['source_message_id']})
+                pre_consume += [x for x in (mid, correction_pending.get('correction_of'), correction_pending.get('source_message_id')) if x]
                 cache_delete(CORRECTION_KEY.format(conv=conv_key)); correction_pending = None
                 continue
             if L.is_bare_no(text):
@@ -480,6 +484,9 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         cache_delete(REROUTE_KEY.format(conv=conv_key)); reroute = None
     if reroute is None:
         reroute = _reroute_from_chat(conversation, partner)
+    quoted = _reroute_from_quote(conversation, partner, rows)
+    if quoted is not None:
+        reroute = quoted                                 # the customer pointed at the notice himself
 
     # A bare «أيوة» / «لا» / «تأكيد» that quotes nothing is not in the planner's `answers`
     # (it only extracts quoted replies and bare amounts) — attach it to whatever we are waiting
@@ -525,6 +532,8 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     decision = decide(plan, hv_threshold=_high_value_threshold(), repeat_pending=repeat_pending,
                       reroute=reroute, texts={mid: _text_of(m) for mid, m in rows.items()}, accounts=accounts,
                       list_pending=list_pending, hv_pending=hv_phone)
+    if decision.get('hint_pending'):
+        cache_set(CORRECTION_KEY.format(conv=conv_key), {**decision['hint_pending'], 'ts': time.time()}, PENDING_TTL)
     if decision.get('list_confirm'):
         cache_set(LIST_KEY.format(conv=conv_key), {**decision['list_confirm'], 'ts': time.time()}, PENDING_TTL)
     elif list_pending:
@@ -681,7 +690,7 @@ def _is_noise_line(text: str) -> bool:
     # ignored — no reply, no model, and its number is never an amount.
     from qurtoba.tools.planning import _FEE_NOTE_RE
     cls = _classify_message(t)
-    if _FEE_NOTE_RE.search(L.norm(t)) and not cls['phones'] and len(t.split()) <= 8:
+    if _FEE_NOTE_RE.search(L.norm(t)) and not cls['phones'] and not cls['amounts'] and len(t.split()) <= 8:
         return True
     return False
 
@@ -799,17 +808,51 @@ _REROUTE_LINE = 'محتاجين رقم تانى'
 _REMAINDER_RE = None
 
 
+_CANCEL_LINE = 'تم الغاء التحويل'
+
+
+def _notice_amount(notice, partner) -> Optional[float]:
+    """The amount an office notice is about: «… الباقى ( X ) …» → X; otherwise the full
+    original amount of the customer message it quotes (its record, its text, or the last
+    record on that number)."""
+    global _REMAINDER_RE
+    import re
+    if _REMAINDER_RE is None:
+        _REMAINDER_RE = re.compile(r'الباقى\s*\(\s*([\d,\.]+)\s*\)')
+    txt = str((notice.content or {}).get('text') or '') if isinstance(notice.content, dict) else ''
+    m = _REMAINDER_RE.search(txt)
+    if m:
+        return float(m.group(1).replace(',', ''))
+    q = getattr(notice, 'reply_to', None)
+    if q is None:
+        return None
+    rec = getattr(q, 'qurtoba_record', None)
+    if rec is not None and (getattr(rec, 'original_value', None) or getattr(rec, 'value', None)):
+        return float(getattr(rec, 'original_value', None) or rec.value)
+    amts = _classify_message(_text_of(q)).get('amounts') or []
+    if amts:
+        return float(amts[0])
+    from qurtoba.models import QurtobaRecord
+    customer = getattr(partner, 'qurtoba_customer', None)
+    phones = _classify_message(_text_of(q)).get('phones') or []
+    if customer is not None and phones:
+        r = QurtobaRecord.objects.filter(customer=customer, account_number=phones[0]).order_by('-id').first()
+        if r is not None and (getattr(r, 'original_value', None) or getattr(r, 'value', None)):
+            return float(getattr(r, 'original_value', None) or r.value)
+    return None
+
+
+def _is_notice(text: str) -> bool:
+    return _REROUTE_LINE in str(text or '') or _CANCEL_LINE in str(text or '')
+
+
 def _reroute_from_chat(conversation, partner) -> Optional[Dict[str, Any]]:
     """Derive the owed reroute amount from the LAST outbound notice when no cache marker exists
     (worker restart, notice sent before v2, sandbox): «… الباقى ( X ) …» → X; the no-wallet
     notice → the full amount of the transfer it quotes."""
-    global _REMAINDER_RE
     try:
-        import re
         from django.utils import timezone
         from modules.chat.models import Message
-        if _REMAINDER_RE is None:
-            _REMAINDER_RE = re.compile(r'الباقى\s*\(\s*([\d,\.]+)\s*\)')
         day_start = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
         last = (Message.objects_all.filter(conversation=conversation, direction='outbound', type='text', active=True,
                                            created_at__gte=day_start)
@@ -819,32 +862,51 @@ def _reroute_from_chat(conversation, partner) -> Optional[Dict[str, Any]]:
         txt = str((last.content or {}).get('text') or '') if isinstance(last.content, dict) else ''
         if _REROUTE_LINE not in txt:
             return None
-        amount = None
-        m = _REMAINDER_RE.search(txt)
-        if m:
-            amount = float(m.group(1).replace(',', ''))
-        else:
-            q = last.reply_to
-            rec = getattr(q, 'qurtoba_record', None) if q is not None else None
-            if rec is not None and getattr(rec, 'value', None):
-                amount = float(rec.value)
-            elif q is not None:
-                amts = _classify_message(_text_of(q)).get('amounts') or []
-                amount = float(amts[0]) if amts else None
-            if amount is None and q is not None:
-                from qurtoba.models import QurtobaRecord
-                customer = getattr(partner, 'qurtoba_customer', None)
-                phones = _classify_message(_text_of(q)).get('phones') or []
-                if customer is not None and phones:
-                    r = QurtobaRecord.objects.filter(customer=customer, account_number=phones[0]).order_by('-id').first()
-                    if r is not None and getattr(r, 'original_value', None) or getattr(r, 'value', None):
-                        amount = float(getattr(r, 'original_value', None) or r.value)
+        amount = _notice_amount(last, partner)
         if not amount or amount <= 0:
             return None
         marker = {'amount': amount, 'ts': last.created_at.timestamp(), 'kind': 'chat', 'record_id': None}
         return marker if _reroute_still_valid(conversation, partner, marker) else None
     except Exception:
         return None
+
+
+def _reroute_from_quote(conversation, partner, rows: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """A BARE number quoting one of our rejection / cancellation notices («محتاجين رقم تانى»,
+    «تم الغاء التحويل») is the new number for that transfer — whenever it comes, even after other
+    transfers were created (office rule 2026-09-08). The amount is the notice's."""
+    try:
+        for mid, m in rows.items():
+            if getattr(m, 'type', None) != 'text':
+                continue
+            q = getattr(m, 'reply_to', None)
+            if q is None or getattr(q, 'direction', None) != 'outbound' or not _is_notice(_text_of(q)):
+                continue
+            cls = _classify_message(_text_of(m))
+            if len(cls['phones']) != 1 or cls['amounts']:
+                continue
+            amount = _notice_amount(q, partner)
+            if amount and amount > 0:
+                log('reroute_quoted', conversation, mid=str(mid)[:8], amount=amount)
+                return {'amount': amount, 'ts': time.time(), 'kind': 'quoted', 'record_id': None}
+        return None
+    except Exception:
+        return None
+
+
+def _created_since(partner, phone: str, value, ts) -> bool:
+    """Was `value` → `phone` already created after `ts` (the model acted on the question itself)?"""
+    try:
+        from datetime import datetime, timezone as _tz
+        from qurtoba.models import QurtobaRecord
+        customer = getattr(partner, 'qurtoba_customer', None)
+        if customer is None or not ts:
+            return False
+        since = datetime.fromtimestamp(float(ts), tz=_tz.utc)
+        return QurtobaRecord.objects.filter(customer=customer, account_number=phone, value=float(value),
+                                            created_at__gte=since).exists()
+    except Exception:
+        return False
 
 
 def _reroute_still_valid(conversation, partner, marker: Dict[str, Any]) -> bool:

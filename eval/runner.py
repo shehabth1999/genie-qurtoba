@@ -611,13 +611,14 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
             if setup.get('system_notice') == 'no_wallet':
                 from qurtoba.tasks import _CANCEL_NOTICE_MESSAGES
                 insert_outbound_system(conversation, admin_partner, '👍')
-                insert_outbound_system(conversation, admin_partner, _CANCEL_NOTICE_MESSAGES['no_wallet'], reply_to=m0)
+                notice_msg = insert_outbound_system(conversation, admin_partner, _CANCEL_NOTICE_MESSAGES['no_wallet'], reply_to=m0)
                 QurtobaRecord.objects.filter(pk=rec.pk).update(cash_sys_state='canceled', cash_sys_canceled_reason='no_wallet',
                                                               cash_sys_original_value=float(pc['value']), value=0.0)
             backdate(conversation, customer, 120)
 
         batch: List[Any] = []
         turns = scn['turns']
+        notice_msg = locals().get('notice_msg')
         # Messages inside one batch are stamped a few seconds apart (a person typing),
         # not in the same second — the planner treats a same-second split as a
         # deliberate ≤3 burst and executes it. A scenario can override with `offset`.
@@ -631,7 +632,10 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
                 batch = []
                 batch_clock = None
                 backdate(conversation, customer, gap)
-            reply_to = rows_by_turn.get(t['reply_to']) if t.get('reply_to') is not None else None
+            if t.get('reply_to') == 'notice':
+                reply_to = notice_msg                       # the customer quotes our rejection notice
+            else:
+                reply_to = rows_by_turn.get(t['reply_to']) if t.get('reply_to') is not None else None
             if batch_clock is None:
                 n_batch = 1
                 j = i + 1

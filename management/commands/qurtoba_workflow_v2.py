@@ -110,7 +110,7 @@ def build_spec(src_nodes, tool_ids):
     not_linked = src_cfg(SRC_NOT_LINKED_TOOL)
     not_linked['arguments'] = {'message': R.NOT_LINKED}
 
-    X0, X1, X2, X3, X4, X5, X6 = 0, 320, 640, 960, 1280, 1600, 1920
+    X0, X1, X2, X3, X4, X5, X6, X7 = 0, 320, 640, 960, 1280, 1600, 1920, 2240
     nodes = [
         dict(node_id='conditional_linked', node_type='conditional', label='linked to a Qurtoba customer?', x=X0, y=300,
              configuration={'conditions': [{'operator': 'is_true', 'data_type': 'boolean',
@@ -131,6 +131,7 @@ def build_spec(src_nodes, tool_ids):
         _fn('function_done', 'done — silent turn', X5, 440, NODE_CODE['function_done']),
         _fn('function_ai_context', 'context for the thinking model', X5, 300, NODE_CODE['function_ai_context']),
         dict(node_id='agent_thinker', node_type='agent_chat', label='THINKER (model): questions, replies, info tools', x=X6, y=300, configuration=thinker),
+        _fn('function_model_done', 'model turn timing → output', X7, 300, NODE_CODE['function_model_done']),
         _fn('function_off_hours', 'off-hours notice', X3, 560, NODE_CODE['function_off_hours']),
         dict(node_id=AVAILABILITY_NODE, node_type='function', label='service_availability', x=X3, y=40,
              configuration=src_cfg(AVAILABILITY_NODE)),
@@ -149,6 +150,7 @@ def build_spec(src_nodes, tool_ids):
         ('conditional_needs_ai', 'function_ai_context', '1'),
         ('conditional_needs_ai', 'function_done', '0'),
         ('function_ai_context', 'agent_thinker', ''),
+        ('agent_thinker', 'function_model_done', ''),
         (AVAILABILITY_NODE, SHARED_CORE_NODE, ''),
         (SHARED_CORE_NODE, 'agent_payments', ''),
     ]

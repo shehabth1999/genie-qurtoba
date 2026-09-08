@@ -6,7 +6,7 @@ The node receives the whole workflow state as ``input_data`` and the live
 
 Graph (see management/commands/qurtoba_workflow_v2.py):
     linked? → route (receipt / off-hours / money) → transfers (creates, no model)
-           → needs AI? → ai_context → agent_thinker | done ('' = silent turn)
+           → needs AI? → ai_context → agent_thinker → model_done (logs the turn time) | done ('' = silent turn)
 
 Nothing here may raise: a raised error would make the engine retry the node up to
 ``max_retries`` times, re-running the money path. Errors are logged, a human is
@@ -107,6 +107,16 @@ def ai_context_node(input_data, conversation, partner) -> Dict[str, Any]:
                 who = 'you' if getattr(q, 'direction', None) == 'outbound' else 'the customer'
                 quote = f' [replying to {who}: «{str(qc.get("text") or qc.get("caption") or "")[:60]}»]'
             texts.append(f"[message_id: {m.id}] ({m.type}){quote} {str(c.get('text') or c.get('transcription') or c.get('caption') or '')[:300]}")
+        # step 6 (2026-09-08): time every model turn — the start is stamped here, the end in
+        # model_done_node — so slow turns (75 s, 181 s seen today) are visible in the agent log
+        try:
+            import time as _time
+            from .context import cache_set
+            cache_set(f'qurtoba:model_start:{conversation.id}', _time.time(), 900)
+            log('model_start', conversation, leftovers=len(summary.get('leftovers') or []),
+                others=len(summary.get('others') or []), msgs=len(texts))
+        except Exception:
+            pass
         return {
             'now': timezone.localtime().strftime('%Y-%m-%d %H:%M (%A)'),
             'partner_name': getattr(partner, 'name', '') or '',
@@ -118,6 +128,35 @@ def ai_context_node(input_data, conversation, partner) -> Dict[str, Any]:
     except Exception as exc:
         logger.exception('automation ai context failed')
         return {'now': '', 'partner_name': '', 'customer_name': '', 'accounts': '', 'money_path': '', 'messages': ''}
+
+
+THINKER_NODE_ID = 'agent_thinker'
+
+
+def model_done_node(input_data, conversation, partner) -> str:
+    """Last node after the thinker: log how long the model turn took and pass its output on
+    (an empty string = silent turn, as before)."""
+    out = None
+    try:
+        import time as _time
+        from .context import cache_get, cache_delete
+        results = (input_data or {}).get('__node_results__') or {}
+        node = results.get(THINKER_NODE_ID) or {}
+        od = node.get('output_data') if isinstance(node, dict) else None
+        if isinstance(od, dict):
+            out = od.get('__output__')
+            if out is None:
+                out = od.get('response') or od.get('output') or od.get('content')
+        started = cache_get(f'qurtoba:model_start:{conversation.id}')
+        secs = round(_time.time() - float(started), 1) if started else None
+        cache_delete(f'qurtoba:model_start:{conversation.id}')
+        log('model_done', conversation, seconds=secs, out_len=len(str(out or '')),
+            tokens=od.get('tokens_used') if isinstance(od, dict) else None,
+            model=od.get('model') if isinstance(od, dict) else None)
+    except Exception as exc:
+        logger.exception('automation model_done failed')
+        log('node_error', conversation, node='model_done', error=str(exc)[:200])
+    return out if isinstance(out, str) else ''
 
 
 # The exact code pasted into each function node (kept here so the builder and the
@@ -136,4 +175,5 @@ NODE_CODE = {
     'function_off_hours': _code('off_hours_node'),
     'function_done': _code('done_node'),
     'function_ai_context': _code('ai_context_node'),
+    'function_model_done': _code('model_done_node'),
 }

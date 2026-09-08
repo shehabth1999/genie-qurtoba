@@ -30,6 +30,33 @@ logger = logging.getLogger(__name__)
 # خصم root (خصم/يخصم/تخصم/هيخصم/اخصم/اخصمها/خصمها) is caught by the substring «خصم».
 _FEE_NOTE_RE = re.compile(r'خصم|رسوم|عمول|مصاريف')
 
+# Office rule (2026-09-08): fee wording is NOISE, nothing more. «بدون خصم», «بدون عموله»,
+# «اخصم مصاريف الخدمة», «الرسوم عليا», «لو هيخصم 15 اخصمها» — the fee words are dropped and
+# whatever amount stands beside them is read as usual («11.000ج م بدون خصم» → 11000). The
+# only number that leaves with the noise is the fee itself: a small number inside a
+# deduction INSTRUCTION (not a «بدون» remark).
+_FEE_NOISE_WORDS = {'بدون', 'لو', 'هي', 'عليا', 'عليه', 'عليك', 'علي', 'الخدمه', 'خدمه', 'الخدمات',
+                    'اتحمل', 'هتحمل', 'نتحمل', 'اتحملها', 'هتحملها', 'من', 'المبلغ', 'كمان', 'برضو'}
+_FEE_MAX = 100          # a wallet fee is tens of pounds; 15 / 30 / 50 — never a transfer amount
+
+
+def _strip_fee_noise(rest_text: str):
+    """(kept, dropped): the line without its fee wording, and the noise that was removed.
+    A number stays unless it is fee-sized inside a deduction instruction."""
+    toks = rest_text.split()
+    n = [_arabic_normalize(_ar_to_ascii(t)).lower() for t in toks]
+    remark = any(w == 'بدون' for w in n)                      # «بدون خصم» = no fee, a remark
+    kept, dropped = [], []
+    for tok, nt in zip(toks, n):
+        if _FEE_NOTE_RE.search(nt) or nt in _FEE_NOISE_WORDS:
+            dropped.append(tok)
+            continue
+        if not remark and re.fullmatch(r'\d+', nt) and float(nt) <= _FEE_MAX:
+            dropped.append(tok)                                # «لو هيخصم 15» → 15 is the fee
+            continue
+        kept.append(tok)
+    return ' '.join(kept).strip(), ' '.join(dropped).strip()
+
 # Reference / receipt-serial phrases whose number is an ID, NEVER a transfer amount:
 # «رقم العملية 5», «الرقم المرجعي 12345», «reference 88». (A bare «رقم» is NOT here — that
 # often precedes a phone; only these reference-phrase roots count.)
@@ -108,6 +135,18 @@ def _lead_is_amount_words(lead: str) -> bool:
             continue
         rest = rest[len(hit):]
     return True
+
+
+_TALLY_MAX = 1000       # a tally / serial next to a name is small; «اشرف 18000» stays an amount
+
+
+def _is_name_led(line: str) -> bool:
+    """True if the LETTERS before the first digit of `line` are not amount/label/type words —
+    the line starts with a name («عاصم كاش اشرف 18», «محتاج 500»), spaces or not."""
+    t = _arabic_normalize(_ar_to_ascii(line or '')).lower()
+    m = re.match(r'^([^\d]*)\d', t)
+    lead = re.sub('[^a-z؀-ۿ]', '', m.group(1) if m else '')
+    return bool(lead) and not _lead_is_amount_words(lead)
 
 
 def _is_glued_name_label(tok: str) -> bool:
@@ -221,6 +260,7 @@ def _classify_message(text: str) -> Dict[str, Any]:
     phones: List[str] = []
     amounts: List[float] = []
     ambiguous: List[float] = []
+    name_led: List[tuple] = []     # (value, line) — a name then a small number: tally or orphan amount?
     has_name = False
 
     for line in text.splitlines():
@@ -246,8 +286,9 @@ def _classify_message(text: str) -> Dict[str, Any]:
         # number) so «0100600100» can't become the amount 100,600,100 paired with a phone.
         _kept_rest = []
         for _tok in rest:
-            if line_phones and re.fullmatch(r'\+?0{0,2}2(?:0)?', _tok):
+            if line_phones and re.fullmatch(r'\+2|\+20|002|0020', _tok):
                 continue                   # «+2» / «+20» / «002» next to the number: a country code, not 2 pounds
+                                           # (a bare «20» is a number: «01… المبلغ 20 ألف», 2026-09-08)
             if re.fullmatch(r'0\d{9,11}', _tok):
                 has_name = True            # broken phone → noise, not a giant amount
                 _ignore(_tok, 'broken_phone')
@@ -264,16 +305,23 @@ def _classify_message(text: str) -> Dict[str, Any]:
         # Fee-deduction instruction («لو هيخصم 15 اخصمها», «اخصم الرسوم») → the number here
         # is a FEE reference, not a transfer amount. Treat the line as a note; extract nothing.
         # Same for a reference/receipt-serial phrase («رقم العملية 5», «الرقم المرجعي 12345»).
-        if _FEE_NOTE_RE.search(rest_text):
+        if _FEE_NOTE_RE.search(_arabic_normalize(rest_text)):
+            # fee wording is noise: drop it, keep the amount standing beside it (office rule 2026-09-08)
             has_name = True
-            _ignore(rest_text, 'fee_note')
-            continue
+            rest_text, fee_part = _strip_fee_noise(rest_text)
+            if fee_part:
+                _ignore(fee_part, 'fee_note')
+            if not rest_text:
+                continue
         if _REF_NOTE_RE.search(rest_text):
             has_name = True
             _ignore(rest_text, 'reference_note')
             continue
         r = normalize_amount(rest_text)
         if r['ok'] and float(r['value']).is_integer():
+            if _is_name_led(rest_text) and r['value'] < _TALLY_MAX:
+                name_led.append((r['value'], rest_text))   # «عاصم كاش اشرف 18» — decided after the loop
+                continue
             amounts.append(r['value'])
             if r.get('ambiguous'):
                 ambiguous.append(r['value'])
@@ -294,6 +342,16 @@ def _classify_message(text: str) -> Dict[str, Any]:
             has_name = True
             _ignore(rest_text, 'words')
 
+    # A name followed by a small number («عاصم كاش اشرف 18», «مدحت 2», «محمد 90 مستعجله») under a
+    # message that already holds its number and amount is the office's tally line, never a
+    # second amount (2026-09-08: five of them woke the model for three minutes). Alone in a
+    # message («محتاج 500») it is still an amount with no number.
+    for val, line in name_led:
+        if phones and amounts:
+            has_name = True
+            _ignore(line, 'name_label')
+        else:
+            amounts.append(val)
     # The same number written twice in one message is ONE number («01… ⏎ 01… ⏎ 800»);
     # otherwise it becomes two phones and one amount → a bogus «لكل رقم ولا تقسيم؟».
     phones = list(dict.fromkeys(phones))
