@@ -134,8 +134,8 @@ THINKER_NODE_ID = 'agent_thinker'
 
 
 def model_done_node(input_data, conversation, partner) -> str:
-    """Last node after the thinker: log how long the model turn took and pass its output on
-    (an empty string = silent turn, as before)."""
+    """Last node after the thinker: log how long the model turn took; the turn ends silently
+    (the model's plain output is never a reply)."""
     out = None
     try:
         import time as _time
@@ -156,7 +156,9 @@ def model_done_node(input_data, conversation, partner) -> str:
     except Exception as exc:
         logger.exception('automation model_done failed')
         log('node_error', conversation, node='model_done', error=str(exc)[:200])
-    return out if isinstance(out, str) else ''
+    # Every customer-facing word goes through the reply tool; the model's plain output («Done»,
+    # a summary) is thrown away here — so nothing ever reaches the outbound gate from it.
+    return ''
 
 
 # The exact code pasted into each function node (kept here so the builder and the

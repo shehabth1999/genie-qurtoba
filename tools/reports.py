@@ -28,6 +28,7 @@ Qurtoba reporting tools for AI Studio agents.
     withheld so nothing is silently dropped.
 """
 import logging
+import re
 import time
 from datetime import date as date_cls, datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -189,6 +190,7 @@ def _new_group(partner, *, is_self: bool, order: int) -> dict:
         'in_flight': [],
         'pending_transactions': [],
         'pending_payments': [],
+        'cancelled': [],           # reversed by Cash-SYS (value 0 now) — shown, never counted
         'totals': {'debit': 0.0, 'credit': 0.0},
         '_order': order,
     }
@@ -443,6 +445,33 @@ def _date_display(report_date_iso: str) -> str:
         return report_date_iso
 
 
+def _date_display_ar(report_date_iso: str) -> str:
+    """«الثلاثاء 8 سبتمبر (08/09/2026)» — the day name the office uses, plus the numeric date."""
+    try:
+        from qurtoba.services.daily_totals import fmt_day_ar
+        y, m, d = (int(x) for x in report_date_iso.split('-'))
+        return f'{fmt_day_ar(date_cls(y, m, d))} ({_date_display(report_date_iso)})'
+    except Exception:
+        return _date_display(report_date_iso)
+
+
+_CANCEL_REASON_AR = {
+    'no_wallet': 'الرقم مش عليه محفظة',
+    'limit': 'الرقم تجاوز الحد',
+    'daily_limit': 'الرقم تجاوز الحد اليومي',
+    'monthly_limit': 'الرقم تجاوز الحد الشهري',
+    'cancel_request': 'ألغي بناءً على طلبك',
+    'agent': 'ألغي بواسطة المكتب',
+    'office': 'ألغي بواسطة المكتب',
+}
+_AUTO_NOTE_RE = re.compile(r'^\[auto\]\s*|\s*لعملية\s*#\d+')
+
+
+def _clean_note(text) -> str:
+    """«[auto] مصاريف خدمة لعملية #37144» → «مصاريف خدمة»: no internal ids in a customer file."""
+    return _AUTO_NOTE_RE.sub('', str(text or '')).strip()
+
+
 def _balance_phrase(current_balance: float) -> str:
     """Mirror check_balance_and_send(): direction word first, absolute amount."""
     bal = float(current_balance or 0)
@@ -460,11 +489,16 @@ def _build_statement_xlsx(
     total_debit: float,
     total_credit: float,
     current_balance: float,
+    *,
+    generated_at: Optional[str] = None,
 ) -> bytes:
-    """The whole day as one right-to-left worksheet; same rows the text form prints."""
+    """The whole day as one right-to-left worksheet — every number on the account and what
+    the office entered («بواسطة قرطبة»), one section each with its own subtotal, then the
+    day's totals and the balance. Same rows and buckets the text form prints."""
     from io import BytesIO
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
 
     wb = Workbook()
     ws = wb.active
@@ -472,85 +506,147 @@ def _build_statement_xlsx(
     ws.sheet_view.rightToLeft = True
 
     bold = Font(bold=True)
-    title_font = Font(bold=True, size=14)
-    head_fill = PatternFill('solid', fgColor='DDEBF7')
-    section_fill = PatternFill('solid', fgColor='F2F2F2')
-    center = Alignment(horizontal='center', vertical='center')
+    white_bold = Font(bold=True, color='FFFFFF')
+    title_font = Font(bold=True, size=15, color='1F3864')
+    sub_font = Font(size=11, color='595959')
+    head_fill = PatternFill('solid', fgColor='1F3864')
+    section_fill = PatternFill('solid', fgColor='D9E1F2')
+    subtotal_fill = PatternFill('solid', fgColor='F2F2F2')
+    total_fill = PatternFill('solid', fgColor='FFF2CC')
+    done_fill = PatternFill('solid', fgColor='E2EFDA')
+    wait_fill = PatternFill('solid', fgColor='FFF2CC')
+    review_fill = PatternFill('solid', fgColor='FCE4D6')
+    center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    right = Alignment(horizontal='right', vertical='center', wrap_text=True)
     thin = Side(style='thin', color='BFBFBF')
     box = Border(left=thin, right=thin, top=thin, bottom=thin)
-    headers = ['#', 'المبلغ', 'النوع', 'الرقم', 'الوقت', 'الحالة']
-    ncols = len(headers)
 
-    def _merged_line(text, font=bold, fill=None):
+    headers = ['#', 'الوقت', 'النوع', 'الرقم', 'المبلغ', 'الحالة', 'ملاحظات']
+    ncols = len(headers)
+    AMOUNT_COL = 5
+
+    def _merged_line(text, font=bold, fill=None, align=center, height=None):
         ws.append([text])
         r = ws.max_row
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncols)
         cell = ws.cell(row=r, column=1)
         cell.font = font
-        cell.alignment = center
+        cell.alignment = align
         if fill is not None:
-            cell.fill = fill
+            for c in range(1, ncols + 1):
+                ws.cell(row=r, column=c).fill = fill
+        if height:
+            ws.row_dimensions[r].height = height
 
-    def _table_row(values, *, header=False):
+    def _table_row(values, *, header=False, fill=None):
         ws.append(values)
         r = ws.max_row
         for c in range(1, ncols + 1):
             cell = ws.cell(row=r, column=c)
             cell.border = box
-            cell.alignment = center
+            cell.alignment = right if c == ncols else center
             if header:
-                cell.font = bold
+                cell.font = white_bold
                 cell.fill = head_fill
+            elif fill is not None and c == 6:
+                cell.fill = fill
         if not header:
-            ws.cell(row=r, column=2).number_format = '#,##0'
+            ws.cell(row=r, column=AMOUNT_COL).number_format = '#,##0'
 
-    _merged_line(f'كشف حساب اليوم — {_date_display(report_date_iso)}', font=title_font)
-    _merged_line(customer_name or '')
+    def _subtotal_row(label, value, fill):
+        ws.append([label, None, None, None, float(value or 0)])
+        r = ws.max_row
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=AMOUNT_COL - 1)
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.fill = fill
+            cell.border = box
+            cell.font = bold
+            cell.alignment = center
+        ws.cell(row=r, column=AMOUNT_COL).number_format = '#,##0'
+
+    def _note_for(row) -> str:
+        bits = []
+        if row.get('is_payment'):
+            bits.append('سداد')
+        if row.get('is_seller_collection'):
+            bits.append('تحصيل')
+        notes = _clean_note(row.get('notes'))
+        if notes:
+            bits.append(notes[:60])
+        if row.get('reason'):
+            reason = str(row['reason'])
+            bits.append(_CANCEL_REASON_AR.get(reason, reason)[:60])
+        return ' — '.join(bits)
+
+    # ── title block ──
+    _merged_line(f'كشف حساب يوم {_date_display_ar(report_date_iso)}', font=title_font, height=26)
+    _merged_line(f'العميل: {customer_name or ""}', font=Font(bold=True, size=12))
+    _merged_line('يشمل كل عمليات اليوم من جميع أرقامك وما سجّله مكتب قرطبة' +
+                 (f'  •  صدر في {generated_at}' if generated_at else ''), font=sub_font)
     ws.append([])
 
-    populated = [g for g in groups if _group_has_rows(g)]
-    show_headings = len(populated) > 1
+    populated = [g for g in groups if _group_has_rows(g) or g.get('cancelled')]
     for g in populated:
-        if show_headings:
-            _merged_line(g.get('label') or g.get('phone') or '', fill=section_fill)
+        label = g.get('label') or g.get('phone') or ''
+        if g.get('partner_id') is None:
+            heading = '🏢 ' + label
+        else:
+            heading = '📱 ' + label + (' (رقمك)' if g.get('is_self') else '')
+        _merged_line(heading, fill=section_fill, height=20)
         _table_row(headers, header=True)
         n = 0
-        for bucket, status in (('executed', '✅ منفذة'), ('in_flight', '⏳ قيد التنفيذ')):
+        sec_total = 0.0
+        for bucket, status, fill in (('executed', '✅ منفذة', done_fill), ('in_flight', '⏳ قيد التنفيذ', wait_fill)):
             for row in g.get(bucket) or []:
                 n += 1
-                kind = str(row.get('type') or '')
-                if row.get('is_payment'):
-                    kind = f'{kind} (سداد)'
-                _table_row([n, float(row.get('value') or 0), kind,
-                            row.get('account_number') or '—',
-                            _short_time(row.get('time')), status])
+                amount = float(row.get('value') or 0)
+                if not row.get('is_payment'):
+                    sec_total += amount
+                _table_row([n, _short_time(row.get('time')), str(row.get('type') or ''),
+                            row.get('account_number') or '—', amount, status, _note_for(row)], fill=fill)
         for row in g.get('pending_transactions') or []:
             n += 1
-            _table_row([n, float(row.get('value') or 0), str(row.get('type') or ''),
-                        row.get('account_number') or '—',
-                        _short_time(row.get('time')), '🕓 قيد المراجعة'])
+            _table_row([n, _short_time(row.get('time')), str(row.get('type') or ''),
+                        row.get('account_number') or '—', float(row.get('value') or 0),
+                        '🕓 قيد المراجعة', _note_for(row)], fill=review_fill)
         for row in g.get('pending_payments') or []:
             n += 1
-            _table_row([n, float(row.get('value') or 0), str(row.get('type') or ''),
-                        '—', _short_time(row.get('time')), '🕓 سداد قيد المراجعة'])
+            _table_row([n, _short_time(row.get('time')), str(row.get('type') or ''),
+                        '—', float(row.get('value') or 0), '🕓 سداد قيد المراجعة', _note_for(row)], fill=review_fill)
+        for row in g.get('cancelled') or []:
+            n += 1
+            _table_row([n, _short_time(row.get('time')), str(row.get('type') or ''),
+                        row.get('account_number') or '—', float(row.get('value') or 0),
+                        '❌ ملغاة (غير محسوبة)', _note_for(row)], fill=review_fill)
+        _subtotal_row(f'إجمالي تحويلات {label}', sec_total, subtotal_fill)
         ws.append([])
 
-    def _total_row(label, value):
-        ws.append([label, value])
-        r = ws.max_row
-        ws.cell(row=r, column=1).font = bold
-        cell = ws.cell(row=r, column=2)
-        cell.font = bold
-        if isinstance(value, (int, float)):
-            cell.number_format = '#,##0'
+    if not populated:
+        _merged_line('لا توجد عمليات مسجلة في هذا اليوم', font=sub_font)
+        ws.append([])
 
-    _total_row('💸 إجمالي التحويلات', float(total_debit or 0))
+    # ── day totals ──
+    _subtotal_row('💸 إجمالي التحويلات اليوم (كل الأرقام)', float(total_debit or 0), total_fill)
     if total_credit:
-        _total_row('💵 إجمالي السداد', float(total_credit or 0))
-    _total_row('🏦 الرصيد الحالي', _balance_phrase(current_balance))
+        _subtotal_row('💵 إجمالي السداد اليوم', float(total_credit or 0), total_fill)
+    ws.append(['🏦 الرصيد الحالي', None, None, None, _balance_phrase(current_balance)])
+    r = ws.max_row
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=AMOUNT_COL - 1)
+    ws.merge_cells(start_row=r, start_column=AMOUNT_COL, end_row=r, end_column=ncols)
+    for c in range(1, ncols + 1):
+        cell = ws.cell(row=r, column=c)
+        cell.fill = total_fill
+        cell.border = box
+        cell.font = bold
+        cell.alignment = center
 
-    for col, width in zip('ABCDEF', (6, 14, 14, 18, 10, 20)):
-        ws.column_dimensions[col].width = width
+    for idx, width in enumerate((5, 9, 14, 17, 13, 20, 30), start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+    ws.freeze_panes = 'A5'
+    ws.page_setup.orientation = 'landscape'
+    ws.page_setup.fitToWidth = 1
+    ws.print_options.horizontalCentered = True
 
     buf = BytesIO()
     wb.save(buf)
@@ -564,6 +660,23 @@ def _statement_caption(customer_name, report_date_iso, total_debit, total_credit
         lines.append(f'💵 إجمالي السداد: {_fmt_int(total_credit)} جنيه')
     lines.append(f'🏦 الرصيد الحالي: {_balance_phrase(current_balance)}')
     return '\n'.join(lines)
+
+
+def statement_display_name(report_date_iso: str) -> str:
+    return f'كشف حساب {_date_display(report_date_iso)}.xlsx'
+
+
+def store_statement_xlsx(customer_pk, xlsx: bytes, report_date_iso: str) -> Tuple[Optional[str], str]:
+    """Store the file as an Attachment in media storage and return (public URL, display name).
+    Meta fetches documents by public URL (chat documents and template headers alike)."""
+    from django.core.files.base import ContentFile
+    from modules.base.models.attachment import Attachment
+    from modules.chat.utils.file_utils import get_media_url_for_attachment
+
+    stored_name = f'qurtoba_statement_{customer_pk}_{report_date_iso}_{int(time.time())}.xlsx'
+    attachment = Attachment(name=stored_name, mime_type=_XLSX_MIME, type='document', size=len(xlsx))
+    attachment.file.save(stored_name, ContentFile(xlsx), save=True)
+    return get_media_url_for_attachment(attachment), statement_display_name(report_date_iso)
 
 
 def _send_statement_document(conversation, customer_pk, xlsx: bytes,
@@ -580,14 +693,10 @@ def _send_statement_document(conversation, customer_pk, xlsx: bytes,
     from qurtoba.ai_guard import system_send
     from qurtoba.extensions import _get_system_partner
 
-    stored_name = f'qurtoba_statement_{customer_pk}_{report_date_iso}_{int(time.time())}.xlsx'
-    attachment = Attachment(name=stored_name, mime_type=_XLSX_MIME, type='document', size=len(xlsx))
-    attachment.file.save(stored_name, ContentFile(xlsx), save=True)
-    url = get_media_url_for_attachment(attachment)
+    url, display_name = store_statement_xlsx(customer_pk, xlsx, report_date_iso)
     if not url:
         return False, 'no public media URL for the statement file'
 
-    display_name = f'كشف حساب {_date_display(report_date_iso)}.xlsx'
     with system_send():
         result = OmnichannelSendService().send_and_broadcast(
             partner=conversation.social_partner,
@@ -604,79 +713,19 @@ def _send_statement_document(conversation, customer_pk, xlsx: bytes,
     return True, None
 
 
-# ── tool ────────────────────────────────────────────────────────────────────
+def collect_customer_day(customer, partner, target_date) -> Dict[str, Any]:
+    """Everything that happened on the CUSTOMER's account on `target_date`, from every
+    number and from the office (partner=NULL), grouped per originating phone.
 
-@tool(
-    name='qurtoba_get_customer_daily_transactions',
-    display_name='Send Customer Qurtoba Daily Statement',
-    description=(
-        'Daily statement (كشف حساب اليوم / تقرير / حركات اليوم). '
-        '⚠️ THIS TOOL POSTS THE STATEMENT ITSELF — one message per phone number. On success '
-        'output ZERO characters, exactly like the balance tool; do NOT retype or summarise it. '
-        'INPUTS: report_date optional (ISO YYYY-MM-DD; omit=today). '
-        'send_report optional (OMIT to send; default true). '
-        '🔴 Set send_report=FALSE for a FILTERED/subset ask («اللي متمتش»/«كام اتنفذ»/«تحويلاتي '
-        'انا»/"which are still pending"): nothing is posted, you read transactions[] '
-        '(`bucket` = "executed"/"in_flight"; `is_self` = sent from THIS number; `partner_phone` = '
-        'which number sent it), filter to ALL matching items and write your own short reply. '
-        'A customer can have SEVERAL numbers, so the statement is sectioned per phone (the asking '
-        'one marked «رقمك») plus a «بواسطة قرطبة» section for what the accountant entered. '
-        'Amounts of zero or less are withheld from the customer (see hidden_nonpositive_count).'
-    ),
-    category='qurtoba',
-    requires_auth=True,
-    side_effect=True,
-    rate_limit=20,
-)
-def qurtoba_get_customer_daily_transactions(
-    context,
-    report_date: Optional[str] = None,
-    send_report: Optional[bool] = None,
-) -> Dict[str, Any]:
-    # Typed Optional and defaulted here rather than `= True`: the LangChain
-    # adapter turns every non-required field into Optional[T] with default None
-    # and passes it explicitly, so a plain `True` default would be overwritten
-    # by None on every call the model makes without the argument — silently
-    # turning sending off. Omitted means SEND.
-    should_send = True if send_report is None else bool(send_report)
-
-    conv = getattr(context, 'conversation', None)
-    partner = getattr(context, 'partner', None)
-    if partner is None and conv is not None:
-        partner = getattr(conv, 'social_partner', None)
-
-    if partner is None:
-        return {
-            'success': False,
-            'error': 'No active conversation/partner in context.',
-            'error_type': 'no_conversation',
-        }
-
-    customer = getattr(partner, 'qurtoba_customer', None)
-    if customer is None:
-        return {
-            'success': False,
-            'error': 'The current chat partner is not linked to any Qurtoba customer.',
-            'error_type': 'partner_not_linked',
-        }
-
-    parsed_date = _parse_iso_date(report_date)
-    if report_date and parsed_date is None:
-        return {
-            'success': False,
-            'error': f"Invalid report_date '{report_date}'. Expected ISO format YYYY-MM-DD.",
-            'error_type': 'invalid_date',
-        }
-
-    from django.utils import timezone
-    target_date = parsed_date or timezone.localdate()
-
+    Shared by the on-demand statement tool and the end-of-day reminder so both show the
+    same rows, the same buckets and the same totals. `partner` is the phone the statement
+    is for (its section leads and is marked «رقمك»); it may be None.
+    """
     from qurtoba.models import (
         QurtobaRecord,
         QurtobaPendingTransaction,
         QurtobaPendingPayment,
     )
-
     # The asking phone. Its section leads the report and is marked «رقمك».
     self_partner_id = getattr(partner, 'pk', None)
     self_phone = _normalize_phone(getattr(partner, 'phone', None))
@@ -731,6 +780,19 @@ def qurtoba_get_customer_daily_transactions(
         # statement AND from the totals so the printed lines add up to the
         # printed total; the count is reported so the omission is auditable.
         if amount <= 0:
+            original = float(getattr(r, 'cash_sys_original_value', None) or 0)
+            if getattr(r, 'cash_sys_state', None) == 'canceled' and original > 0:
+                # a transfer the customer asked for that Cash-SYS reversed: listed as «ملغاة»
+                # so the day reads complete, excluded from every total
+                g = _group_for(r.partner, r.partner_id)
+                g['cancelled'].append({
+                    'record_id': r.pk, 'type': r.type, 'value': original,
+                    'account_number': r.account_number,
+                    'time': r.time.strftime('%H:%M:%S') if r.time else None,
+                    'reason': getattr(r, 'cash_sys_canceled_reason', None) or '',
+                    'partner_id': r.partner_id, 'partner_phone': g['phone'], 'is_self': g['is_self'],
+                })
+                continue
             hidden_nonpositive += 1
             continue
 
@@ -832,6 +894,88 @@ def qurtoba_get_customer_daily_transactions(
 
     ordered_groups = _sort_groups(groups)
 
+    return {
+        'self_partner_id': self_partner_id, 'self_phone': self_phone, 'groups': ordered_groups,
+        'total_debit': total_debit, 'total_credit': total_credit, 'transactions': transactions,
+        'pending_transactions': pending_transactions, 'pending_payments': pending_payments,
+        'hidden_nonpositive': hidden_nonpositive,
+    }
+
+
+# ── tool ────────────────────────────────────────────────────────────────────
+
+@tool(
+    name='qurtoba_get_customer_daily_transactions',
+    display_name='Send Customer Qurtoba Daily Statement',
+    description=(
+        'Daily statement (كشف حساب اليوم / تقرير / حركات اليوم). '
+        '⚠️ THIS TOOL POSTS THE STATEMENT ITSELF — one message per phone number. On success '
+        'output ZERO characters, exactly like the balance tool; do NOT retype or summarise it. '
+        'INPUTS: report_date optional (ISO YYYY-MM-DD; omit=today). '
+        'send_report optional (OMIT to send; default true). '
+        '🔴 Set send_report=FALSE for a FILTERED/subset ask («اللي متمتش»/«كام اتنفذ»/«تحويلاتي '
+        'انا»/"which are still pending"): nothing is posted, you read transactions[] '
+        '(`bucket` = "executed"/"in_flight"; `is_self` = sent from THIS number; `partner_phone` = '
+        'which number sent it), filter to ALL matching items and write your own short reply. '
+        'A customer can have SEVERAL numbers, so the statement is sectioned per phone (the asking '
+        'one marked «رقمك») plus a «بواسطة قرطبة» section for what the accountant entered. '
+        'Amounts of zero or less are withheld from the customer (see hidden_nonpositive_count).'
+    ),
+    category='qurtoba',
+    requires_auth=True,
+    side_effect=True,
+    rate_limit=20,
+)
+def qurtoba_get_customer_daily_transactions(
+    context,
+    report_date: Optional[str] = None,
+    send_report: Optional[bool] = None,
+) -> Dict[str, Any]:
+    # Typed Optional and defaulted here rather than `= True`: the LangChain
+    # adapter turns every non-required field into Optional[T] with default None
+    # and passes it explicitly, so a plain `True` default would be overwritten
+    # by None on every call the model makes without the argument — silently
+    # turning sending off. Omitted means SEND.
+    should_send = True if send_report is None else bool(send_report)
+
+    conv = getattr(context, 'conversation', None)
+    partner = getattr(context, 'partner', None)
+    if partner is None and conv is not None:
+        partner = getattr(conv, 'social_partner', None)
+
+    if partner is None:
+        return {
+            'success': False,
+            'error': 'No active conversation/partner in context.',
+            'error_type': 'no_conversation',
+        }
+
+    customer = getattr(partner, 'qurtoba_customer', None)
+    if customer is None:
+        return {
+            'success': False,
+            'error': 'The current chat partner is not linked to any Qurtoba customer.',
+            'error_type': 'partner_not_linked',
+        }
+
+    parsed_date = _parse_iso_date(report_date)
+    if report_date and parsed_date is None:
+        return {
+            'success': False,
+            'error': f"Invalid report_date '{report_date}'. Expected ISO format YYYY-MM-DD.",
+            'error_type': 'invalid_date',
+        }
+
+    from django.utils import timezone
+    target_date = parsed_date or timezone.localdate()
+
+
+    day_data = collect_customer_day(customer, partner, target_date)
+    self_partner_id, self_phone = day_data['self_partner_id'], day_data['self_phone']
+    ordered_groups, transactions = day_data['groups'], day_data['transactions']
+    total_debit, total_credit = day_data['total_debit'], day_data['total_credit']
+    pending_transactions, pending_payments = day_data['pending_transactions'], day_data['pending_payments']
+    hidden_nonpositive = day_data['hidden_nonpositive']
     customer.refresh_from_db(fields=['balance'])
     grade_limit = (customer.grade or 0) * 1000
 

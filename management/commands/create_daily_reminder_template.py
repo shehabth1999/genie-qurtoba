@@ -16,6 +16,7 @@ from django.core.management.base import BaseCommand, CommandError
 
 
 TEMPLATE_NAME = 'qurtoba_daily_summary'
+STATEMENT_TEMPLATE_NAME = 'qurtoba_daily_statement_xlsx'   # same body, the day's Excel statement as the header
 DEFAULT_ACCOUNT_PHONE = '201006003836'  # محاسب قرطبة
 
 HEADER = 'كشف نهاية اليوم'
@@ -90,6 +91,11 @@ class Command(BaseCommand):
                                  'a wording or variable change needs a NEW name.')
         parser.add_argument('--submit', action='store_true',
                             help='Also submit it to Meta for approval instead of leaving a draft.')
+        parser.add_argument('--document', action='store_true',
+                            help=f'Build the DOCUMENT-header variant ({STATEMENT_TEMPLATE_NAME}) as a SECOND template: '
+                                 'the same body, with the day\'s full Excel statement attached as the header. A sample '
+                                 'statement is generated and stored as the header sample Meta reviews. The text '
+                                 'template is left untouched.')
 
     def handle(self, *args, **opts):
         from django.contrib.contenttypes.models import ContentType
@@ -119,6 +125,8 @@ class Command(BaseCommand):
             return
 
         name = opts['name']
+        if opts['document'] and name == TEMPLATE_NAME:
+            name = STATEMENT_TEMPLATE_NAME
         template = WhatsAppTemplate.objects.filter(
             whatsapp_account=account, name=name, language=language,
         ).first()
@@ -131,8 +139,13 @@ class Command(BaseCommand):
         template.template_name = name
         template.category = 'utility'
         template.status = 'draft'
-        template.header_format = 'TEXT'
-        template.header_content = HEADER
+        if opts['document']:
+            template.header_format = 'DOCUMENT'
+            template.header_content = None
+            template.header_media = self._sample_statement_attachment()
+        else:
+            template.header_format = 'TEXT'
+            template.header_content = HEADER
         template.body_text = body
         template.footer_text = FOOTER
         template.content_type = partner_ct   # "apply to" — resolves {{vars}} off Partner
@@ -179,6 +192,30 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f'Submitted to Meta. template_id={template.template_id} status={template.status}. '
             'It sends only once Meta marks it APPROVED.'))
+
+    def _sample_statement_attachment(self):
+        """A real statement file (the customer with the most recent activity, that day) stored
+        as the template's header sample — Meta reviews the header with it."""
+        from django.core.files.base import ContentFile
+        from django.utils import timezone
+        from modules.base.models.attachment import Attachment
+        from qurtoba.models import QurtobaRecord
+        from qurtoba.tools.reports import _XLSX_MIME, _build_statement_xlsx, collect_customer_day
+
+        rec = QurtobaRecord.objects.filter(value__gt=0).select_related('customer').order_by('-date', '-id').first()
+        if rec is None:
+            raise CommandError('No Qurtoba record exists — cannot build a sample statement.')
+        customer, day = rec.customer, rec.date
+        data = collect_customer_day(customer, None, day)
+        xlsx = _build_statement_xlsx(customer_name=customer.name, report_date_iso=day.isoformat(),
+                                     groups=data['groups'], total_debit=data['total_debit'],
+                                     total_credit=data['total_credit'], current_balance=customer.balance or 0,
+                                     generated_at=timezone.localtime().strftime('%Y-%m-%d %H:%M'))
+        name = f'qurtoba_statement_sample_{day.isoformat()}.xlsx'
+        att = Attachment(name=name, mime_type=_XLSX_MIME, type='document', size=len(xlsx))
+        att.file.save(name, ContentFile(xlsx), save=True)
+        self.stdout.write(f'  header   : DOCUMENT sample {name} ({len(xlsx)} bytes, customer {customer.pk}, day {day})')
+        return att
 
     def _preview(self, body):
         """Render the body against a real linked partner so the wording can be judged."""

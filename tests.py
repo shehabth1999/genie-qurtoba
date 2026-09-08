@@ -635,3 +635,46 @@ class QuotedNoticeRerouteTests(SimpleTestCase):
         order = NS(content={'text': '01098765432\n22 ألف و 610'}, direction='inbound', qurtoba_record=None)
         notice = NS(content={'text': 'تم الغاء التحويل\n\nو لم يتم تسجيل العمليه عليك'}, direction='outbound', reply_to=order)
         self.assertEqual(_notice_amount(notice, NS(qurtoba_customer=None)), 22610.0)
+
+
+class DailyStatementXlsxTests(SimpleTestCase):
+    """The end-of-day Excel: every number on the account, the office section, cancelled rows
+    listed but never counted, notes without internal ids."""
+
+    def _groups(self):
+        row = lambda t, acc, v, **k: {'type': t, 'account_number': acc, 'value': v, 'time': '10:00:00', **k}
+        return [
+            {'partner_id': 7, 'phone': '01061265618', 'label': '01061265618', 'is_self': False,
+             'executed': [row('كاش(20)', '01011637469', 30000), row('مصاريف خدمه', None, 30, notes='[auto] مصاريف خدمة لعملية #37144')],
+             'in_flight': [row('كاش', '01098765432', 500)], 'pending_transactions': [], 'pending_payments': [],
+             'cancelled': [row('كاش(20)', '01017527079', 22610, reason='no_wallet')],
+             'totals': {'debit': 30530.0, 'credit': 0.0}, '_order': 0},
+            {'partner_id': None, 'phone': None, 'label': 'بواسطة قرطبة', 'is_self': False,
+             'executed': [row('فورى', '6081844', 900)], 'in_flight': [], 'pending_transactions': [], 'pending_payments': [],
+             'cancelled': [], 'totals': {'debit': 900.0, 'credit': 0.0}, '_order': 1},
+        ]
+
+    def test_sheet_lists_every_section_and_never_counts_a_cancelled_row(self):
+        from io import BytesIO
+        from openpyxl import load_workbook
+        from qurtoba.tools.reports import _build_statement_xlsx
+        x = _build_statement_xlsx('حسين', '2026-09-08', self._groups(), 31430.0, 0.0, 213666.0, generated_at='2026-09-08 23:59')
+        ws = load_workbook(BytesIO(x)).active
+        cells = [str(v) for r in ws.iter_rows(values_only=True) for v in r if v is not None]
+        text = ' | '.join(cells)
+        self.assertIn('الثلاثاء 8 سبتمبر', text)
+        self.assertIn('📱 01061265618', text)
+        self.assertIn('🏢 بواسطة قرطبة', text)
+        self.assertIn('❌ ملغاة (غير محسوبة)', text)
+        self.assertIn('الرقم مش عليه محفظة', text)
+        self.assertIn('مصاريف خدمة', text)
+        self.assertNotIn('[auto]', text)
+        self.assertNotIn('#37144', text)
+        # the section subtotal counts executed + in-flight (30000 + 30 + 500), not the cancelled 22,610
+        self.assertIn('إجمالي تحويلات 01061265618 | 30530', text)
+        self.assertIn('عليك 213,666 جنيه', text)
+
+    def test_empty_day_still_renders(self):
+        from qurtoba.tools.reports import _build_statement_xlsx
+        x = _build_statement_xlsx('x', '2026-09-08', [], 0.0, 0.0, 0.0)
+        self.assertGreater(len(x), 1000)

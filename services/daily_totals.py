@@ -158,3 +158,32 @@ def fmt_amount(value) -> str:
         return f'{int(round(float(value))):,}'
     except (TypeError, ValueError):
         return '0'
+
+
+def partners_for_day_statement(day: Optional[datetime.date] = None):
+    """Who gets the end-of-day STATEMENT (the Excel one): everyone in
+    partners_active_on(day), plus every linked number that has talked to us before
+    (has a WhatsApp conversation) whose CUSTOMER had any record that day from another
+    number or from the office — the file shows the whole account, so a customer whose
+    day happened on their other number or inside Qurtoba still gets it (2026-09-08)."""
+    from modules.base.models import Partner
+    from modules.chat.models import Conversation
+    from qurtoba.models import QurtobaRecord
+
+    if day is None:
+        day = reporting_day()
+    active = set(partners_active_on(day))
+    customers = set(
+        QurtobaRecord.objects.filter(date=day).order_by().values_list('customer_id', flat=True).distinct()
+    )
+    if not customers:
+        return sorted(active)
+    with_chat = set(
+        Conversation.objects.filter(type='whatsapp', social_partner__qurtoba_customer_id__in=customers)
+        .order_by().values_list('social_partner_id', flat=True).distinct()
+    )
+    linked = set(
+        Partner.objects.filter(id__in=with_chat, qurtoba_customer_id__in=customers)
+        .values_list('id', flat=True)
+    )
+    return sorted(pid for pid in (active | linked) if pid)
