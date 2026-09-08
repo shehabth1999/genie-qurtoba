@@ -194,27 +194,29 @@ class Command(BaseCommand):
             'It sends only once Meta marks it APPROVED.'))
 
     def _sample_statement_attachment(self):
-        """A real statement file (the customer with the most recent activity, that day) stored
-        as the template's header sample — Meta reviews the header with it."""
+        """A real statement (the customer with the most recent activity, that day) rendered as a
+        PDF and stored as the template's header sample — Meta reviews the header with it."""
         from django.core.files.base import ContentFile
         from django.utils import timezone
         from modules.base.models.attachment import Attachment
         from qurtoba.models import QurtobaRecord
-        from qurtoba.tools.reports import _XLSX_MIME, _build_statement_xlsx, collect_customer_day
+        from qurtoba.tools.reports import _build_statement_pdf, collect_customer_day
 
         rec = QurtobaRecord.objects.filter(value__gt=0).select_related('customer').order_by('-date', '-id').first()
         if rec is None:
             raise CommandError('No Qurtoba record exists — cannot build a sample statement.')
         customer, day = rec.customer, rec.date
         data = collect_customer_day(customer, None, day)
-        xlsx = _build_statement_xlsx(customer_name=customer.name, report_date_iso=day.isoformat(),
-                                     groups=data['groups'], total_debit=data['total_debit'],
-                                     total_credit=data['total_credit'], current_balance=customer.balance or 0,
-                                     generated_at=timezone.localtime().strftime('%Y-%m-%d %H:%M'))
-        name = f'qurtoba_statement_sample_{day.isoformat()}.xlsx'
-        att = Attachment(name=name, mime_type=_XLSX_MIME, type='document', size=len(xlsx))
-        att.file.save(name, ContentFile(xlsx), save=True)
-        self.stdout.write(f'  header   : DOCUMENT sample {name} ({len(xlsx)} bytes, customer {customer.pk}, day {day})')
+        # Meta reviews a DOCUMENT header with a PDF sample only («The type of file is not
+        # supported» #2388084 for .xlsx); the nightly sends still attach the Excel.
+        pdf = _build_statement_pdf(customer_name=customer.name, report_date_iso=day.isoformat(),
+                                   groups=data['groups'], total_debit=data['total_debit'],
+                                   total_credit=data['total_credit'], current_balance=customer.balance or 0,
+                                   generated_at=timezone.localtime().strftime('%Y-%m-%d %H:%M'))
+        name = f'qurtoba_statement_sample_{day.isoformat()}.pdf'
+        att = Attachment(name=name, mime_type='application/pdf', type='document', size=len(pdf))
+        att.file.save(name, ContentFile(pdf), save=True)
+        self.stdout.write(f'  header   : DOCUMENT sample {name} ({len(pdf)} bytes, customer {customer.pk}, day {day})')
         return att
 
     def _preview(self, body):

@@ -653,6 +653,67 @@ def _build_statement_xlsx(
     return buf.getvalue()
 
 
+def _build_statement_pdf(customer_name: str, report_date_iso: str, groups: List[dict],
+                         total_debit: float, total_credit: float, current_balance: float,
+                         *, generated_at: Optional[str] = None) -> bytes:
+    """The same statement as a PDF (weasyprint). Meta accepts only a PDF as the header
+    SAMPLE of a DOCUMENT template; the nightly sends carry the Excel."""
+    import html as _h
+    from weasyprint import HTML
+
+    def esc(x):
+        return _h.escape(str(x if x is not None else ''))
+
+    rows_html = []
+    populated = [g for g in groups if _group_has_rows(g) or g.get('cancelled')]
+    for g in populated:
+        label = g.get('label') or g.get('phone') or ''
+        heading = ('🏢 ' if g.get('partner_id') is None else '📱 ') + label
+        rows_html.append(f'<tr class="sec"><td colspan="7">{esc(heading)}</td></tr>')
+        rows_html.append('<tr class="head"><th>#</th><th>الوقت</th><th>النوع</th><th>الرقم</th><th>المبلغ</th><th>الحالة</th><th>ملاحظات</th></tr>')
+        n = 0
+        sec_total = 0.0
+        buckets = [('executed', '✅ منفذة'), ('in_flight', '⏳ قيد التنفيذ'), ('pending_transactions', '🕓 قيد المراجعة'),
+                   ('pending_payments', '🕓 سداد قيد المراجعة'), ('cancelled', '❌ ملغاة (غير محسوبة)')]
+        for bucket, status in buckets:
+            for row in g.get(bucket) or []:
+                n += 1
+                amount = float(row.get('value') or 0)
+                if bucket in ('executed', 'in_flight') and not row.get('is_payment'):
+                    sec_total += amount
+                note = _clean_note(row.get('notes'))
+                if row.get('reason'):
+                    r = str(row['reason'])
+                    note = (note + ' — ' if note else '') + _CANCEL_REASON_AR.get(r, r)
+                rows_html.append(
+                    f'<tr><td>{n}</td><td>{esc(_short_time(row.get("time")))}</td><td>{esc(row.get("type"))}</td>'
+                    f'<td>{esc(row.get("account_number") or "—")}</td><td>{amount:,.0f}</td><td>{esc(status)}</td><td>{esc(note)}</td></tr>')
+        rows_html.append(f'<tr class="sub"><td colspan="4">إجمالي تحويلات {esc(label)}</td><td colspan="3">{sec_total:,.0f}</td></tr>')
+    if not populated:
+        rows_html.append('<tr><td colspan="7">لا توجد عمليات مسجلة في هذا اليوم</td></tr>')
+    credit_html = f'<tr class="tot"><td colspan="4">💵 إجمالي السداد اليوم</td><td colspan="3">{float(total_credit or 0):,.0f}</td></tr>' if total_credit else ''
+    doc = f"""<html dir="rtl" lang="ar"><head><meta charset="utf-8"><style>
+      @page {{ size: A4 landscape; margin: 14mm; }}
+      body {{ font-family: 'DejaVu Sans', sans-serif; font-size: 11px; color: #222; }}
+      h1 {{ font-size: 18px; color: #1F3864; margin: 0 0 4px 0; }}
+      .meta {{ color: #595959; margin-bottom: 10px; }}
+      table {{ border-collapse: collapse; width: 100%; }}
+      td, th {{ border: 1px solid #BFBFBF; padding: 4px 6px; text-align: center; }}
+      tr.sec td {{ background: #D9E1F2; font-weight: bold; text-align: right; }}
+      tr.head th {{ background: #1F3864; color: #fff; }}
+      tr.sub td {{ background: #F2F2F2; font-weight: bold; }}
+      tr.tot td {{ background: #FFF2CC; font-weight: bold; }}
+    </style></head><body>
+      <h1>كشف حساب يوم {esc(_date_display_ar(report_date_iso))}</h1>
+      <div class="meta"><b>العميل:</b> {esc(customer_name)} &nbsp;•&nbsp; يشمل كل عمليات اليوم من جميع أرقامك وما سجّله مكتب قرطبة{(' &nbsp;•&nbsp; صدر في ' + esc(generated_at)) if generated_at else ''}</div>
+      <table>{''.join(rows_html)}
+        <tr class="tot"><td colspan="4">💸 إجمالي التحويلات اليوم (كل الأرقام)</td><td colspan="3">{float(total_debit or 0):,.0f}</td></tr>
+        {credit_html}
+        <tr class="tot"><td colspan="4">🏦 الرصيد الحالي</td><td colspan="3">{esc(_balance_phrase(current_balance))}</td></tr>
+      </table></body></html>"""
+    return HTML(string=doc).write_pdf()
+
+
 def _statement_caption(customer_name, report_date_iso, total_debit, total_credit, current_balance) -> str:
     lines = [f'كشف حساب {_date_display(report_date_iso)} — {customer_name}',
              f'💸 إجمالي التحويلات: {_fmt_int(total_debit)} جنيه']
