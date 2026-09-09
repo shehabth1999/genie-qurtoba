@@ -27,6 +27,7 @@ class QurtobaConfig(AppConfig):
         self._apply_business_settings()
         self._install_tool_db_hygiene()
         self._install_ai_guard()
+        self._install_delete_guard()
         self._takeover_celery_config()
 
         # Kick off a catalog pull on first startup so the tables are never empty.
@@ -54,6 +55,14 @@ class QurtobaConfig(AppConfig):
             dj_settings.AI_SAME_TIME_WINDOW_SEC = 12
         except Exception:
             logger.exception('qurtoba: could not apply AI_HIGH_VALUE_CONFIRM_THRESHOLD')
+
+    @staticmethod
+    def _install_delete_guard():
+        try:
+            from qurtoba import safety
+            safety.install()
+        except Exception:
+            logger.exception('qurtoba: delete guard NOT installed')
 
     @staticmethod
     def _install_tool_db_hygiene():

@@ -1749,16 +1749,13 @@ def _reminder_sender_partner(template):
     interactive user behind a beat job, so fall back through the account's own
     partner, then any staff partner.
     """
-    from modules.base.models import Partner
+    from qurtoba.extensions import system_sender
 
     account = template.whatsapp_account
-    for candidate in (
-        getattr(account, 'partner', None),
-        getattr(template, 'created_by', None) and getattr(template.created_by, 'partner', None),
-    ):
-        if candidate is not None:
-            return candidate
-    return Partner.objects.filter(user__isnull=False).order_by('pk').first()
+    candidate = getattr(account, 'partner', None)
+    if candidate is not None and getattr(candidate, 'active', True):
+        return candidate
+    return system_sender()
 
 
 # ───────────────── Stranded-conversation recovery (extension-owned) ─────────

@@ -22,35 +22,48 @@ def _get_conv_and_customer(queryset):
     return conv, customer
 
 
+def system_sender():
+    """The Partner every automatic message is sent AS — resolved by role, never by id or email.
+
+    Order: the platform's AI/system partner (``ai_agent=True``, preferring ``system_user=True``),
+    then any active staff partner (one that has a login). Nothing here can be a customer.
+    2026-09-09: the admin account the automation used to send as was deleted; the sender
+    must never again be one person's account.
+    """
+    from modules.base.models.partner import Partner
+    ai = (Partner.all_objects.filter(ai_agent=True, active=True)
+          .order_by('-system_user', 'pk').first())
+    if ai is not None:
+        return ai
+    return Partner.objects.filter(user__isnull=False, active=True).order_by('pk').first()
+
+
 def _get_system_partner(conversation):
     """
-    Return the internal agent/staff Partner to use as sender.
-    Priority: active internal member → conversation creator → any staff partner.
-    Uses ChatBridgeService pattern: system_partner = the agent/staff.
+    Return the internal Partner to use as sender on `conversation`.
+    Priority: the AI/system partner → an internal member of the conversation (a staff
+    partner with a login) → any staff partner. Never the customer, never the creator.
     """
     from modules.chat.models import ConversationMember
     from modules.base.models.partner import Partner
 
-    # 1. Try an active internal member (has a user, not the external social_partner)
-    member = (
+    sender = system_sender()
+    if sender is not None and getattr(sender, 'ai_agent', False):
+        return sender
+
+    # ConversationMember.user is a Partner; an internal member is one with a login
+    social_id = getattr(conversation, 'social_partner_id', None)
+    member_ids = list(
         ConversationMember.objects
-        .filter(conversation=conversation, active=True)
-        .exclude(user=None)
-        .select_related('user')
-        .first()
+        .filter(conversation=conversation, active=True, user__isnull=False)
+        .exclude(user_id=social_id)
+        .values_list('user_id', flat=True)
     )
-    if member and member.user_id:
-        # User.partner is a reverse relation: User → Partner FK
-        partner = Partner.objects.filter(user__id=member.user_id).first()
-        if partner:
-            return partner
-
-    # 2. Fall back to the conversation creator (always a Partner from BaseModel)
-    if conversation.created_by_id:
-        return conversation.created_by
-
-    # 3. Last resort: any active non-system partner
-    return Partner.objects.filter(system_user=False, active=True).first()
+    if member_ids:
+        staff = Partner.objects.filter(pk__in=member_ids, user__isnull=False, active=True).order_by('pk').first()
+        if staff is not None:
+            return staff
+    return sender
 
 
 def check_balance_and_send(conversation, customer):

@@ -254,8 +254,10 @@ def get_sandbox():
     from qurtoba.models import QurtobaCustomer
 
     account = WhatsAppAccount.objects.get(pk=WHATSAPP_ACCOUNT_ID)
-    ai_partner = Partner.all_objects.filter(ai_agent=True, email='genie@genie-erp.com').first()
-    admin_partner = Partner.all_objects.filter(pk=2).first() or Partner.objects.filter(user__isnull=False).order_by('pk').first()
+    from qurtoba.extensions import system_sender
+    ai_partner = system_sender()
+    admin_partner = (Partner.objects.filter(user__isnull=False, user__is_superuser=True, active=True).order_by('pk').first()
+                     or Partner.objects.filter(user__isnull=False, active=True).order_by('pk').first())
 
     customer = QurtobaCustomer.objects.filter(name=SANDBOX_CUSTOMER_NAME).first()
     if customer is None:

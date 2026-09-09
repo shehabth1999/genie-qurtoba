@@ -35,8 +35,8 @@ def tool_context(conversation, partner):
 
 
 def _ai_partner():
-    from modules.base.models import Partner
-    return Partner.all_objects.filter(ai_agent=True, email='genie@genie-erp.com').first()
+    from qurtoba.extensions import system_sender
+    return system_sender()
 
 
 def _trace(conversation, tool_name: str, tool_input: Dict[str, Any], tool_output: Any) -> None:
