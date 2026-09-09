@@ -59,7 +59,8 @@ def pending_state(conversation) -> Dict[str, Any]:
         out['high_value'] = {'account_number': hv_phone, 'source_message_id': hv_src}
     rep = _list_repeat_pending(conversation) or {}
     if rep:
-        out['repeat'] = [{'account_number': v.get('account_number'), 'value': v.get('value'), 'type': v.get('type')}
+        out['repeat'] = [{'account_number': v.get('account_number'), 'value': v.get('value'), 'type': v.get('type'),
+                          'source_message_id': v.get('source_message_id')}
                          for v in rep.values() if isinstance(v, dict)]
     return out
 
@@ -84,13 +85,23 @@ def describe(conversation) -> List[str]:
 
 
 def answer_pending(conversation, partner, decision: str, answer_message_id: Optional[str] = None) -> Dict[str, Any]:
-    """Apply a yes/no to whatever is held (priority: correction, list, high value, repeat)."""
+    """Apply a yes/no to whatever is held (priority: correction, list, high value, repeat).
+
+    ``answer_message_id`` defaults to the customer's newest message — the one they
+    just cancelled or confirmed with. The model calls this tool without an id, and a
+    «no» on a held repeat used to drop the transfer in SILENCE because the decline line
+    was guarded by that id (2026-09-08: «الغاء» twice, then «لغيت ؟», answered by
+    nothing at all). Whatever we drop, the customer is told.
+    """
     from qurtoba.tools.transactions import (_clear_repeat_pending, qurtoba_confirm_pending_repeats,
                                              qurtoba_create_new_transactions_bulk)
     from qurtoba.tools.planning import _classify_message
     key = _conv_key(conversation)
     st = pending_state(conversation)
     yes = decision == 'yes'
+    if not answer_message_id:
+        _newest = _newest_inbound(conversation)
+        answer_message_id = str(_newest.id) if _newest is not None else None
     result: Dict[str, Any] = {'success': True, 'handled': False, 'kind': 'none', 'created': [], 'note': ''}
 
     # The customer's newest message quoting one of THEIR OWN other messages is about that
@@ -169,9 +180,15 @@ def answer_pending(conversation, partner, decision: str, answer_message_id: Opti
                           note='repeated the held transfer(s)')
         else:
             _clear_repeat_pending(conversation)
-            if answer_message_id:
-                send_quoted(conversation, answer_message_id, R.REPEAT_DECLINED)
-            result.update(handled=True, note='the repeat was dropped')
+            # ALWAYS confirm a cancel: the customer's own message, else the number
+            # message the question was quoted on. Never drop a transfer silently.
+            target = answer_message_id or next(
+                (r.get('source_message_id') for r in st['repeat'] if isinstance(r, dict) and r.get('source_message_id')),
+                None)
+            told = send_quoted(conversation, target, R.REPEAT_DECLINED) if target else False
+            result.update(handled=True,
+                          note='the repeat was dropped; the customer was told' if told
+                               else 'the repeat was dropped (the confirmation line could not be sent — say it yourself)')
         log('pending_answer', conversation, kind='repeat', yes=yes)
         return result
 

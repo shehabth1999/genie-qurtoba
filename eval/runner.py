@@ -551,6 +551,10 @@ def score_turn(turn: Dict[str, Any], expect: Dict[str, Any],
         add('agent silent (no customer-visible agent text)', len(agent_texts) == 0, f'agent_texts={agent_texts} blocked={[b["blocked"] for b in blocked]}')
     elif reply == 'one_message':
         add('exactly one agent message', len(agent_texts) == 1, f'agent_texts={agent_texts}')
+    elif reply == 'at_least_one':
+        # a direct question must never be met with silence (2026-09-08: «لغيت ؟» got nothing)
+        add('the customer got an answer', len(agent_texts) + len(tool_texts) > 0,
+            f'agent_texts={agent_texts} tool_texts={tool_texts}')
     elif reply == 'question':
         add('exactly one agent message and it asks', len(agent_texts) == 1 and any(q in agent_texts[0] for q in ('؟', '?')), f'agent_texts={agent_texts}')
     for s in expect.get('contains', []):

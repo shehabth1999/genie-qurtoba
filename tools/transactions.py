@@ -543,6 +543,9 @@ def _validate_debt_item(
 # ---------------------------------------------------------------------------
 
 _REPEAT_PENDING_TTL = 3600  # seconds a pending repeat waits for the customer's «أيوة»
+# One «تحب أكررها؟» per held repeat: re-asking on every later turn also re-marked the
+# turn as answered and silenced the customer's own question (2026-09-08).
+_REPEAT_ASK_COOLDOWN = 30 * 60   # seconds
 
 
 def _repeat_pending_key(conversation) -> Optional[str]:
@@ -820,18 +823,29 @@ def _create_one_debt(
             # The agent NEVER asks this and NEVER self-confirms.
             _val = dup_today.value
             _val_int = int(_val) if float(_val).is_integer() else _val
+            # Ask ONCE. `repeat_asked` deliberately leaves the number message unconsumed so a
+            # later «أيوة» can settle it, which means every following turn re-plans the same
+            # message and used to re-ask the identical question — and each re-ask marked the
+            # turn as answered, so the customer's real question in between («لغيت ؟») was
+            # dropped by the gate as redundant (2026-09-08 22:00). One question per hold.
+            _sig = _repeat_signature(type, final_account, amount)
+            _held = (_list_repeat_pending(conversation) or {}).get(_sig) or {}
+            _asked_before = float(_held.get('asked_ts') or 0)
+            _ask_again = (_tz.now().timestamp() - _asked_before) > _REPEAT_ASK_COOLDOWN
             _store_repeat_pending(
                 conversation, type_=type, amount=amount, account=final_account,
                 source_message_id=src, consumed_ids=consumed_message_ids,
-                existing_record_id=dup_today.pk, asked_ts=_tz.now().timestamp(),
+                existing_record_id=dup_today.pk,
+                asked_ts=(_tz.now().timestamp() if _ask_again else _asked_before),
             )
-            _send_quoted_text(
-                conversation, social_partner, src,
-                f'عملية {dup_today.type} بمبلغ {_val_int} جنيه للرقم {final_account} '
-                f'اتنفذت النهارده بالفعل. تحب أكررها؟',
-            )
+            if _ask_again:
+                _send_quoted_text(
+                    conversation, social_partner, src,
+                    f'عملية {dup_today.type} بمبلغ {_val_int} جنيه للرقم {final_account} '
+                    f'اتنفذت النهارده بالفعل. تحب أكررها؟',
+                )
             return {
-                'success': True, 'repeat_asked': True,
+                'success': True, 'repeat_asked': True, 'already_asked': not _ask_again,
                 'existing_record_id': dup_today.pk, 'type': dup_today.type,
                 'value': dup_today.value, 'account_number': dup_today.account_number,
                 'created_at': dup_today.created_at.isoformat(),

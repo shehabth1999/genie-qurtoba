@@ -678,3 +678,52 @@ class DailyStatementXlsxTests(SimpleTestCase):
         from qurtoba.tools.reports import _build_statement_xlsx
         x = _build_statement_xlsx('x', '2026-09-08', [], 0.0, 0.0, 0.0)
         self.assertGreater(len(x), 1000)
+
+
+class CancelIsAlwaysConfirmedTests(SimpleTestCase):
+    """2026-09-08: «الغاء» dropped the held repeat in silence, then «لغيت ؟» got nothing either."""
+
+    def test_no_on_a_held_repeat_tells_the_customer(self):
+        from types import SimpleNamespace as NS
+        from unittest.mock import patch
+        from qurtoba.automation import pending as P
+        sent = []
+        held = {'repeat': [{'account_number': '01012345678', 'value': 23200.0, 'type': 'كاش',
+                            'source_message_id': 'num-msg'}]}
+        with patch.object(P, 'pending_state', return_value=held), \
+             patch.object(P, '_newest_inbound', return_value=NS(id='cancel-msg')), \
+             patch.object(P, 'send_quoted', side_effect=lambda c, m, t: sent.append((m, t)) or True), \
+             patch('qurtoba.tools.transactions._clear_repeat_pending'), \
+             patch.object(P, 'log'):
+            res = P.answer_pending(NS(id='c1'), NS(), 'no')
+        self.assertTrue(res['handled'])
+        self.assertEqual(res['kind'], 'repeat')
+        self.assertEqual(sent, [('cancel-msg', 'تمام، مش هتتكرر.')])
+        self.assertIn('the customer was told', res['note'])
+
+    def test_it_falls_back_to_the_number_message_when_there_is_no_newest_inbound(self):
+        from types import SimpleNamespace as NS
+        from unittest.mock import patch
+        from qurtoba.automation import pending as P
+        sent = []
+        held = {'repeat': [{'account_number': '01012345678', 'value': 23200.0, 'type': 'كاش',
+                            'source_message_id': 'num-msg'}]}
+        with patch.object(P, 'pending_state', return_value=held), \
+             patch.object(P, '_newest_inbound', return_value=None), \
+             patch.object(P, 'send_quoted', side_effect=lambda c, m, t: sent.append((m, t)) or True), \
+             patch('qurtoba.tools.transactions._clear_repeat_pending'), \
+             patch.object(P, 'log'):
+            P.answer_pending(NS(id='c1'), NS(), 'no')
+        self.assertEqual(sent, [('num-msg', 'تمام، مش هتتكرر.')])
+
+
+class BalanceIsAlwaysATooLTests(SimpleTestCase):
+    """«شوف كدا كام ؟» was answered with prose and no figure (2026-09-09 19:36)."""
+
+    def test_the_prompt_forbids_talking_about_money_without_a_tool(self):
+        import pathlib
+        text = (pathlib.Path(__file__).parent / 'prompts' / 'agents' / 'thinker' / 'prompt.md').read_text(encoding='utf-8')
+        self.assertIn('شوف كدا كام؟', text)
+        self.assertIn('Never speak about money without a tool', text)
+        for forbidden in ('رصيدك ثابت', 'مفيش حاجة اتسجلت عليك'):
+            self.assertIn(forbidden, text)

@@ -46,6 +46,8 @@ def qurtoba_answer_pending(context, decision: str) -> Dict[str, Any]:
     if decision not in ('yes', 'no'):
         return {'success': False, 'error_type': 'invalid_decision', 'error': 'decision must be "yes" or "no".'}
     try:
+        # answer_message_id=None → the money path quotes the customer's newest message,
+        # so a «no» always gets its «تمام، مش هتتكرر.» (2026-09-08: cancels went unanswered)
         return answer_pending(conv, partner, decision, answer_message_id=None)
     except Exception as exc:  # never raise into the agent loop
         return {'success': False, 'error_type': 'exception', 'error': str(exc)}
