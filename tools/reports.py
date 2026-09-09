@@ -724,7 +724,9 @@ def _statement_caption(customer_name, report_date_iso, total_debit, total_credit
 
 
 def statement_display_name(report_date_iso: str) -> str:
-    return f'كشف حساب {_date_display(report_date_iso)}.xlsx'
+    """What the customer sees as the document's name. Dashes, never slashes: a «/» in a
+    filename reads as a path separator on some clients and can break saving the file."""
+    return f'كشف حساب {_date_display(report_date_iso).replace("/", "-")}.xlsx'
 
 
 def store_statement_xlsx(customer_pk, xlsx: bytes, report_date_iso: str) -> Tuple[Optional[str], str]:
