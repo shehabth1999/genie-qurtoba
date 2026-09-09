@@ -79,6 +79,16 @@ def check_balance_and_send(conversation, customer):
     """
     from modules.chat.services.omnichannel_send_service import OmnichannelSendService
 
+    # Ask Qurtoba first: the stored column is a cache, refreshed when a record is saved.
+    # A settlement made inside Qurtoba writes no record here, so without this the customer
+    # is told a debt the office already cleared (2026-09-09: «عليك 213,666» against a real
+    # balance of zero). Best effort — on failure the last known figure is used.
+    try:
+        customer.recompute_balance()
+        customer.refresh_from_db(fields=['balance'])
+    except Exception:
+        logger.warning('balance refresh failed for customer %s — sending the last known figure',
+                       getattr(customer, 'pk', None), exc_info=True)
     balance = customer.balance or 0
 
     # Customer-facing message: only ليك / عليك with the ABSOLUTE value — never

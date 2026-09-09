@@ -28,6 +28,7 @@ class QurtobaConfig(AppConfig):
         self._install_tool_db_hygiene()
         self._install_ai_guard()
         self._install_delete_guard()
+        self._install_auth_probe()
         self._takeover_celery_config()
 
         # Kick off a catalog pull on first startup so the tables are never empty.
@@ -55,6 +56,14 @@ class QurtobaConfig(AppConfig):
             dj_settings.AI_SAME_TIME_WINDOW_SEC = 12
         except Exception:
             logger.exception('qurtoba: could not apply AI_HIGH_VALUE_CONFIRM_THRESHOLD')
+
+    @staticmethod
+    def _install_auth_probe():
+        try:
+            from qurtoba import auth_probe
+            auth_probe.install()
+        except Exception:
+            logger.exception('qurtoba: auth probe NOT installed')
 
     @staticmethod
     def _install_delete_guard():
@@ -226,6 +235,14 @@ class QurtobaConfig(AppConfig):
                     'task': 'qurtoba.tasks.send_qurtoba_daily_reminder',
                     # Just after midnight Cairo time, every day of the year.
                     'schedule': CairoCrontab(hour=0, minute=10),
+                },
+                # Self-heal the ledger: their push is fire-and-forget, so anything it could
+                # not deliver (dead credential, deploy window, a payload we refused) is
+                # pulled back within minutes instead of drifting silently for hours.
+                'qurtoba-sync-missing-records': {
+                    'task': 'qurtoba.tasks.sync_missing_qurtoba_records',
+                    'schedule': 300.0,
+                    'kwargs': {'days_back': 1},
                 },
                 'recover-stranded-conversations': {
                     'task': 'qurtoba.tasks.recover_stranded_conversations',

@@ -43,6 +43,14 @@ class QurtobaCustomerSerializer(serializers.ModelSerializer):
 
 
 class QurtobaRecordSerializer(serializers.ModelSerializer):
+    # `type` is stored EXACTLY as Qurtoba sends it, never validated against our own list.
+    # A ModelSerializer would build a ChoiceField from the model's choices and answer 400
+    # «not a valid choice» for anything new — which is what happened to «الدفع» (2026-09-09):
+    # every settlement the office made was refused at the door and the customer's balance
+    # never moved. A ledger row we cannot classify is still a ledger row: take it, store it,
+    # and let the office see it.
+    type = serializers.CharField(max_length=50, required=False, allow_null=True, allow_blank=True)
+
     # camelCase → snake_case mappings (exact field names from Qurtoba Record serializer)
     accountNumber = serializers.CharField(source='account_number', required=False, allow_null=True, allow_blank=True)
     isDone        = serializers.BooleanField(source='is_done',   required=False)

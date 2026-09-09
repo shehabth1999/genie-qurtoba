@@ -143,49 +143,26 @@ class QurtobaRecordListView(APIView):
                 return Response({'status': True, 'duplicate': True, 'in_flight': True},
                                 status=status.HTTP_200_OK)
 
-        ser = QurtobaRecordSerializer(data=data)
-        if ser.is_valid():
-            obj = ser.save()
-            # Resolve customer FK and attach — QurtobaRecord.save() will then
-            # call recompute_balance() automatically (handles isDone flip too)
-            customer = self._resolve_customer(obj.customer_data_qurtoba_id)
-            update_fields = ['raw_data', 'qurtoba_synced', 'qurtoba_posted_at']
-            obj.raw_data = dict(data)
-            # Mark as already synced — this record originated in Qurtoba, not Genie.
-            # Prevents post_create() from trying to push it back to Qurtoba.
-            obj.qurtoba_synced = True
-            obj.qurtoba_posted_at = timezone.now()
-            # Store Qurtoba's record ID so Cash-SYS webhook can match it back
-            qurtoba_record_id = data.get('_record_id')
-            if qurtoba_record_id:
-                try:
-                    obj.qurtoba_record_id = int(qurtoba_record_id)
-                    update_fields.append('qurtoba_record_id')
-                except (ValueError, TypeError):
-                    pass
-            if customer:
-                obj.customer = customer
-                update_fields.append('customer')
-            obj.save(update_fields=update_fields)
-            # Pull authoritative balance from Qurtoba after receiving its push.
-            # recompute_balance() only counts local Genie records — if Qurtoba has more
-            # records than Genie has synced, the local balance would be wrong.
-            if customer:
-                from qurtoba.utils_sync import _sync_customer_balance
-                _sync_customer_balance(
-                    getattr(settings, 'QURTOBA_BASE_URL', '').rstrip('/'),
-                    getattr(settings, 'QURTOBA_TOKEN', ''),
-                    customer,
-                )
+        from qurtoba.ingest import ingest_row
+        obj, outcome, detail = ingest_row(data)
+        if outcome in ('created', 'duplicate'):
             return Response({'status': True}, status=status.HTTP_201_CREATED)
 
         # Nothing was created, so release the in-flight claim — otherwise a
         # corrected retry would be rejected as a duplicate for the full TTL.
         if record_id is not None:
             cache.delete(f'qurtoba:sync:record:{record_id}')
-        logger.warning('[Qurtoba Sync] invalid record payload _record_id=%s: %s',
-                       record_id, ser.errors)
-        return Response({'status': False, 'errors': ser.errors}, status=status.HTTP_400_BAD_REQUEST)
+        # A refused push is a LOST ledger row: their side never retries. Log it where we can
+        # actually read it, so it is visible the same day rather than months later.
+        try:
+            from qurtoba.automation.context import log as _agent_log
+            _agent_log('api_record_refused', None, record_id=record_id,
+                       type=str(data.get('type'))[:30], value=data.get('value'),
+                       customer=data.get('customerData'), errors=str(detail)[:160])
+        except Exception:
+            pass
+        logger.warning('[Qurtoba Sync] invalid record payload _record_id=%s: %s', record_id, detail)
+        return Response({'status': False, 'errors': detail}, status=status.HTTP_400_BAD_REQUEST)
 
     @staticmethod
     def _resolve_customer(customer_qurtoba_id):

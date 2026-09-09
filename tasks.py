@@ -1742,6 +1742,89 @@ def _dispatch_statement_reminders(template, partner_ids, sender_partner, day):
     return queued, failed
 
 
+@shared_task(bind=True, max_retries=0, name='qurtoba.tasks.sync_missing_qurtoba_records')
+def sync_missing_qurtoba_records(self, report_date=None, days_back=0):
+    """SELF-HEAL: pull any ledger row Qurtoba created that never reached us.
+
+    Their push is fire-and-forget. A row is lost whenever the POST cannot be accepted —
+    the credential is gone (2026-09-09: an admin delete destroyed the API token and 27
+    rows vanished in 56 minutes), we are mid-deploy, or we answer 4xx for a payload we do
+    not understand. Nothing on their side retries, so the row is simply never seen and
+    the customer's balance silently drifts.
+
+    Runs every few minutes over today (and yesterday during the night, so the end-of-day
+    statement is complete). Idempotent on Qurtoba's own record id, so a row already here
+    costs one set lookup. Rows carrying no customer are skipped, exactly as their push does.
+    """
+    import datetime as _dt
+
+    import requests
+    from django.utils import timezone
+    from qurtoba.ingest import ingest_row, normalize_api_row
+    from qurtoba.models import QurtobaCustomer, QurtobaRecord
+
+    base = getattr(settings, 'QURTOBA_BASE_URL', '').rstrip('/')
+    token = getattr(settings, 'QURTOBA_TOKEN', '')
+    if not base or not token:
+        return {'skipped': 'no_api_config'}
+
+    today = timezone.localdate()
+    days = [_dt.date.fromisoformat(report_date)] if report_date else \
+        [today - _dt.timedelta(days=n) for n in range(0, max(0, int(days_back)) + 1)]
+
+    headers = {'Authorization': f'Token {token}'}
+    here = set(QurtobaRecord.objects.exclude(qurtoba_record_id__isnull=True)
+               .values_list('qurtoba_record_id', flat=True))
+    healed, refused, touched = [], [], set()
+
+    for day in days:
+        rows, url, params, pages = [], f'{base}/transactions/api2/record/', {'date': day.isoformat()}, 0
+        try:
+            while url and pages < 60:
+                r = requests.get(url, headers=headers, params=params, timeout=30)
+                r.raise_for_status()
+                body = r.json()
+                rows += body.get('results', [])
+                url = body.get('next')
+                params = None
+                pages += 1
+        except Exception as exc:
+            logger.warning('[Qurtoba Heal] could not list %s: %s', day, exc)
+            continue
+
+        for row in sorted([x for x in rows if str(x.get('date')) == day.isoformat()],
+                          key=lambda x: x.get('id') or 0):
+            rid = row.get('id')
+            if rid in here:
+                continue
+            cd = row.get('customerData')
+            cust_id = cd.get('id') if isinstance(cd, dict) else cd
+            if not cust_id:
+                continue                       # their push never sends these either
+            customer = QurtobaCustomer.objects.filter(qurtoba_id=cust_id).first()
+            if customer is None:
+                continue                       # a customer this Genie does not know
+            obj, outcome, detail = ingest_row(normalize_api_row(row), pull_balance=False)
+            if outcome == 'created':
+                healed.append(rid)
+                here.add(rid)
+                touched.add(customer.pk)
+            elif outcome == 'invalid':
+                refused.append({'record_id': rid, 'error': str(detail)[:200]})
+
+    for pk in touched:
+        try:
+            QurtobaCustomer.objects.get(pk=pk).recompute_balance()
+        except Exception:
+            logger.exception('[Qurtoba Heal] balance refresh failed for customer %s', pk)
+
+    if healed or refused:
+        logger.warning('[Qurtoba Heal] pulled %d row(s) their push never delivered: %s%s',
+                       len(healed), healed[:20], f' | refused: {refused}' if refused else '')
+    return {'healed': len(healed), 'record_ids': healed[:50], 'refused': refused,
+            'customers_refreshed': len(touched), 'days': [str(d) for d in days]}
+
+
 def _reminder_sender_partner(template):
     """The internal Partner the reminder is sent 'from'.
 

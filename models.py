@@ -319,6 +319,16 @@ class QurtobaCustomer(BaseModel):
             self.save(update_fields=['balance'])
             return
 
+        if self.qurtoba_id:
+            # The customer EXISTS on Qurtoba and the call simply failed (timeout, 5xx).
+            # Keep the last authoritative figure rather than re-deriving one from the rows
+            # this side happens to hold: Qurtoba can carry rows we never received — a
+            # settlement, an accountant edit — so the local sum would be confidently wrong
+            # (2026-09-09: it would have re-stated a debt of 213,666 the office had cleared).
+            logger.warning('recompute_balance: Qurtoba unreachable for customer %s — keeping the '
+                           'last known balance %s', self.qurtoba_id, self.balance)
+            return
+
         # Fallback — local sum on Qurtoba-side records only
         on_qurtoba = (
             models.Q(qurtoba_synced=True)
@@ -649,6 +659,12 @@ class QurtobaRecord(BaseModel):
     ]
     SETTLEMENT_TYPES = [
         ('مندوب', 'مندوب'),  # collector settles with office
+        # 2026-09-09: the office settles a customer's whole debt inside Qurtoba and the row
+        # comes to us as «الدفع» with a NEGATIVE value (isDown False), which clears the
+        # balance. It was missing from this list, so the inbound push was answered 400
+        # «not a valid choice» and every settlement was silently dropped — the customer kept
+        # being told he owed 213,666 after the office had zeroed him.
+        ('الدفع', 'الدفع'),
     ]
     TYPE_CHOICES = DEBT_TYPES + COLLECTION_TYPES + SETTLEMENT_TYPES
 
