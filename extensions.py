@@ -408,12 +408,23 @@ class WhatsAppAccountQurtobaExtension(ModelExtension):
     _inherit = 'whatsapp.whatsappaccount'
     _depends = ['base']
 
-    # Manual master switch for the AI agent on this account. Toggled by hand
-    # (enable/disable); the AI flow is wired to this by the integrator.
+    # Manual master switch for the AI agent on this account. OFF = the AI does nothing at
+    # all: no transaction, no payment, no reply — and messages that arrive meanwhile are
+    # marked handled, so switching it back on never replays them. Read by qurtoba.switches
+    # (the workflow gate node, the money path, and every AI create tool).
     ai_agent_enabled = models.BooleanField(
         default=True,
         verbose_name=_('تفعيل الرد الآلي (AI)'),
-        help_text=_('تشغيل/إيقاف رد الوكيل الذكي يدويًا لهذا الحساب.'),
+        help_text=_('تشغيل/إيقاف رد الوكيل الذكي يدويًا لهذا الحساب. عند الإيقاف لا يتم تنفيذ أي معاملة ولا يتم الرد تلقائياً.'),
+    )
+
+    # Manual off-hours switch — owner decision 2026-09-13: flipped by hand, NEVER by the clock.
+    # ON = no transaction or payment of any kind; the customer gets the off-hours notice.
+    # Read by qurtoba.switches.
+    qurtoba_off_hours = models.BooleanField(
+        default=False,
+        verbose_name=_('وضع خارج مواعيد العمل'),
+        help_text=_('تشغيل يدوي فقط (لا يعمل بالتوقيت). أثناء التشغيل لا يتم تنفيذ أي معاملة أو سداد، ويستلم العميل رسالة خارج مواعيد العمل.'),
     )
 
     qurtoba_allow_cash = models.BooleanField(

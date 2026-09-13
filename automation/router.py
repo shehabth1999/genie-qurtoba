@@ -1,5 +1,5 @@
 """Turn loading and the ONLY routing Python does: is this a receipt image, is the
-off-hours switch on, is the partner linked. Everything else goes down the money path
+manual off-hours switch on (never the clock), is the partner linked. Everything else goes down the money path
 first (``transfers.run``) and then — if anything is left — to the AI.
 
 Python never interprets what the customer means (owner decision 2026-09-06): a
@@ -109,25 +109,34 @@ def unprocessed_text_rows(conversation):
 
 
 def route(conversation, partner, input_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """The function-node entry: linked? off-hours? receipt image? — else the money path."""
+    """The function-node entry: linked? off-hours? receipt image? — else the money path.
+
+    Off-hours is the MANUAL switch «وضع خارج مواعيد العمل» on the WhatsApp account, read fresh
+    every turn by ``qurtoba.switches``, never the clock (owner decision 2026-09-13). It is checked
+    BEFORE the receipt image: while closed, a receipt must not reach the payments agent and
+    register a سداد, exactly as the old off-hours agent refused payments.
+    """
     input_data = input_data or {}
-    off_hours = bool(input_data.get('off_hours'))
-    base = {'intent': Intent.TRANSFER, 'batch_ids': [], 'rows': [], 'off_hours': off_hours, 'quoted_id': None}
+    base = {'intent': Intent.TRANSFER, 'batch_ids': [], 'rows': [], 'off_hours': False, 'quoted_id': None}
     if partner is not None and getattr(partner, 'qurtoba_customer_id', None) is None:
         return {**base, 'intent': Intent.NOT_LINKED}
 
+    from qurtoba.switches import account_flags
+    off_hours = bool(account_flags(conversation).get('off_hours'))
+    base['off_hours'] = off_hours
     batch = load_batch_rows(conversation, input_data)
     rows = [_row_dict(m) for m in batch]
     base['batch_ids'] = [r['id'] for r in rows]
     base['rows'] = rows
     base['quoted_id'] = rows[-1]['quoted_id'] if rows else None
-    from qurtoba.tools.planning import _classify_message
-    has_image = any(r['type'] == 'image' or (r['quotes_image'] and not _classify_message(r['text'])['phones'])
-                    for r in rows)
-    if has_image:
-        base['intent'] = Intent.RECEIPT
-    elif off_hours:
+    if off_hours:
         base['intent'] = Intent.OFF_HOURS
+    else:
+        from qurtoba.tools.planning import _classify_message
+        has_image = any(r['type'] == 'image' or (r['quotes_image'] and not _classify_message(r['text'])['phones'])
+                        for r in rows)
+        if has_image:
+            base['intent'] = Intent.RECEIPT
     try:
         from qurtoba.tools._debuglog import log_event
         log_event('route', conversation=conversation, intent=base['intent'], batch=[r['id'][:8] for r in rows])

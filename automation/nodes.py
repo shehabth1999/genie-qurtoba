@@ -5,8 +5,11 @@ The node receives the whole workflow state as ``input_data`` and the live
 ``conversation`` / ``partner`` objects as globals.
 
 Graph (see management/commands/qurtoba_workflow_v2.py):
-    linked? → route (receipt / off-hours / money) → transfers (creates, no model)
+    AI switch on? (gate) — off → ai_off ('' = nothing at all, messages marked handled)
+    → linked? → route (off-hours switch / receipt / money) → transfers (creates, no model)
            → needs AI? → ai_context → agent_thinker → model_done (logs the turn time) | done ('' = silent turn)
+
+Both switches (AI on/off, manual off-hours) are read by ``qurtoba.switches``, never the clock.
 
 Nothing here may raise: a raised error would make the engine retry the node up to
 ``max_retries`` times, re-running the money path. Errors are logged, a human is
@@ -39,6 +42,45 @@ def _route_of(input_data: Dict[str, Any], conversation, partner) -> Dict[str, An
     return route(conversation, partner, input_data)
 
 
+def _nothing_for_ai(summary: str) -> Dict[str, Any]:
+    """A money-path result that created nothing and leaves nothing for the model."""
+    return {'items': 0, 'replies': 0, 'created': [], 'leftovers': [], 'others': [], 'needs_ai': False,
+            'summary': summary}
+
+
+def gate_node(input_data, conversation, partner) -> Dict[str, Any]:
+    """First node of the graph: is the AI switched on for this account (إعدادات قرطبة)?
+
+    ``ai_enabled`` False routes the turn to ``ai_off_node``: nothing runs, no transaction, no
+    payment, no reply. Never raises; a failure reads as OFF (fail closed)."""
+    try:
+        from qurtoba.switches import account_flags
+        enabled = bool(account_flags(conversation).get('ai_enabled'))
+    except Exception as exc:
+        logger.exception('automation gate failed, treating the AI as off')
+        log('node_error', conversation, node='gate', error=str(exc)[:200])
+        enabled = False
+    if not enabled:
+        log('ai_off', conversation)
+    return {'ai_enabled': enabled}
+
+
+def ai_off_node(input_data, conversation, partner) -> str:
+    """The AI is switched off: end the turn with NOTHING (no transaction, no payment, no reply)
+    and mark this turn's messages handled, so switching the AI back on never replays them into a
+    transfer a human may already have made by hand."""
+    from .context import consume
+    try:
+        from .router import load_batch_rows
+        ids = [str(m.id) for m in load_batch_rows(conversation, input_data)]
+        n = consume(conversation, ids)
+        log('ai_off_consumed', conversation, count=n, batch=[i[:8] for i in ids])
+    except Exception as exc:
+        logger.exception('automation ai_off failed')
+        log('node_error', conversation, node='ai_off', error=str(exc)[:200])
+    return ''
+
+
 def route_node(input_data, conversation, partner) -> Dict[str, Any]:
     from .router import route
     try:
@@ -52,6 +94,20 @@ def route_node(input_data, conversation, partner) -> Dict[str, Any]:
 def transfers_node(input_data, conversation, partner) -> Dict[str, Any]:
     """Create every clean transfer now; report what is left for the AI."""
     from .transfers import run
+    # Safety net behind the gate node: a graph built before the gate existed, or a switch
+    # flipped between the gate and here, must still create NOTHING. Read fresh.
+    try:
+        from qurtoba.switches import account_flags
+        flags = account_flags(conversation)
+    except Exception:
+        logger.exception('automation transfers: switch read failed, creating nothing')
+        flags = {'ai_enabled': False, 'off_hours': False}
+    if not flags.get('ai_enabled'):
+        ai_off_node(input_data, conversation, partner)
+        return _nothing_for_ai('The AI is switched off for this account: nothing was created.')
+    if flags.get('off_hours'):
+        off_hours_node(input_data, conversation, partner)
+        return _nothing_for_ai('The off-hours switch is on: nothing was created.')
     try:
         return run(conversation, partner, _route_of(input_data, conversation, partner))
     except Exception as exc:
@@ -172,6 +228,8 @@ def _code(fn: str) -> str:
 
 
 NODE_CODE = {
+    'function_gate': _code('gate_node'),
+    'function_ai_off': _code('ai_off_node'),
     'function_route': _code('route_node'),
     'function_transfers': _code('transfers_node'),
     'function_off_hours': _code('off_hours_node'),

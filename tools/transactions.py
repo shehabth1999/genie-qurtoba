@@ -1392,6 +1392,13 @@ def qurtoba_create_new_transactions_bulk(
     if err:
         return err
 
+    # AI switch off / manual off-hours on (qurtoba.switches): create nothing. Read fresh, so a
+    # switch flipped mid-turn is honoured here even after the graph already routed the turn.
+    from qurtoba.switches import create_refusal
+    refused = create_refusal(conv, what='transfer')
+    if refused:
+        return refused
+
     if not isinstance(transactions, list) or not transactions:
         return {
             'success': False,
@@ -1507,6 +1514,13 @@ def qurtoba_confirm_pending_repeats(context) -> Dict[str, Any]:
     if err:
         return err
 
+    # AI switch off / manual off-hours on (qurtoba.switches): create nothing. Read fresh, so a
+    # switch flipped mid-turn is honoured here even after the graph already routed the turn.
+    from qurtoba.switches import create_refusal
+    refused = create_refusal(conv, what='transfer')
+    if refused:
+        return refused
+
     pending = _list_repeat_pending(conv)
     if not pending:
         return {'success': True, 'created': [], 'skipped': [], 'note': 'no_pending'}
@@ -1611,6 +1625,13 @@ def qurtoba_register_customer_payment(
     conv, customer, err = _resolve_conversation_and_customer(context)
     if err:
         return err
+
+    # AI switch off / manual off-hours on (qurtoba.switches): create nothing. Read fresh, so a
+    # switch flipped mid-turn is honoured here even after the graph already routed the turn.
+    from qurtoba.switches import create_refusal
+    refused = create_refusal(conv, what='payment')
+    if refused:
+        return refused
 
     # --- Rule 1: confirmation text must be present and non-trivial ---
     confirmation = (customer_confirmation_text or '').strip()

@@ -1,7 +1,10 @@
 """Build / update the workflow-v2 graph («Qurtoba Accountant Automations») from a Python spec.
 
-Graph: linked? → route → [receipt → payments agent | off-hours → notice | MONEY PATH (creates, no model)
-       → anything left? → thinking model (replies + info tools) | done].
+Graph: AI switch on? [off → nothing at all] → linked? → route → [off-hours switch → notice
+       | receipt → payments agent | MONEY PATH (creates, no model) → anything left? → thinking model | done].
+
+Both switches live on the WhatsApp account («إعدادات قرطبة»), are flipped by hand and read by
+qurtoba.switches. Nothing in this graph looks at the clock (owner decision 2026-09-13).
 
     manage.py qurtoba_workflow_v2                 # upsert nodes + edges of workflow 3 (idempotent)
     manage.py qurtoba_workflow_v2 --dry-run       # print the spec, change nothing
@@ -78,7 +81,7 @@ def _fn(node_id, label, x, y, code, timeout=60):
 
 def build_spec(src_nodes, tool_ids):
     """(nodes, edges, global_configuration) for the v2 graph:
-    linked? → route → [receipt → payments agent | off-hours → notice | money path → needs AI? → thinker | done]"""
+    AI on? [off → nothing] → linked? → route → [off-hours → notice | receipt → payments agent | money path → needs AI? → thinker | done]"""
     def src_cfg(node_id):
         n = src_nodes.get(node_id)
         if n is None:
@@ -112,12 +115,21 @@ def build_spec(src_nodes, tool_ids):
 
     X0, X1, X2, X3, X4, X5, X6, X7 = 0, 320, 640, 960, 1280, 1600, 1920, 2240
     nodes = [
+        # The AI switch comes first (إعدادات قرطبة › تفعيل الرد الآلي): OFF ends the turn with nothing
+        # at all, no transaction, no payment, no reply (owner decision 2026-09-13).
+        _fn('function_gate', 'AI switch on? (إعدادات قرطبة)', -640, 300, NODE_CODE['function_gate'], timeout=30),
+        dict(node_id='conditional_ai_enabled', node_type='conditional', label='AI enabled? off: nothing runs', x=-320, y=300,
+             configuration={'conditions': [{'operator': 'is_true', 'data_type': 'boolean',
+                                            'variable1': '{{ function_gate.ai_enabled }}', 'variable2': ''}],
+                            'default_branch': 'default'}),
+        _fn('function_ai_off', 'AI off: silent, no transaction, messages marked handled', -320, 560,
+            NODE_CODE['function_ai_off'], timeout=30),
         dict(node_id='conditional_linked', node_type='conditional', label='linked to a Qurtoba customer?', x=X0, y=300,
              configuration={'conditions': [{'operator': 'is_true', 'data_type': 'boolean',
                                             'variable1': '{{partner.has_qurtoba_customer}}', 'variable2': ''}],
                             'default_branch': 'default'}),
         dict(node_id='tool_not_linked', node_type='tool', label='not linked → static notice', x=X1, y=560, configuration=not_linked),
-        _fn('function_route', 'ROUTE: receipt image? off-hours? else money', X1, 300, NODE_CODE['function_route']),
+        _fn('function_route', 'ROUTE: off-hours switch? receipt image? else money', X1, 300, NODE_CODE['function_route']),
         dict(node_id='conditional_route', node_type='conditional', label='receipt / off-hours / money', x=X2, y=300,
              configuration={'conditions': [
                  {'operator': 'equals', 'data_type': 'string', 'variable1': '{{ function_route.intent }}', 'variable2': 'receipt'},
@@ -140,6 +152,9 @@ def build_spec(src_nodes, tool_ids):
         dict(node_id='agent_payments', node_type='agent_chat', label='payments_agent (vision model)', x=X5, y=40, configuration=payments),
     ]
     edges = [
+        ('function_gate', 'conditional_ai_enabled', ''),
+        ('conditional_ai_enabled', 'conditional_linked', '1'),
+        ('conditional_ai_enabled', 'function_ai_off', '0'),
         ('conditional_linked', 'function_route', '1'),
         ('conditional_linked', 'tool_not_linked', '0'),
         ('function_route', 'conditional_route', ''),
@@ -156,7 +171,7 @@ def build_spec(src_nodes, tool_ids):
     ]
     global_configuration = {
         'schedules': [], 'chat_based': False, 'input_message': '', 'record_trigger': {}, 'recursion_limit': 25,
-        'state_injections': [{'key': 'off_hours', 'type': 'bool', 'persist': False, 'initial_value': False}],
+        'state_injections': [],   # off-hours is the manual account switch (qurtoba.switches), not workflow state
         'schedules_runtime': [],
     }
     return nodes, edges, global_configuration
