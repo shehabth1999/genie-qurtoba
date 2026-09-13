@@ -28,6 +28,9 @@ from .static_reply import (
 from .pending import (
     qurtoba_answer_pending,
 )
+from .split import (
+    qurtoba_request_split,
+)
 
 __all__ = [
     "cash_sys_create_and_activate",
@@ -42,4 +45,5 @@ __all__ = [
     "qurtoba_get_customer_daily_transactions",
     "qurtoba_send_static_message",
     "qurtoba_answer_pending",
+    "qurtoba_request_split",
 ]

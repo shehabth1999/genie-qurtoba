@@ -490,7 +490,19 @@ SCENARIOS += [
     {   # «قسم» → nothing created, human alerted
         'id': 'X18', 'title': 'x: «قسم 1500 على الأرقام» → لا تنفيذ، تنبيه بشري',
         'turns': [{'text': f'{P1}\n{P2}\n{P3}\nقسم 1500 عليهم'}],
-        'expect': {'final': {'no_records': True, 'tools': [{'name': 'alert_qurtoba_human', 'must': True}], 'forbid': SAFE}},
+        'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_request_split', 'must': True}],
+                             'tool_texts_contain': ['طلب التقسيم'], 'forbid': SAFE}},
+    },
+    {   # a split spread over several messages → nothing paired by position, the split tool runs (2026-09-13)
+        'id': 'X18b', 'title': 'x: «01… ⏎ 01… ⏎ قسم 1000 عليهم» رسائل منفصلة → لا تنفيذ، طلب تقسيم',
+        'turns': [{'text': P1}, {'text': P2}, {'text': 'قسم 1000 عليهم'}],
+        'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_request_split', 'must': True}],
+                             'tool_texts_contain': ['طلب التقسيم'], 'forbid': SAFE}},
+    },
+    {   # one number, an amount and a split word → never created on sight (2026-09-13)
+        'id': 'X18c', 'title': 'x: «01… 1000 قسمها نصين» → لا تنفيذ، طلب تقسيم',
+        'turns': [{'text': f'{P1} 1000 قسمها نصين'}],
+        'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_request_split', 'must': True}], 'forbid': SAFE}},
     },
     {   # greeting + transfer + balance in one burst → transfer created, balance answered, greeting not a transfer
         'id': 'X19', 'title': 'x: تحية + تحويل + سؤال رصيد في دفعة واحدة',
@@ -545,9 +557,9 @@ SCENARIOS += [
     {'id': 'Y3', 'title': 'y: «ابعت 700 للرقمين دول»', 'turns': [{'text': f'ابعت 700 للرقمين دول\n{P1}\n{P2}'}],
      'expect': {'final': {'creates': [{'account': P1, 'value': 700}, {'account': P2, 'value': 700}], 'forbid': SAFE}}},
     {'id': 'Y4', 'title': 'y: «نص نص» = تقسيم → لا تنفيذ، تنبيه', 'turns': [{'text': f'{P1}\n{P2}\n1000 نص نص'}],
-     'expect': {'final': {'no_records': True, 'tools': [{'name': 'alert_qurtoba_human', 'must': True}], 'forbid': SAFE}}},
+     'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_request_split', 'must': True}], 'forbid': SAFE}}},
     {'id': 'Y5', 'title': 'y: «وزعهم بالتساوي» = تقسيم → لا تنفيذ', 'turns': [{'text': f'{P1}\n{P2}\n1000 وزعهم بالتساوي'}],
-     'expect': {'final': {'no_records': True, 'forbid': SAFE}}},
+     'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_request_split', 'must': True}], 'forbid': SAFE}}},
     # non-cash wording
     {'id': 'Y6', 'title': 'y: «حول 500 على الفوري بتاعي»', 'setup': {'accounts': ACC}, 'turns': [{'text': 'حول 500 على الفوري بتاعي'}],
      'expect': {'final': {'creates': [{'account': '6081844', 'value': 500}], 'forbid': SAFE}}},

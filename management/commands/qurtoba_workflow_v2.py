@@ -40,7 +40,7 @@ THINKER_TOOLS = (
     'whatsapp_reply_to_message', 'qurtoba_send_customer_balance_to_chat', 'qurtoba_get_customer_daily_transactions',
     'qurtoba_check_transaction_status', 'qurtoba_check_payment_status', 'qurtoba_clear_pending_transfers',
     'alert_qurtoba_human', 'qurtoba_send_static_message',
-    'qurtoba_create_new_transactions_bulk', 'qurtoba_answer_pending',
+    'qurtoba_create_new_transactions_bulk', 'qurtoba_answer_pending', 'qurtoba_request_split',
 )
 
 

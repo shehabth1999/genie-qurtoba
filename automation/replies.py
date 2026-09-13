@@ -48,8 +48,10 @@ AVAILABLE: List[str] = [
 ]
 SCOPE = 'أنا متخصص في معاملات قرطبة بس، فمش هقدر أساعدك في ده.'
 WAIT = 'لحظة'
-SPLIT_INFO = ('التقسيم على الأرقام بيتعمل عندنا يدوي — وصلني ومش محتاج تبعت تاني. '
-              'ولو تحب تقولي كام لكل رقم أنفذها فوراً.')
+# A split request («قسم/وزّع المبلغ على الأرقام») is done by hand at the office. qurtoba_request_split posts an
+# internal note mentioning the staff, notifies them like a receipt waiting for review, and sends the customer
+# this ONE short line (owner decision 2026-09-13).
+SPLIT_RECEIVED = 'تمام ✅ طلب التقسيم وصل وهيتنفذ يدوي.'
 PER_NUMBER_QUESTION = 'تقصد {amount} لكل رقم، ولا تقسيمه عليهم؟'
 NOT_UNDERSTOOD = 'مش فاهم الرسالة دي — ابعت الرقم في سطر والمبلغ في سطر'
 SAY_AGAIN_SIMPLER = 'ابعت الرقم في سطر والمبلغ في سطر تحته، وأنا أنفذ على طول.'

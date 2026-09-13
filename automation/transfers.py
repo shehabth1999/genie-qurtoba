@@ -349,6 +349,12 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     correction_pending = cache_get(CORRECTION_KEY.format(conv=conv_key))
     to_model: List[Dict[str, Any]] = []
 
+    # A SPLIT request («قسم/وزّع المبلغ على الأرقام», «نص نص», «بالتساوي») is done by hand at the office and
+    # belongs to the model, which calls qurtoba_request_split. When ANY message of the burst asks for a split,
+    # every number and amount in the burst goes to the model with it: pairing by position would otherwise turn
+    # «01… ⏎ 01… ⏎ قسم 1000 عليهم» into a real transfer (owner decision 2026-09-13).
+    split_burst = any(m.type == 'text' and L.SPLIT.search(L.norm(_text_of(m))) for m in rows.values())
+
     for mid, m in list(rows.items()):
         text = _text_of(m)
         t = L.norm(text)
@@ -385,8 +391,13 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                 pre_consume += [x for x in (mid, correction_pending.get('correction_of'), correction_pending.get('source_message_id')) if x]
                 cache_delete(CORRECTION_KEY.format(conv=conv_key)); correction_pending = None
                 continue
+        if split_burst and (cls['phones'] or cls['amounts'] or L.SPLIT.search(t)):
+            # part of a split request — never created here, never paired by position
+            to_model.append({'message_id': mid, 'kind': 'split', 'text': text[:200]})
+            pre_consume.append(mid)
+            continue
         if len(cls['phones']) >= 2 and len(cls['amounts']) == 1:
-            # several numbers with ONE amount: «لكل رقم» / «قسم» / a mistake — meaning → the model
+            # several numbers with ONE amount: «لكل رقم» / a mistake — meaning → the model
             to_model.append({'message_id': mid, 'kind': 'multi_number', 'text': text[:200]})
             pre_consume.append(mid)
             continue
@@ -712,7 +723,10 @@ def render_ai_summary(summary: Dict[str, Any]) -> str:
         for l in lo:
             k = l.get('kind')
             if k == 'multi_number':
-                hint = 'several numbers with ONE amount — read it: the same amount to each (create one item per number), a split (alert a human), or unclear (ask)'
+                hint = 'several numbers with ONE amount — read it: the same amount to each (create one item per number), a split request (qurtoba_request_split), or unclear (ask)'
+            elif k == 'split':
+                hint = ('part of a SPLIT request («قسم/وزّع/نص نص/بالتساوي») — call qurtoba_request_split ONCE for the whole request '
+                        'with the message that asks for the split; create nothing for these numbers and reply nothing')
             elif k == 'sentence':
                 hint = 'a number and/or an amount INSIDE a sentence — read it: a status question (check_transaction_status), a complaint or refund (alert a human + «لحظة»), an order (create it), or unclear (ask)'
             elif k == 'hold_word':
