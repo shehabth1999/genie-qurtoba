@@ -17,8 +17,9 @@ from django.core.management.base import BaseCommand, CommandError
 
 TEMPLATE_NAME = 'qurtoba_daily_summary'
 STATEMENT_TEMPLATE_NAME = 'qurtoba_daily_statement_xlsx'   # RETIRED 2026-09-14: text + file in one message
-FILE_TEMPLATE_NAME = 'qurtoba_daily_statement_file'        # the Excel statement ALONE, its own message
-FILE_BODY = '📎 كشف حساب نهاية اليوم'                       # Meta requires a body; one static line, no variables
+FILE_TEMPLATE_NAME = 'qurtoba_daily_excel'                 # the Excel statement ALONE, its own message
+# «كشف حساب يوم <date>». Meta rejects a body that starts or ends with a variable, so the 📎 closes it.
+FILE_BODY = 'كشف حساب يوم {{qurtoba_date}} 📎'
 DEFAULT_ACCOUNT_PHONE = '201006003836'  # محاسب قرطبة
 
 HEADER = 'كشف نهاية اليوم'

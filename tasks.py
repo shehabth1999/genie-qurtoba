@@ -1580,9 +1580,10 @@ QURTOBA_DAILY_REMINDER_TEMPLATE = 'qurtoba_daily_summary_v2'
 # The same reminder with the day's full statement (Excel) in the DOCUMENT header — used as
 # soon as Meta approves it; the text template above stays untouched as the fallback.
 # The customer's Excel statement ALONE, sent as its own message right after the summary text: a DOCUMENT
-# header and a one-line body. Owner decision 2026-09-14: never text and file in one message, so the combined
-# template 'qurtoba_daily_statement_xlsx' is retired and never used.
-QURTOBA_DAILY_FILE_TEMPLATE = 'qurtoba_daily_statement_file'
+# header and the body «كشف حساب يوم {{qurtoba_date}} 📎». Owner decision 2026-09-14: never text and file in one
+# message, so the combined template 'qurtoba_daily_statement_xlsx' is retired and never used. The first
+# file-only template 'qurtoba_daily_statement_file' (#20) was withdrawn from Meta the same day for this body.
+QURTOBA_DAILY_FILE_TEMPLATE = 'qurtoba_daily_excel'
 QURTOBA_DAILY_PAIR_SPACING_S = 8     # seconds between two recipients' pairs of messages
 QURTOBA_DAILY_FILE_DELAY_S = 4       # the file follows its summary text by this much, so it arrives second
 
