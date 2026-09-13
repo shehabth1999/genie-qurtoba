@@ -106,6 +106,28 @@ CANCEL_STOPPED = 'تم الإيقاف. تأكد من تفاصيل المعامل
 # ── off-hours / linkage ───────────────────────────────────────────────────────
 
 OFF_HOURS = 'خارج مواعيد العمل حالياً. ساعات العمل من 9 صباحاً حتى 11:50 مساءً — تحت أمرك في أي وقت خلالها.'
+
+# The off-hours AGENT's refusals (manual switch «وضع خارج مواعيد العمل»). The model sends them through
+# the reply tool, quoted on the refused message; the workflow builder bakes them into its prompt from
+# here, so the prompt and the fixed fallback above can never disagree about the hours.
+WORKING_HOURS = 'مواعيد العمل من 9 صباحاً حتى 11:50 مساءً طوال أيام الأسبوع'
+OFF_HOURS_TRANSACTION = (
+    'بنعتذر لحضرتك\n\n'
+    '*لا يمكن تنفيذ أي معاملات خارج مواعيد العمل*\n\n'
+    f'{WORKING_HOURS}\n\n'
+    'برجاء إعادة إرسال طلبك خلال مواعيد العمل وسيتم تنفيذه فوراً'
+)
+OFF_HOURS_PAYMENT = (
+    'عذراً، لا يمكن تسجيل السداد الآن خارج مواعيد العمل.\n'
+    f'{WORKING_HOURS}.\n'
+    'برجاء إعادة إرسال صورة الإيصال خلال مواعيد العمل ليتم تسجيلها.'
+)
+OFF_HOURS_STATUS = (
+    'عذراً، لا يمكن مراجعة حالة التحويلات أو إلغاؤها الآن خارج مواعيد العمل.\n'
+    f'{WORKING_HOURS}.\n'
+    'تقدر تطلب «كشف حساب» دلوقتي لعرض عمليات اليوم.'
+)
+OFF_HOURS_WHEN_OPEN = f'احنا دلوقتي خارج مواعيد العمل. {WORKING_HOURS}.'
 NOT_LINKED = ('بنعتذر ل حضرتك\n\nحسابك غير مربوط بعميل قرطبة\n\n'
               'برجاء التواصل مع إدارة قرطبة لربط حسابك أو إضافة حساب لك')
 

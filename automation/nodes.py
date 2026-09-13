@@ -8,6 +8,8 @@ Graph (see management/commands/qurtoba_workflow_v2.py):
     AI switch on? (gate) — off → ai_off ('' = nothing at all, messages marked handled)
     → linked? → route (off-hours switch / receipt / money) → transfers (creates, no model)
            → needs AI? → ai_context → agent_thinker → model_done (logs the turn time) | done ('' = silent turn)
+    off-hours → off_hours_context → agent_off_hours (balance + statement + reply tools only)
+           → off_hours_done (fixed closed notice if nothing reached the customer; messages marked handled)
 
 Both switches (AI on/off, manual off-hours) are read by ``qurtoba.switches``, never the clock.
 
@@ -217,6 +219,77 @@ def model_done_node(input_data, conversation, partner) -> str:
     return ''
 
 
+OFF_HOURS_AGENT_NODE_ID = 'agent_off_hours'
+
+
+def off_hours_context_node(input_data, conversation, partner) -> Dict[str, Any]:
+    """What the off-hours agent gets: time, customer, the day a statement should cover, the messages.
+
+    ``statement_day`` is the business day that has just ended (``reporting_day``: before noon it is
+    yesterday). It only picks WHICH day a statement shows at night; whether the office is closed is
+    decided by the manual switch alone, never by the clock."""
+    ctx = ai_context_node(input_data, conversation, partner)
+    out = {
+        'now': ctx.get('now', ''),
+        'partner_name': ctx.get('partner_name', ''),
+        'customer_name': ctx.get('customer_name', ''),
+        # Not 'messages': a function node's keys are merged into the workflow state, where
+        # 'messages' is the engine's own chat-history channel.
+        'inbound_messages': ctx.get('messages', ''),
+        'statement_day': '',
+    }
+    try:
+        from qurtoba.services.daily_totals import reporting_day
+        out['statement_day'] = reporting_day().isoformat()
+    except Exception:
+        logger.warning('automation off-hours: reporting_day failed', exc_info=True)
+    return out
+
+
+def _outbound_since_batch(conversation, batch_ids) -> bool:
+    """True when anything reached the customer after the first message of this turn: a quoted
+    refusal, the balance line, the statement document. Tool trace rows do not count."""
+    from modules.chat.models import Message
+    first = (Message.objects_all.filter(conversation=conversation, id__in=[str(i) for i in batch_ids])
+             .order_by('created_at').values_list('created_at', flat=True).first())
+    if first is None:
+        return False
+    return (Message.objects_all.filter(conversation=conversation, direction='outbound', created_at__gte=first)
+            .exclude(type__in=('tool', 'tool_call')).exists())
+
+
+def off_hours_done_node(input_data, conversation, partner) -> str:
+    """After the off-hours agent. If nothing at all reached the customer (the model failed or stayed
+    silent), send the fixed closed notice so they are never left in silence. Then mark the turn's
+    messages handled. The model's plain output is thrown away, exactly like model_done_node."""
+    from . import replies as R
+    from .context import cache_delete, cache_get, consume, said_recently, send_quoted
+    try:
+        route = _route_of(input_data, conversation, partner)
+        ids = route.get('batch_ids') or []
+        try:
+            import time as _time
+            node = ((input_data or {}).get('__node_results__') or {}).get(OFF_HOURS_AGENT_NODE_ID) or {}
+            od = node.get('output_data') if isinstance(node, dict) else None
+            started = cache_get(f'qurtoba:model_start:{conversation.id}')
+            cache_delete(f'qurtoba:model_start:{conversation.id}')
+            log('off_hours_model_done', conversation,
+                seconds=round(_time.time() - float(started), 1) if started else None,
+                model=od.get('model') if isinstance(od, dict) else None)
+        except Exception:
+            pass
+        if ids and not _outbound_since_batch(conversation, ids):
+            mid = ids[-1]
+            if not said_recently(conversation, mid, R.OFF_HOURS, minutes=120):
+                send_quoted(conversation, mid, R.OFF_HOURS)
+            log('off_hours_fallback', conversation, mid=str(mid)[:8])
+        consume(conversation, ids)
+    except Exception as exc:
+        logger.exception('automation off-hours done failed')
+        log('node_error', conversation, node='off_hours_done', error=str(exc)[:200])
+    return ''
+
+
 # The exact code pasted into each function node (kept here so the builder and the
 # canvas never drift). `conversation` / `partner` are globals the engine injects.
 def _code(fn: str) -> str:
@@ -233,6 +306,8 @@ NODE_CODE = {
     'function_route': _code('route_node'),
     'function_transfers': _code('transfers_node'),
     'function_off_hours': _code('off_hours_node'),
+    'function_off_hours_context': _code('off_hours_context_node'),
+    'function_off_hours_done': _code('off_hours_done_node'),
     'function_done': _code('done_node'),
     'function_ai_context': _code('ai_context_node'),
     'function_model_done': _code('model_done_node'),

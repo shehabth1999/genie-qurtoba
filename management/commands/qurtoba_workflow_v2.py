@@ -1,6 +1,6 @@
 """Build / update the workflow-v2 graph («Qurtoba Accountant Automations») from a Python spec.
 
-Graph: AI switch on? [off → nothing at all] → linked? → route → [off-hours switch → notice
+Graph: AI switch on? [off → nothing at all] → linked? → route → [off-hours switch → closed agent (balance + statement only)
        | receipt → payments agent | MONEY PATH (creates, no model) → anything left? → thinking model | done].
 
 Both switches live on the WhatsApp account («إعدادات قرطبة»), are flipped by hand and read by
@@ -74,6 +74,28 @@ def _thinker_prompt() -> str:
     return text.split('**prompt:**', 1)[1].strip() if '**prompt:**' in text else text.strip()
 
 
+_OFF_HOURS_PROMPT_PATH = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, 'prompts', 'agents', 'off_hours', 'prompt.md')
+
+# The off-hours agent can send the balance, send the statement and write quoted replies. Nothing else:
+# no tool that creates, repeats, holds, cancels or checks money (owner decision 2026-09-13).
+OFF_HOURS_TOOLS = (
+    'qurtoba_send_customer_balance_to_chat', 'qurtoba_get_customer_daily_transactions', 'whatsapp_reply_to_message',
+)
+
+
+def _off_hours_prompt() -> str:
+    with open(_OFF_HOURS_PROMPT_PATH, encoding='utf-8') as fh:
+        text = fh.read()
+    text = text.split('**prompt:**', 1)[1].strip() if '**prompt:**' in text else text.strip()
+    for token, value in (('[[WORKING_HOURS]]', R.WORKING_HOURS), ('[[TEMPLATE_TRANSACTION]]', R.OFF_HOURS_TRANSACTION),
+                         ('[[TEMPLATE_PAYMENT]]', R.OFF_HOURS_PAYMENT), ('[[TEMPLATE_STATUS]]', R.OFF_HOURS_STATUS),
+                         ('[[WHEN_OPEN]]', R.OFF_HOURS_WHEN_OPEN)):
+        text = text.replace(token, value)
+    if '[[' in text:
+        raise CommandError('off-hours prompt has an unreplaced [[placeholder]]')
+    return text
+
+
 def _fn(node_id, label, x, y, code, timeout=60):
     return dict(node_id=node_id, node_type='function', label=label, x=x, y=y,
                 configuration={'code': code, 'description': '', 'update_state': [], 'timeout_seconds': timeout})
@@ -81,7 +103,7 @@ def _fn(node_id, label, x, y, code, timeout=60):
 
 def build_spec(src_nodes, tool_ids):
     """(nodes, edges, global_configuration) for the v2 graph:
-    AI on? [off → nothing] → linked? → route → [off-hours → notice | receipt → payments agent | money path → needs AI? → thinker | done]"""
+    AI on? [off → nothing] → linked? → route → [off-hours → closed agent | receipt → payments agent | money path → needs AI? → thinker | done]"""
     def src_cfg(node_id):
         n = src_nodes.get(node_id)
         if n is None:
@@ -109,6 +131,19 @@ def build_spec(src_nodes, tool_ids):
     thinker['temperature'] = 0.2
     thinker['reasoning_mode'] = 'none'
     thinker['description'] = 'Thinking model: runs after the system created the clean transfers; creates only what the system could not read.'
+
+    # Off-hours agent (manual switch «وضع خارج مواعيد العمل»): the thinker's model settings, its own prompt,
+    # and ONLY the balance, statement and reply tools — nothing that can create money.
+    missing_off_hours_tools = [n for n in OFF_HOURS_TOOLS if n not in tool_ids]
+    if missing_off_hours_tools:
+        raise CommandError(f'off-hours tools not registered: {missing_off_hours_tools}')
+    off_hours = json.loads(json.dumps(thinker))
+    off_hours['messages'] = [{'role': 'system', 'text': _off_hours_prompt(), 'cache': True, 'cache_ttl': '5m', 'attachments': []}]
+    off_hours['selected_tools'] = [{'store': True, 'tool_id': tool_ids[name], 'ask_human': False} for name in OFF_HOURS_TOOLS]
+    off_hours['handoff'] = {'enabled': False, 'targets': []}
+    off_hours['update_state'] = []
+    off_hours['description'] = ('Off-hours agent: balance and statement only; refuses every transfer, payment, status check '
+                                'and cancellation with the working hours. Has no tool that can create money.')
 
     not_linked = src_cfg(SRC_NOT_LINKED_TOOL)
     not_linked['arguments'] = {'message': R.NOT_LINKED}
@@ -144,7 +179,11 @@ def build_spec(src_nodes, tool_ids):
         _fn('function_ai_context', 'context for the thinking model', X5, 300, NODE_CODE['function_ai_context']),
         dict(node_id='agent_thinker', node_type='agent_chat', label='THINKER (model): questions, replies, info tools', x=X6, y=300, configuration=thinker),
         _fn('function_model_done', 'model turn timing → output', X7, 300, NODE_CODE['function_model_done']),
-        _fn('function_off_hours', 'off-hours notice', X3, 560, NODE_CODE['function_off_hours']),
+        _fn('function_off_hours_context', 'OFF-HOURS: context for the closed agent', X3, 560, NODE_CODE['function_off_hours_context']),
+        dict(node_id='agent_off_hours', node_type='agent_chat',
+             label='OFF-HOURS agent: balance + statement only, refuses every transaction', x=X4, y=560, configuration=off_hours),
+        _fn('function_off_hours_done', 'OFF-HOURS: closed notice if silent, messages handled', X5, 560,
+            NODE_CODE['function_off_hours_done']),
         dict(node_id=AVAILABILITY_NODE, node_type='function', label='service_availability', x=X3, y=40,
              configuration=src_cfg(AVAILABILITY_NODE)),
         dict(node_id=SHARED_CORE_NODE, node_type='function', label='shared_roles', x=X4, y=40,
@@ -159,7 +198,9 @@ def build_spec(src_nodes, tool_ids):
         ('conditional_linked', 'tool_not_linked', '0'),
         ('function_route', 'conditional_route', ''),
         ('conditional_route', AVAILABILITY_NODE, '1'),
-        ('conditional_route', 'function_off_hours', '2'),
+        ('conditional_route', 'function_off_hours_context', '2'),
+        ('function_off_hours_context', 'agent_off_hours', ''),
+        ('agent_off_hours', 'function_off_hours_done', ''),
         ('conditional_route', 'function_transfers', '0'),
         ('function_transfers', 'conditional_needs_ai', ''),
         ('conditional_needs_ai', 'function_ai_context', '1'),
