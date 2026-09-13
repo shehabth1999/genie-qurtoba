@@ -1579,109 +1579,80 @@ def reconcile_unsynced_qurtoba_records():
 QURTOBA_DAILY_REMINDER_TEMPLATE = 'qurtoba_daily_summary_v2'
 # The same reminder with the day's full statement (Excel) in the DOCUMENT header — used as
 # soon as Meta approves it; the text template above stays untouched as the fallback.
-QURTOBA_DAILY_STATEMENT_TEMPLATE = 'qurtoba_daily_statement_xlsx'
-QURTOBA_DAILY_STATEMENT_SPACING_S = 2       # seconds between two recipients
+# The customer's Excel statement ALONE, sent as its own message right after the summary text: a DOCUMENT
+# header and a one-line body. Owner decision 2026-09-14: never text and file in one message, so the combined
+# template 'qurtoba_daily_statement_xlsx' is retired and never used.
+QURTOBA_DAILY_FILE_TEMPLATE = 'qurtoba_daily_statement_file'
+QURTOBA_DAILY_PAIR_SPACING_S = 8     # seconds between two recipients' pairs of messages
+QURTOBA_DAILY_FILE_DELAY_S = 4       # the file follows its summary text by this much, so it arrives second
 
 
 @shared_task(bind=True, max_retries=0)
 def send_qurtoba_daily_reminder(self, report_date=None, dry_run=False):
     """
-    Post the end-of-day summary to every number that requested a transaction
-    through Genie on the business day that just ended.
+    End-of-day messages, TWO per recipient: the summary text (QURTOBA_DAILY_REMINDER_TEMPLATE, unchanged) and
+    then, as a separate message, the customer's Excel statement alone (QURTOBA_DAILY_FILE_TEMPLATE).
 
-    Audience is deliberately narrow — only chat-born records carry a `partner`,
-    so a customer whose day was keyed into Qurtoba by an accountant is not
-    messaged: nobody asked us for anything from a phone. See
-    qurtoba.services.daily_totals.partners_active_on.
+    Audience, owner decision 2026-09-14: only the numbers that wrote to us on the business day being reported
+    (qurtoba.services.daily_totals.partners_chatted_on). A customer whose day was keyed into Qurtoba by the
+    office, or who did not message us that day, gets nothing.
 
-    Runs just after midnight Cairo, so `report_date` defaults to the day that
-    has just CLOSED, not today. Pass an ISO date to re-run for a specific day,
-    or dry_run=True to see who would receive it without sending.
+    Each template is used only once Meta has APPROVED it: until the file template is approved the summary text
+    still goes out on its own. The retired combined template is never used.
 
-    max_retries=0 on purpose: a retry would re-send template messages that
-    already went out, and there is no per-recipient idempotency key here.
+    Runs just after midnight Cairo, so `report_date` defaults to the day that has just CLOSED. Pass an ISO date
+    to re-run a specific day, or dry_run=True to see who would receive what without sending.
+
+    max_retries=0 on purpose: a retry would re-send template messages that already went out.
     """
     import datetime as _dt
 
     from modules.base.models import Partner
     from modules.whatsapp.models import WhatsAppTemplate
-    from qurtoba.services.daily_totals import partners_active_on, reporting_day
+    from qurtoba.services.daily_totals import partners_chatted_on, reporting_day
 
     day = _dt.date.fromisoformat(report_date) if report_date else reporting_day()
-
-    template_name = getattr(
-        settings, 'QURTOBA_DAILY_REMINDER_TEMPLATE', QURTOBA_DAILY_REMINDER_TEMPLATE,
-    )
-    statement_name = getattr(settings, 'QURTOBA_DAILY_STATEMENT_TEMPLATE', QURTOBA_DAILY_STATEMENT_TEMPLATE)
-    template = (
-        WhatsAppTemplate.objects
-        .filter(template_name=statement_name, status='approved', header_format='DOCUMENT')
-        .first()
-    )
-    with_statement = template is not None
-    if template is None:
-        template = (
-            WhatsAppTemplate.objects
-            .filter(template_name=template_name, status='approved')
-            .first()
-        )
-    if template is None:
-        logger.warning(
-            '[Qurtoba Daily] no APPROVED template named %r or %r — nothing sent for %s. '
-            'Create it and get Meta approval first.', statement_name, template_name, day,
-        )
+    text_name = getattr(settings, 'QURTOBA_DAILY_REMINDER_TEMPLATE', QURTOBA_DAILY_REMINDER_TEMPLATE)
+    file_name = getattr(settings, 'QURTOBA_DAILY_FILE_TEMPLATE', QURTOBA_DAILY_FILE_TEMPLATE)
+    text_template = WhatsAppTemplate.objects.filter(template_name=text_name, status='approved').first()
+    file_template = (WhatsAppTemplate.objects
+                     .filter(template_name=file_name, status='approved', header_format='DOCUMENT').first())
+    names = {'text_template': getattr(text_template, 'template_name', None),
+             'file_template': getattr(file_template, 'template_name', None)}
+    if text_template is None and file_template is None:
+        logger.warning('[Qurtoba Daily] neither %r nor %r is APPROVED — nothing sent for %s', text_name, file_name, day)
         return {'sent': 0, 'reason': 'template_not_approved', 'report_date': str(day)}
+    if text_template is None:
+        logger.warning('[Qurtoba Daily] %r is not approved — only the statement file goes out for %s', text_name, day)
+    if file_template is None:
+        logger.info('[Qurtoba Daily] %r is not approved yet — only the summary text goes out for %s', file_name, day)
 
-    if with_statement:
-        from qurtoba.services.daily_totals import partners_for_day_statement
-        partner_ids = partners_for_day_statement(day)
-    else:
-        partner_ids = partners_active_on(day)
+    partner_ids = partners_chatted_on(day)
     if not partner_ids:
-        logger.info('[Qurtoba Daily] no phone requested a transaction on %s — nothing to send', day)
-        return {'sent': 0, 'reason': 'empty_audience', 'report_date': str(day)}
+        logger.info('[Qurtoba Daily] nobody wrote to us on %s — nothing to send', day)
+        return {'sent': 0, 'reason': 'empty_audience', 'report_date': str(day), **names}
 
-    # A partner with no Qurtoba link would render «—» for the account name and
-    # a zero balance, which reads as broken. Skip rather than send that.
-    sendable = list(
-        Partner.objects
-        .filter(id__in=partner_ids, qurtoba_customer__isnull=False)
-        .values_list('id', flat=True)
-    )
+    # A partner with no Qurtoba link would render «—» for the account name and a zero balance.
+    sendable = list(Partner.objects.filter(id__in=partner_ids, qurtoba_customer__isnull=False)
+                    .values_list('id', flat=True))
     skipped = len(partner_ids) - len(sendable)
-    if skipped:
-        logger.info('[Qurtoba Daily] skipped %d unlinked partner(s) for %s', skipped, day)
-
     if not sendable:
-        return {'sent': 0, 'reason': 'no_linked_partners', 'report_date': str(day)}
+        return {'sent': 0, 'reason': 'no_linked_partners', 'report_date': str(day), **names}
 
     if dry_run:
-        logger.info('[Qurtoba Daily] DRY RUN for %s — would send %s to %s', day, template.template_name, sendable)
-        return {'sent': 0, 'reason': 'dry_run', 'report_date': str(day), 'template': template.template_name,
-                'with_statement': with_statement, 'would_send_to': sendable, 'skipped_unlinked': skipped}
+        logger.info('[Qurtoba Daily] DRY RUN for %s — %s to %s', day, names, sendable)
+        return {'sent': 0, 'reason': 'dry_run', 'report_date': str(day), **names,
+                'would_send_to': sendable, 'skipped_unlinked': skipped}
 
-    sender_partner = _reminder_sender_partner(template)
+    sender_partner = _reminder_sender_partner(text_template or file_template)
     if sender_partner is None:
-        logger.error('[Qurtoba Daily] no sender partner resolvable for account %s — nothing sent',
-                     template.whatsapp_account_id)
-        return {'sent': 0, 'reason': 'no_sender_partner', 'report_date': str(day)}
+        logger.error('[Qurtoba Daily] no sender partner resolvable — nothing sent for %s', day)
+        return {'sent': 0, 'reason': 'no_sender_partner', 'report_date': str(day), **names}
 
-    if with_statement:
-        queued, failed = _dispatch_statement_reminders(template, sendable, sender_partner, day)
-        logger.info('[Qurtoba Daily] queued %d statement reminder(s) for %s (%d failed to build)',
-                    queued, day, len(failed))
-        return {'sent': queued, 'report_date': str(day), 'skipped_unlinked': skipped,
-                'template': template.template_name, 'with_statement': True, 'failed': failed}
-
-    from modules.whatsapp.tasks import process_bulk_whatsapp_template_sending
-    process_bulk_whatsapp_template_sending.delay(
-        template_id=template.id,
-        contact_ids=sendable,
-        sender_partner_id=sender_partner.id,
-    )
-    logger.info('[Qurtoba Daily] queued %d reminder(s) for %s', len(sendable), day)
-    return {'sent': len(sendable), 'report_date': str(day), 'skipped_unlinked': skipped,
-            'template': template.template_name, 'with_statement': False}
+    result = _dispatch_daily_messages(text_template, file_template, sendable, sender_partner, day)
+    logger.info('[Qurtoba Daily] %s for %s: %d summary text(s) and %d statement file(s) queued, %d failed',
+                names, day, result['texts'], result['files'], len(result['failed']))
+    return {'sent': len(sendable), 'report_date': str(day), 'skipped_unlinked': skipped, **names, **result}
 
 
 def build_customer_day_statement(customer, day):
@@ -1703,43 +1674,61 @@ def build_customer_day_statement(customer, day):
     return xlsx, url, display_name
 
 
-def _dispatch_statement_reminders(template, partner_ids, sender_partner, day):
-    """One template send per recipient with the customer's statement file in the DOCUMENT header.
+def _dispatch_daily_messages(text_template, file_template, partner_ids, sender_partner, day):
+    """Per recipient: the summary text first, then, as its own message a few seconds later, the Excel
+    statement alone. Either template may be None (not approved yet) and is then skipped.
 
-    The core bulk sender renders one header for everybody (the template's sample file), so
-    the per-customer file is attached here and each send is scheduled straight on the core
-    per-message task — which sends it, records the chat message and retries a failed send.
-    The file is built once per customer and shared by all of that customer's numbers.
+    Every send is scheduled on the core per-message task, which sends it, records the chat message and retries
+    a failed send. One file is built per customer per day and shared by that customer's numbers. Recipients are
+    spaced so each pair arrives in order and pairs never interleave.
     """
     from modules.base.models import Partner
     from modules.whatsapp.tasks import _build_template_params, process_sending_whatsapp_template
     from modules.whatsapp.utils.phone import resolve_delivery_partner
 
-    account = template.whatsapp_account
-    queued, failed = 0, []
-    files = {}                                   # customer id → (url, display name)
-    for index, pid in enumerate(partner_ids):
+    texts, files, failed = 0, 0, []
+    statement_files = {}                         # customer id → (url, display name)
+    for slot, pid in enumerate(partner_ids):
+        base = slot * QURTOBA_DAILY_PAIR_SPACING_S
         try:
             contact = Partner.objects.select_related('qurtoba_customer').get(id=pid)
-            customer = contact.qurtoba_customer
-            if customer.pk not in files:
-                _xlsx, url, display_name = build_customer_day_statement(customer, day)
-                if not url:
-                    raise RuntimeError('no public media URL for the statement file')
-                files[customer.pk] = (url, display_name)
-            url, display_name = files[customer.pk]
-            message_content, body_params, _header = _build_template_params(template, contact)
-            header_params = [{'type': 'document', 'url': url, 'filename': display_name}]
-            receiver = resolve_delivery_partner(contact, account)
-            process_sending_whatsapp_template.apply_async(
-                args=[template.id, receiver.id, sender_partner.id, message_content, body_params, header_params, None],
-                countdown=index * QURTOBA_DAILY_STATEMENT_SPACING_S,
-            )
-            queued += 1
         except Exception as exc:  # noqa: BLE001 — one bad recipient must not stop the rest
-            logger.exception('[Qurtoba Daily] statement for partner %s failed: %s', pid, exc)
-            failed.append({'partner_id': pid, 'error': str(exc)[:200]})
-    return queued, failed
+            failed.append({'partner_id': pid, 'part': 'contact', 'error': str(exc)[:200]})
+            continue
+        if text_template is not None:
+            try:
+                receiver = resolve_delivery_partner(contact, text_template.whatsapp_account)
+                message_content, body_params, header_params = _build_template_params(text_template, contact)
+                process_sending_whatsapp_template.apply_async(
+                    args=[text_template.id, receiver.id, sender_partner.id, message_content, body_params,
+                          header_params, None],
+                    countdown=base,
+                )
+                texts += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.exception('[Qurtoba Daily] summary text for partner %s failed: %s', pid, exc)
+                failed.append({'partner_id': pid, 'part': 'text', 'error': str(exc)[:200]})
+        if file_template is not None:
+            try:
+                customer = contact.qurtoba_customer
+                if customer.pk not in statement_files:
+                    _xlsx, url, display_name = build_customer_day_statement(customer, day)
+                    if not url:
+                        raise RuntimeError('no public media URL for the statement file')
+                    statement_files[customer.pk] = (url, display_name)
+                url, display_name = statement_files[customer.pk]
+                receiver = resolve_delivery_partner(contact, file_template.whatsapp_account)
+                message_content, body_params, _header = _build_template_params(file_template, contact)
+                process_sending_whatsapp_template.apply_async(
+                    args=[file_template.id, receiver.id, sender_partner.id, message_content, body_params,
+                          [{'type': 'document', 'url': url, 'filename': display_name}], None],
+                    countdown=base + QURTOBA_DAILY_FILE_DELAY_S,
+                )
+                files += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.exception('[Qurtoba Daily] statement file for partner %s failed: %s', pid, exc)
+                failed.append({'partner_id': pid, 'part': 'file', 'error': str(exc)[:200]})
+    return {'texts': texts, 'files': files, 'failed': failed}
 
 
 @shared_task(bind=True, max_retries=0, name='qurtoba.tasks.sync_missing_qurtoba_records')

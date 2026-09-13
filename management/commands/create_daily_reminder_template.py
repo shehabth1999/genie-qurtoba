@@ -16,7 +16,9 @@ from django.core.management.base import BaseCommand, CommandError
 
 
 TEMPLATE_NAME = 'qurtoba_daily_summary'
-STATEMENT_TEMPLATE_NAME = 'qurtoba_daily_statement_xlsx'   # same body, the day's Excel statement as the header
+STATEMENT_TEMPLATE_NAME = 'qurtoba_daily_statement_xlsx'   # RETIRED 2026-09-14: text + file in one message
+FILE_TEMPLATE_NAME = 'qurtoba_daily_statement_file'        # the Excel statement ALONE, its own message
+FILE_BODY = '📎 كشف حساب نهاية اليوم'                       # Meta requires a body; one static line, no variables
 DEFAULT_ACCOUNT_PHONE = '201006003836'  # محاسب قرطبة
 
 HEADER = 'كشف نهاية اليوم'
@@ -91,6 +93,10 @@ class Command(BaseCommand):
                                  'a wording or variable change needs a NEW name.')
         parser.add_argument('--submit', action='store_true',
                             help='Also submit it to Meta for approval instead of leaving a draft.')
+        parser.add_argument('--file-only', action='store_true',
+                            help=f'Build the file-only template ({FILE_TEMPLATE_NAME}): a DOCUMENT header carrying the '
+                                 'day\'s Excel statement and a single static body line, sent as its own message after '
+                                 'the summary text. The text template is left untouched.')
         parser.add_argument('--document', action='store_true',
                             help=f'Build the DOCUMENT-header variant ({STATEMENT_TEMPLATE_NAME}) as a SECOND template: '
                                  'the same body, with the day\'s full Excel statement attached as the header. A sample '
@@ -117,7 +123,7 @@ class Command(BaseCommand):
 
         partner_ct = ContentType.objects.get_for_model(Partner)
 
-        body = BODY
+        body = FILE_BODY if opts['file_only'] else BODY
         _validate_placeholders(body, Partner)
 
         if opts['preview']:
@@ -127,6 +133,8 @@ class Command(BaseCommand):
         name = opts['name']
         if opts['document'] and name == TEMPLATE_NAME:
             name = STATEMENT_TEMPLATE_NAME
+        if opts['file_only'] and name == TEMPLATE_NAME:
+            name = FILE_TEMPLATE_NAME
         template = WhatsAppTemplate.objects.filter(
             whatsapp_account=account, name=name, language=language,
         ).first()
@@ -139,7 +147,7 @@ class Command(BaseCommand):
         template.template_name = name
         template.category = 'utility'
         template.status = 'draft'
-        if opts['document']:
+        if opts['document'] or opts['file_only']:
             template.header_format = 'DOCUMENT'
             template.header_content = None
             template.header_media = self._sample_statement_attachment()
@@ -147,7 +155,7 @@ class Command(BaseCommand):
             template.header_format = 'TEXT'
             template.header_content = HEADER
         template.body_text = body
-        template.footer_text = FOOTER
+        template.footer_text = '' if opts['file_only'] else FOOTER
         template.content_type = partner_ct   # "apply to" — resolves {{vars}} off Partner
 
         # Deliberately a full save(), not update_or_create(). Django passes

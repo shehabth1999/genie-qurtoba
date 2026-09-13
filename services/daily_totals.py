@@ -79,49 +79,35 @@ def partner_day_totals(partner, day: Optional[datetime.date] = None) -> dict:
     }
 
 
-def partners_active_on(day: Optional[datetime.date] = None):
-    """Partner ids the end-of-day reminder goes to: every linked number that was
-    ACTIVE with us on `day` — it created a record through the chat (any value,
-    including a transfer that was later cancelled or zeroed) OR it sent us at
-    least one WhatsApp message that day.
+def partners_chatted_on(day: Optional[datetime.date] = None):
+    """Partner ids the end-of-day messages go to: every Qurtoba-linked number that sent US at least one
+    WhatsApp message on `day`, and nobody else.
 
-    Until 2026-09-05 only numbers with a record of value > 0 qualified, so a
-    customer who chatted with us but whose transfer bounced (value 0) — or who
-    only asked for the balance — got no summary. The office reported that as
-    a bug: whoever talked to us that day gets the day's summary, even if the
-    totals read 0.
+    Owner decision 2026-09-14. Until then the Excel statement went to every linked number whose CUSTOMER had
+    any record that day, including rows the office keyed into Qurtoba itself: 7 statements a night while only
+    1 or 2 of those customers had written to us. A record alone never qualifies a number now, neither an office
+    row nor a chat-born record dated that day without a message that day. Both nightly messages, the summary
+    text and the Excel file, use this one list, so they always reach exactly the same people.
     """
-    from django.utils import timezone
     from modules.chat.models import Message
-    from qurtoba.models import QurtobaRecord
 
     if day is None:
         day = reporting_day()
-
-    by_record = set(
-        QurtobaRecord.objects
-        .filter(partner__isnull=False, date=day)
-        # .order_by() clears the model's Meta ordering ('-date', '-time').
-        # Without it those columns join the SELECT to satisfy ORDER BY, and
-        # DISTINCT then dedupes on (partner_id, date, time) — handing back the
-        # same partner once per record.
-        .order_by()
-        .values_list('partner_id', flat=True)
-        .distinct()
-    )
     tz = timezone.get_current_timezone()
     start = datetime.datetime.combine(day, datetime.time.min, tzinfo=tz)
     end = start + datetime.timedelta(days=1)
-    by_chat = set(
-        Message.objects_all
-        .filter(direction='inbound', created_at__gte=start, created_at__lt=end,
-                conversation__type='whatsapp',
-                conversation__social_partner__qurtoba_customer__isnull=False)
-        .order_by()
-        .values_list('conversation__social_partner_id', flat=True)
-        .distinct()
+    return sorted(
+        pid for pid in (
+            Message.objects_all
+            .filter(direction='inbound', created_at__gte=start, created_at__lt=end,
+                    conversation__type='whatsapp',
+                    conversation__social_partner__qurtoba_customer__isnull=False)
+            # .order_by() clears Meta ordering so DISTINCT dedupes on the partner id alone.
+            .order_by()
+            .values_list('conversation__social_partner_id', flat=True)
+            .distinct()
+        ) if pid
     )
-    return sorted(pid for pid in (by_record | by_chat) if pid)
 
 
 # Arabic day and month names, spelled the way the office writes them (plain
@@ -160,30 +146,3 @@ def fmt_amount(value) -> str:
         return '0'
 
 
-def partners_for_day_statement(day: Optional[datetime.date] = None):
-    """Who gets the end-of-day STATEMENT (the Excel one): everyone in
-    partners_active_on(day), plus every linked number that has talked to us before
-    (has a WhatsApp conversation) whose CUSTOMER had any record that day from another
-    number or from the office — the file shows the whole account, so a customer whose
-    day happened on their other number or inside Qurtoba still gets it (2026-09-08)."""
-    from modules.base.models import Partner
-    from modules.chat.models import Conversation
-    from qurtoba.models import QurtobaRecord
-
-    if day is None:
-        day = reporting_day()
-    active = set(partners_active_on(day))
-    customers = set(
-        QurtobaRecord.objects.filter(date=day).order_by().values_list('customer_id', flat=True).distinct()
-    )
-    if not customers:
-        return sorted(active)
-    with_chat = set(
-        Conversation.objects.filter(type='whatsapp', social_partner__qurtoba_customer_id__in=customers)
-        .order_by().values_list('social_partner_id', flat=True).distinct()
-    )
-    linked = set(
-        Partner.objects.filter(id__in=with_chat, qurtoba_customer_id__in=customers)
-        .values_list('id', flat=True)
-    )
-    return sorted(pid for pid in (active | linked) if pid)
