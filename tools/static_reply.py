@@ -78,6 +78,8 @@ def qurtoba_send_static_message(
     return {
         'success': True,
         'sent_text': text,
-        'conversation_id': conv.pk,
+        # A str, never the UUID itself: a tool node's result is saved with the run, and a raw UUID failed that
+        # save — the run crashed, was retried and sent the notice twice (conversation fd4a2734, 2026-09-10).
+        'conversation_id': str(conv.pk),
         'note': 'Static message dispatched to the chat (channel delivery + WebSocket push).',
     }

@@ -52,6 +52,15 @@ WAIT = 'لحظة'
 # internal note mentioning the staff, notifies them like a receipt waiting for review, and sends the customer
 # this ONE short line (owner decision 2026-09-13).
 SPLIT_RECEIVED = 'تمام ✅ طلب التقسيم وصل وهيتنفذ يدوي.'
+
+# A request that reached us while offline was cancelled on arrival; asking to execute it later gets this line
+# (owner decision 2026-09-14). Only a request sent again NOW is executed.
+OFFLINE_CANCELLED_OFF_HOURS = 'الطلب ده وصل وإحنا خارج مواعيد العمل واتلغى — لو لسه محتاجه ابعته تاني دلوقتي وهيتنفذ فوراً.'
+OFFLINE_CANCELLED_AI_OFF = 'الطلب ده وصل والخدمة متوقفة واتلغى — لو لسه محتاجه ابعته تاني دلوقتي وهيتنفذ فوراً.'
+OFFLINE_CANCELLED_PAYMENT_OFF_HOURS = 'الإيصال ده وصل وإحنا خارج مواعيد العمل واتلغى — ابعت صورة الإيصال تاني دلوقتي علشان يتسجل.'
+OFFLINE_CANCELLED_PAYMENT_AI_OFF = 'الإيصال ده وصل والخدمة متوقفة واتلغى — ابعت صورة الإيصال تاني دلوقتي علشان يتسجل.'
+OFFLINE_CANCELLED_NOT_LINKED = 'الطلب ده وصل قبل ربط حسابك بقرطبة واتلغى — لو لسه محتاجه ابعته تاني دلوقتي وهيتنفذ فوراً.'
+OFFLINE_CANCELLED_PAYMENT_NOT_LINKED = 'الإيصال ده وصل قبل ربط حسابك بقرطبة واتلغى — ابعت صورة الإيصال تاني دلوقتي علشان يتسجل.'
 PER_NUMBER_QUESTION = 'تقصد {amount} لكل رقم، ولا تقسيمه عليهم؟'
 NOT_UNDERSTOOD = 'مش فاهم الرسالة دي — ابعت الرقم في سطر والمبلغ في سطر'
 SAY_AGAIN_SIMPLER = 'ابعت الرقم في سطر والمبلغ في سطر تحته، وأنا أنفذ على طول.'

@@ -337,6 +337,9 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     rows = {str(m.id): m for m in older}
     for m in batch_rows:
         rows.setdefault(str(m.id), m)
+    # A request cancelled on arrival while we were offline is not open, it was refused: a replayed turn or a
+    # stranded-message recovery must never plan it again (owner decision 2026-09-14).
+    rows = {mid: m for mid, m in rows.items() if not getattr(m, 'qurtoba_offline_cancelled_at', None)}
 
     pre_items: List[Dict[str, Any]] = []
     pre_replies: List[tuple] = []

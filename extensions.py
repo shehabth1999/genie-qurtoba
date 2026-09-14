@@ -353,6 +353,20 @@ class MessageQurtobaExtension(ModelExtension):
         verbose_name=_('Qurtoba Record'),
     )
 
+    # CANCELLED ON ARRIVAL (owner decision 2026-09-14): set on every inbound message of a turn handled while
+    # we were offline — the manual off-hours switch was on ('off_hours'), the AI was switched off ('ai_off'), or
+    # the WhatsApp number was not linked to any Qurtoba customer yet ('not_linked').
+    # Such a request was refused on the spot and can never become a transfer or a payment later: the create
+    # tools refuse it as a source (qurtoba.switches.offline_cancellation) and the money path never re-plans it.
+    qurtoba_offline_cancelled_at = models.DateTimeField(
+        null=True, blank=True,
+        verbose_name=_('Cancelled while offline at'),
+    )
+    qurtoba_offline_reason = models.CharField(
+        max_length=20, null=True, blank=True,
+        verbose_name=_('Offline reason'),
+    )
+
     # `social_sent_at` (the provider's true send time, used to order inbound WhatsApp bursts)
     # is now a core chat.Message field — no longer declared here. `ingest_seq` was dropped:
     # its only purpose was to guess sub-second order, which is unrecoverable, so the planner

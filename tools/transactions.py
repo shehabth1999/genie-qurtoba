@@ -667,6 +667,23 @@ def _create_one_debt(
         else:
             account_corrected = bool(_raw_in and _raw_in != final_account)
 
+    # OFFLINE LOCK (owner decision 2026-09-14): a request that reached us while the office was closed or the AI was
+    # switched off was cancelled on arrival. It never becomes a transfer later — not when the customer quotes it,
+    # not when a run is replayed. Checked on the cited message, or the one the tool itself found above. Staff
+    # approvals (override_grade_limit) are not affected.
+    if not override_grade_limit:
+        from qurtoba.switches import offline_cancellation
+        _lock_id = src or correction_src_id
+        _lock = offline_cancellation(_lock_id) if _lock_id else None
+        if _lock:
+            return {
+                'success': False,
+                'error_type': 'offline_cancelled',
+                'error': _lock['reply'],
+                'offline_reason': _lock['reason'],
+                'cancelled_message_id': str(_lock_id),
+            }
+
     # Pre-check: is this type enabled on the current WhatsApp account?
     allowed, disabled_msg = _check_type_allowed_for_account(conversation, type)
     if not allowed:
@@ -1700,6 +1717,18 @@ def qurtoba_register_customer_payment(
             'success': False,
             'error_type': 'screenshot_invalid',
             'error': 'الرسالة المرجعية للإيصال غير موجودة في هذه المحادثة.',
+        }
+
+    # OFFLINE LOCK: a receipt sent while we were offline was cancelled on arrival (owner decision 2026-09-14).
+    from qurtoba.switches import offline_cancellation
+    _lock = offline_cancellation(str(msg.id))
+    if _lock:
+        return {
+            'success': False,
+            'error_type': 'offline_cancelled',
+            'error': _lock['reply_payment'],
+            'offline_reason': _lock['reason'],
+            'cancelled_message_id': str(msg.id),
         }
 
     chat_attachment = getattr(msg, 'attachment', None)

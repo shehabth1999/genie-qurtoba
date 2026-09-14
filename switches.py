@@ -97,3 +97,46 @@ def _log(event: str, conversation, **fields) -> None:
         log_event(event, conversation=conversation, **fields)
     except Exception:
         pass
+
+
+# ── cancelled on arrival while offline (owner decision 2026-09-14) ───────────────────────────────────────────
+
+def mark_offline_cancelled(conversation, message_ids, reason: str) -> int:
+    """Stamp the inbound messages of a turn handled while offline as CANCELLED ON ARRIVAL.
+
+    `reason` is 'off_hours', 'ai_off' or 'not_linked'. Uses ``.update()`` so no signal fires. Never raises."""
+    ids = [str(i) for i in (message_ids or []) if i]
+    if not ids or conversation is None:
+        return 0
+    try:
+        from django.utils import timezone
+        from modules.chat.models import Message
+        return (Message.objects_all
+                .filter(conversation=conversation, id__in=ids, direction='inbound', qurtoba_offline_cancelled_at__isnull=True)
+                .update(qurtoba_offline_cancelled_at=timezone.now(), qurtoba_offline_reason=reason))
+    except Exception:
+        logger.warning('qurtoba.switches: could not mark messages cancelled while offline', exc_info=True)
+        return 0
+
+
+def offline_cancellation(message_id) -> Optional[Dict[str, str]]:
+    """When `message_id` was cancelled on arrival while offline: {'reason', 'reply', 'reply_payment'} with the
+    customer-facing lines. Otherwise None. A failed read returns None: the watermark and the switches still
+    stand, and this lock must never take the create tools down."""
+    if not message_id:
+        return None
+    try:
+        from modules.chat.models import Message
+        row = (Message.objects_all.filter(id=str(message_id).strip())
+               .values('qurtoba_offline_cancelled_at', 'qurtoba_offline_reason').first())
+    except Exception:
+        return None
+    if not row or not row.get('qurtoba_offline_cancelled_at'):
+        return None
+    from qurtoba.automation import replies as R
+    reason = row.get('qurtoba_offline_reason') or 'off_hours'
+    if reason == 'ai_off':
+        return {'reason': reason, 'reply': R.OFFLINE_CANCELLED_AI_OFF, 'reply_payment': R.OFFLINE_CANCELLED_PAYMENT_AI_OFF}
+    if reason == 'not_linked':
+        return {'reason': reason, 'reply': R.OFFLINE_CANCELLED_NOT_LINKED, 'reply_payment': R.OFFLINE_CANCELLED_PAYMENT_NOT_LINKED}
+    return {'reason': reason, 'reply': R.OFFLINE_CANCELLED_OFF_HOURS, 'reply_payment': R.OFFLINE_CANCELLED_PAYMENT_OFF_HOURS}

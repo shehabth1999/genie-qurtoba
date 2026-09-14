@@ -76,10 +76,60 @@ def ai_off_node(input_data, conversation, partner) -> str:
         from .router import load_batch_rows
         ids = [str(m.id) for m in load_batch_rows(conversation, input_data)]
         n = consume(conversation, ids)
+        from qurtoba.switches import mark_offline_cancelled
+        mark_offline_cancelled(conversation, ids, 'ai_off')      # cancelled on arrival: never a transfer later
         log('ai_off_consumed', conversation, count=n, batch=[i[:8] for i in ids])
     except Exception as exc:
         logger.exception('automation ai_off failed')
         log('node_error', conversation, node='ai_off', error=str(exc)[:200])
+    return ''
+
+
+NOT_LINKED_ONCE_MINUTES = 60
+
+
+def _text_sent_recently(conversation, text: str, minutes: int) -> bool:
+    """True when this exact outbound text already went to this conversation within `minutes`."""
+    from datetime import timedelta
+    from django.utils import timezone
+    from modules.chat.models import Message
+    want = ' '.join(str(text).split())
+    for m in (Message.objects_all.filter(conversation=conversation, direction='outbound', type='text',
+                                         created_at__gte=timezone.now() - timedelta(minutes=minutes))
+              .order_by('-created_at')[:30]):
+        c = m.content if isinstance(m.content, dict) else {}
+        if ' '.join(str(c.get('text') or '').split()) == want:
+            return True
+    return False
+
+
+def not_linked_node(input_data, conversation, partner) -> str:
+    """The WhatsApp number is not linked to any Qurtoba customer. Nothing runs; the office's notice goes out ONCE
+    per conversation per hour — a retried or parallel run can never send it twice (2026-09-10, conversation
+    fd4a2734: a crashed run was retried and the notice went out twice); every message of the turn is marked
+    handled and CANCELLED ON ARRIVAL, so linking the account later never turns it into a transfer
+    (owner decision 2026-09-14)."""
+    from django.core.cache import cache
+    from . import replies as R
+    from .context import consume, send_plain
+    try:
+        from .router import load_batch_rows
+        ids = [str(m.id) for m in load_batch_rows(conversation, input_data)]
+        key = f'qurtoba:not_linked_notice:{conversation.id}'
+        if cache.add(key, 1, NOT_LINKED_ONCE_MINUTES * 60):
+            if _text_sent_recently(conversation, R.NOT_LINKED, NOT_LINKED_ONCE_MINUTES):
+                log('not_linked_notice_skip', conversation, why='already_in_chat')
+            elif not send_plain(conversation, R.NOT_LINKED):
+                cache.delete(key)                 # not delivered: the next message may try again
+        else:
+            log('not_linked_notice_skip', conversation, why='sent_this_hour')
+        consume(conversation, ids)
+        from qurtoba.switches import mark_offline_cancelled
+        mark_offline_cancelled(conversation, ids, 'not_linked')
+        log('not_linked', conversation, batch=[i[:8] for i in ids])
+    except Exception as exc:
+        logger.exception('automation not_linked failed')
+        log('node_error', conversation, node='not_linked', error=str(exc)[:200])
     return ''
 
 
@@ -134,6 +184,8 @@ def off_hours_node(input_data, conversation, partner) -> str:
         if mid and not said_recently(conversation, mid, R.OFF_HOURS, minutes=120):
             send_quoted(conversation, mid, R.OFF_HOURS)
         consume(conversation, route.get('batch_ids') or [])
+        from qurtoba.switches import mark_offline_cancelled
+        mark_offline_cancelled(conversation, route.get('batch_ids') or [], 'off_hours')
     except Exception as exc:
         logger.exception('automation off-hours failed')
         log('node_error', conversation, node='off_hours', error=str(exc)[:200])
@@ -284,6 +336,8 @@ def off_hours_done_node(input_data, conversation, partner) -> str:
                 send_quoted(conversation, mid, R.OFF_HOURS)
             log('off_hours_fallback', conversation, mid=str(mid)[:8])
         consume(conversation, ids)
+        from qurtoba.switches import mark_offline_cancelled
+        mark_offline_cancelled(conversation, ids, 'off_hours')   # cancelled on arrival: never a transfer later
     except Exception as exc:
         logger.exception('automation off-hours done failed')
         log('node_error', conversation, node='off_hours_done', error=str(exc)[:200])
@@ -302,6 +356,7 @@ def _code(fn: str) -> str:
 
 NODE_CODE = {
     'function_gate': _code('gate_node'),
+    'function_not_linked': _code('not_linked_node'),
     'function_ai_off': _code('ai_off_node'),
     'function_route': _code('route_node'),
     'function_transfers': _code('transfers_node'),

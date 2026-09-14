@@ -145,8 +145,6 @@ def build_spec(src_nodes, tool_ids):
     off_hours['description'] = ('Off-hours agent: balance and statement only; refuses every transfer, payment, status check '
                                 'and cancellation with the working hours. Has no tool that can create money.')
 
-    not_linked = src_cfg(SRC_NOT_LINKED_TOOL)
-    not_linked['arguments'] = {'message': R.NOT_LINKED}
 
     X0, X1, X2, X3, X4, X5, X6, X7 = 0, 320, 640, 960, 1280, 1600, 1920, 2240
     nodes = [
@@ -163,7 +161,7 @@ def build_spec(src_nodes, tool_ids):
              configuration={'conditions': [{'operator': 'is_true', 'data_type': 'boolean',
                                             'variable1': '{{partner.has_qurtoba_customer}}', 'variable2': ''}],
                             'default_branch': 'default'}),
-        dict(node_id='tool_not_linked', node_type='tool', label='not linked → static notice', x=X1, y=560, configuration=not_linked),
+        _fn('function_not_linked', 'NOT LINKED: notice once, messages cancelled on arrival', X1, 560, NODE_CODE['function_not_linked']),
         _fn('function_route', 'ROUTE: off-hours switch? receipt image? else money', X1, 300, NODE_CODE['function_route']),
         dict(node_id='conditional_route', node_type='conditional', label='receipt / off-hours / money', x=X2, y=300,
              configuration={'conditions': [
@@ -195,7 +193,7 @@ def build_spec(src_nodes, tool_ids):
         ('conditional_ai_enabled', 'conditional_linked', '1'),
         ('conditional_ai_enabled', 'function_ai_off', '0'),
         ('conditional_linked', 'function_route', '1'),
-        ('conditional_linked', 'tool_not_linked', '0'),
+        ('conditional_linked', 'function_not_linked', '0'),
         ('function_route', 'conditional_route', ''),
         ('conditional_route', AVAILABILITY_NODE, '1'),
         ('conditional_route', 'function_off_hours_context', '2'),
