@@ -60,9 +60,54 @@ def pending_state(conversation) -> Dict[str, Any]:
     rep = _list_repeat_pending(conversation) or {}
     if rep:
         out['repeat'] = [{'account_number': v.get('account_number'), 'value': v.get('value'), 'type': v.get('type'),
-                          'source_message_id': v.get('source_message_id')}
+                          'source_message_id': v.get('source_message_id'), 'asked_ts': v.get('asked_ts')}
                          for v in rep.values() if isinstance(v, dict)]
     return out
+
+
+def _question_time(conversation, st: Dict[str, Any]) -> Optional[float]:
+    """Unix time of the most recent question behind what is held, or None when unknown."""
+    ts: List[float] = []
+    for k in ('correction', 'list'):
+        m = st.get(k)
+        if m and m.get('ts'):
+            ts.append(float(m['ts']))
+    for r in st.get('repeat') or []:
+        if r.get('asked_ts'):
+            ts.append(float(r['asked_ts']))
+    if st.get('high_value'):
+        try:
+            from modules.chat.models import Message
+            q = (Message.objects_all.filter(conversation=conversation, direction='outbound', type='text', active=True,
+                                            content__text__startswith='مبلغ كبير')
+                 .order_by('-created_at').first())
+            if q is not None:
+                ts.append(q.created_at.timestamp())
+        except Exception:
+            pass
+    return max(ts) if ts else None
+
+
+def _answer_gate(conversation, st: Dict[str, Any], newest) -> Optional[str]:
+    """Why a yes/no must NOT be applied now — the reason, or None when it may.
+
+    Money moves on the customer's word, never on the model's: there must be an inbound message
+    newer than our question, and it must not itself be a new number/amount (that is a request,
+    not an answer). 2026-09-17 23:48 (chat 13f58d64): the model answered its own repeat question
+    with «yes» six seconds after asking; the next unrelated message then released 26,900."""
+    if not st:
+        return None
+    if newest is None:
+        return 'no customer message to read as an answer'
+    asked = _question_time(conversation, st)
+    if asked is not None and newest.created_at.timestamp() <= asked:
+        return 'the customer has not answered yet — nothing newer than the question; wait for their reply'
+    from qurtoba.tools.planning import _classify_message
+    txt = (newest.content or {}).get('text', '') if isinstance(newest.content, dict) else ''
+    cls = _classify_message(txt)
+    if cls['phones'] or cls['amounts']:
+        return 'the newest message is a new number/amount, not an answer — handle it as a request; the hold stays'
+    return None
 
 
 def describe(conversation) -> List[str]:
@@ -108,6 +153,12 @@ def answer_pending(conversation, partner, decision: str, answer_message_id: Opti
     # message, not about what we are holding («تأكيد» quoted on a different transfer).
     held_src = (st.get('correction') or {}).get('source_message_id') or (st.get('high_value') or {}).get('source_message_id')
     newest = _newest_inbound(conversation)
+    why_not = _answer_gate(conversation, st, newest)
+    if why_not:
+        result.update(success=False, error_type='no_customer_answer', note=why_not,
+                      kind=next((k for k in ('correction', 'list', 'high_value', 'repeat') if st.get(k)), 'none'))
+        log('pending_answer', conversation, kind='no_customer_answer', yes=yes, why=why_not[:80])
+        return result
     q = getattr(newest, 'reply_to', None) if newest is not None else None
     if yes and st and q is not None and getattr(q, 'direction', None) == 'inbound' and held_src and str(q.id) != str(held_src):
         result['note'] = ('the reply quotes another customer message, not the held one — ask what they mean '
@@ -174,10 +225,20 @@ def answer_pending(conversation, partner, decision: str, answer_message_id: Opti
     if st.get('repeat'):
         result['kind'] = 'repeat'
         if yes:
-            res = call_tool(conversation, partner, qurtoba_confirm_pending_repeats)
-            result.update(handled=True, created=[{'account_number': c.get('account_number'), 'value': c.get('value')}
-                                                  for c in (res.get('created') or []) if isinstance(c, dict)],
-                          note='repeated the held transfer(s)')
+            # the model read the customer's words as a yes; the tool still refuses when the newest
+            # message is a request or older than the question (see _repeat_confirmation_verdict)
+            from qurtoba.tools.transactions import _REPEAT_MEANING_VERIFIED
+            _tok = _REPEAT_MEANING_VERIFIED.set(True)
+            try:
+                res = call_tool(conversation, partner, qurtoba_confirm_pending_repeats)
+            finally:
+                _REPEAT_MEANING_VERIFIED.reset(_tok)
+            made = [{'account_number': c.get('account_number'), 'value': c.get('value')}
+                    for c in (res.get('created') or []) if isinstance(c, dict)]
+            skipped = [s.get('reason') for s in (res.get('skipped') or []) if isinstance(s, dict)]
+            result.update(handled=bool(made), created=made,
+                          note='repeated the held transfer(s)' if made
+                          else f"nothing repeated ({', '.join(skipped) or 'no_pending'}); the hold stays — answer the customer's actual message")
         else:
             _clear_repeat_pending(conversation)
             # ALWAYS confirm a cancel: the customer's own message, else the number

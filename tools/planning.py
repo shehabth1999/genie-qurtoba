@@ -166,6 +166,16 @@ def _is_glued_name_label(tok: str) -> bool:
     return not _lead_is_amount_words(lead)    # unknown letters before the digit → a name label
 
 
+# a phone-length digit run (9+) glued to a letter on either side — «01080755798مبلغ», «رقم01012345678»
+_PHONE_GLUE_RES = (re.compile(r'(\d{9,})(?=[^\W\d_])'), re.compile(r'([^\W\d_])(?=\d{9,})'))
+
+
+def _unglue_phones(text: str) -> str:
+    for rx in _PHONE_GLUE_RES:
+        text = rx.sub(r'\1 ', text)
+    return text
+
+
 def _is_phone(s: str) -> Optional[str]:
     """Return the normalized 01XXXXXXXXX form if `s` is an Egyptian mobile, else None.
 
@@ -238,6 +248,10 @@ def _classify_message(text: str) -> Dict[str, Any]:
     """
     text = _merge_multiplier_lines(text or '')
     text = _ar_to_ascii(text)
+    # A phone glued to letters («01080755798مبلغ10700فدافون», chat 13f58d64 2026-09-18) is two tokens to
+    # a human and one 16-digit token to split(). Separate a phone-length digit run (9+) from the letters
+    # on either side; short runs stay glued so «عبدالله12» / «13300جنيه» / «30الف» parse as before.
+    text = _unglue_phones(text)
     ignored: List[Dict[str, str]] = []
 
     def _ignore(piece: str, reason: str) -> None:
@@ -336,6 +350,12 @@ def _classify_message(text: str) -> Dict[str, Any]:
                 _ignore(rest_text, 'fraction')
                 continue
             for tok, rr in toks:
+                if re.fullmatch(r'0\d{9,11}', tok) or _is_phone(tok):
+                    # a phone-shaped run inside the line is a (broken) number, never an amount —
+                    # «01080755798مبلغ10700» once yielded the amount 1,080,755,798 (2026-09-18)
+                    has_name = True
+                    _ignore(tok, 'broken_phone')
+                    continue
                 if rr['ok'] and float(rr['value']).is_integer():
                     amounts.append(rr['value'])
         elif re.sub(r'[\d\s.,+\-]', '', rest_text):

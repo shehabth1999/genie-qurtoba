@@ -34,6 +34,19 @@ PENDING_TTL = 3600
 
 # ── pure decision table ──────────────────────────────────────────────────────
 
+def _answer_needs_more(a: Dict[str, Any]) -> str:
+    """The line for a bare yes that answers a question asking for a value: what is still missing."""
+    import re
+    q = a.get('question_text') or ''
+    m = re.search(r'الرقم للمبلغ\s*([\d,\.]+)', q)
+    if m:
+        return R.NEED_NUMBER_FOR.format(amount=m.group(1))
+    m = re.search(r'المبلغ لـ\s*(\+?[\d ]{9,})', q)
+    if m:
+        return R.NEED_AMOUNT_FOR.format(phone=m.group(1).strip())
+    return R.UNCLEAR_ANSWER.format(text=(a.get('text') or '')[:20], question=q[:40])
+
+
 def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
            reroute: Optional[Dict[str, Any]], texts: Dict[str, str],
            accounts: Optional[List[tuple]] = None, list_pending: Optional[Dict[str, Any]] = None,
@@ -104,6 +117,11 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
                 list_confirm = False
             elif phone:
                 yes_phones.add(phone)                  # «تأكيد» on a held high value / a list pairing
+            else:
+                # «تمام» to a question that asked for a VALUE («الرقم للمبلغ 10,700؟») answers nothing:
+                # say what is still missing instead of ending the turn in silence (2026-09-18 15:43,
+                # chat 13f58d64: the 10,700 died there)
+                replies.append((a['message_id'], _answer_needs_more(a)))
             consumed.append(a['message_id'])
         elif L.is_bare_no(text):
             if repeat_pending:
@@ -117,6 +135,8 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
             elif phone:
                 no_phones.add(phone)
                 replies.append((a['message_id'], R.DECLINED))
+            else:
+                replies.append((a['message_id'], R.DECLINED))   # a «لا» to our question: the customer withdrew it
             consumed.append(a['message_id'])
         elif kind == 'amount_reply' and a.get('value') is not None and not a.get('applied_to'):
             continue                                   # the planner will have re-paired it next turn
@@ -404,8 +424,9 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             to_model.append({'message_id': mid, 'kind': 'multi_number', 'text': text[:200]})
             pre_consume.append(mid)
             continue
-        if cls['phones'] and cls['amounts'] and L.HOLD.search(t):
-            # a STOP word inside the order («الغي», «متبعتش», «بكرة», «تحصيل», «سداد») — held for the model
+        if cls['phones'] and cls['amounts'] and (L.HOLD.search(t) or L.THIRD_PARTY.search(t)):
+            # a STOP word inside the order («الغي», «متبعتش», «بكرة», «تحصيل», «سداد»), or someone else
+            # handing the money over («هيديك … تحولهم عليا») — held for the model, never created on sight
             to_model.append({'message_id': mid, 'kind': 'hold_word', 'text': text[:200]})
             pre_consume.append(mid)
             continue
@@ -449,8 +470,11 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     planner_input = [{'message_id': mid, 'text': _text_of(m), **({'amount': fallback_amounts[mid]} if mid in fallback_amounts else {})}
                      for mid, m in rows.items() if mid not in pre_consume and m.type == 'text']
     plan = {'success': False}
+    _t_plan = time.time()
     if planner_input:
         plan = call_tool(conversation, partner, qurtoba_plan_transactions, messages=planner_input)
+    log('money_step', conversation, step='plan', ms=int((time.time() - _t_plan) * 1000), msgs=len(planner_input))
+    _t_between = time.time()
 
     # «ابعت رقم صحيح» → the customer's next bare number is the CORRECTION of that message
     # and takes its amount (2026-09-06: «0106013464 ⏎ الفين جنيه» → «01060134646» was asked
@@ -577,9 +601,15 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     created_result = None
     held_items: List[Dict[str, Any]] = []
     created_items: List[Dict[str, Any]] = []
+    # Where the 20–33 s of runs 2901/2902/2979/2981/2988 went is unknown: time the stretch between
+    # the planner and the create call (chat scans + cache) separately from the create itself (P8).
+    log('money_step', conversation, step='between_plan_and_create', ms=int((time.time() - _t_between) * 1000),
+        items=len(items))
     if items:
         clean = [{k: v for k, v in i.items() if k not in ('reroute', 'correction_of')} for i in items]
+        _t_create = time.time()
         created_result = call_tool(conversation, partner, qurtoba_create_new_transactions_bulk, transactions=clean)
+        log('money_step', conversation, step='create', ms=int((time.time() - _t_create) * 1000), items=len(clean))
         summary['items'] = len(clean)
         held_items, created_items = _handle_create_result(conversation, partner, created_result, clean, summary,
                                                           replies_enabled=replies_enabled)
@@ -726,14 +756,19 @@ def render_ai_summary(summary: Dict[str, Any]) -> str:
         for l in lo:
             k = l.get('kind')
             if k == 'multi_number':
-                hint = 'several numbers with ONE amount — read it: the same amount to each (create one item per number), a split request (qurtoba_request_split), or unclear (ask)'
+                hint = ('several numbers with ONE amount — read it: the same amount to each («لكل رقم», «كل واحد», '
+                        '«ابعت X للرقمين/للأرقام دول», «X على الاتنين» → create one item per number, no question), '
+                        'a split request («قسم/وزّع/نص نص/بالتساوي» → qurtoba_request_split), or genuinely unclear (ask)')
             elif k == 'split':
                 hint = ('part of a SPLIT request («قسم/وزّع/نص نص/بالتساوي») — call qurtoba_request_split ONCE for the whole request '
                         'with the message that asks for the split; create nothing for these numbers and reply nothing')
             elif k == 'sentence':
                 hint = 'a number and/or an amount INSIDE a sentence — read it: a status question (check_transaction_status), a complaint or refund (alert a human + «لحظة»), an order (create it), or unclear (ask)'
             elif k == 'hold_word':
-                hint = 'an order that ALSO carries a stop word (cancel / not now / tomorrow / تحصيل / سداد) — read it: a cancelled or postponed order → nothing (say «تمام»), a collection or payment → never a transfer, otherwise create it'
+                hint = ('an order that ALSO carries a stop word (cancel / not now / tomorrow / تحصيل / سداد) or says someone '
+                        'else will hand the money over («هيديك», «يديك», «هيبعتلك», «استلم من») — read it: a cancelled or '
+                        'postponed order → nothing (say «تمام»), a collection / deposit / payment → NEVER a transfer '
+                        '(alert_qurtoba_human + «لحظة»), otherwise create it')
             elif k == 'voice':
                 hint = 'a VOICE message (transcribed) — answer it like text; never create money from voice'
             elif k == 'amount_only':
@@ -972,13 +1007,17 @@ def _handle_create_result(conversation, partner, result: Dict[str, Any], items: 
                 held.append({**item, 'source_message_id': src})
         elif status == 'rejected':
             et = r.get('error_type')
+            if r.get('reply_sent'):
+                consume(conversation, [src])          # the tool already told the customer (account_not_in_chat)
+                continue
             if et == 'invalid_account_number':
                 text = R.BAD_NUMBER
             elif et == 'source_mismatch':
                 alert_human(conversation, partner, f'source_mismatch أثناء الإنشاء التلقائي: {r}')
                 continue
             else:
-                text = r.get('error') or R.NOT_UNDERSTOOD
+                # only a line written for the customer ever reaches them; an internal `error` never does
+                text = r.get('customer_reply') or R.NOT_UNDERSTOOD
             if replies_enabled:
                 if send_quoted(conversation, src, text):
                     summary['replies'] += 1

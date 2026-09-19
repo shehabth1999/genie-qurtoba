@@ -84,6 +84,12 @@ QUESTION_CONFIRM = ('الرسالة دي سؤال ولا طلب تحويل؟ �
                     'لو عايز تحويل {amount} على {phone} ابعت «حول» وننفذه فوراً.')
 NEITHER_OPTION = 'تمام، يبقى {amount} على {phone}؟'
 UNCLEAR_ANSWER = 'رديت بـ«{text}» على «{question}» — قصدك أيوة ولا لأ؟'
+# Both NEED_* lines keep the shape the planner recognises as OUR question (a «؟» and the value in
+# digits), so the customer's next bare number / amount is paired with it, as after «الرقم للمبلغ X؟».
+NEED_NUMBER_FOR = 'تمام — الرقم اللي عليه الـ {amount}؟'
+PUSH_FAILED = 'التحويل ده ما اتسجلش عندنا — لو لسه محتاجه ابعته تاني دلوقتي.'
+MODEL_DOWN = 'ثواني وهنرد على حضرتك 🙏'
+NEED_AMOUNT_FOR = 'تمام — المبلغ لـ {phone}؟'
 UNCLEAR_HV_ANSWER = 'رديت بـ«{text}» على تأكيد الـ{amount} — قصدك نأكد الـ{amount} ولا المبلغ {text} بس؟'
 DECLINED = 'تمام، مش هننفذها.'
 REPEAT_DECLINED = 'تمام، مش هتتكرر.'

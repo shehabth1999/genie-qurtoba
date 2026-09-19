@@ -92,6 +92,12 @@ HOLD = _rx([r'\bالغ', r'\bلغي', r'\bوقف', r'\bاوقف', r'\bكنسل',
             r'\bبكره\b', r'\bبكرا\b', r'\bاستني', r'\bاستنى', r'\bمش دلوقتي', r'\bبعدين\b', r'\bلسه\b', r'\bغلط\b',
             r'\bتحصيل', r'\bمندوب', r'\bسداد', r'\bارجع', r'\bرجع', r'\bاسترجاع'])
 
+# Someone ELSE hands the money over («الراجل عندك هيديك 10000 تحولهم عليا 01…», chat 13f58d64 2026-09-18):
+# a collection or a deposit, never an order to send the customer's balance — held for the model like HOLD.
+THIRD_PARTY = _rx([r'\bهيديك\b', r'\bيديك\b', r'\bهيدفعلك\b', r'\bيدفعلك\b', r'\bهيدفع لك\b', r'\bهيحول لك\b',
+                   r'\bهيحولك\b', r'\bهيبعتلك\b', r'\bيبعتلك\b', r'\bهيسلمك\b', r'\bيسلمك\b', r'\bاستلم من\b',
+                   r'\bمن عنده\b', r'\bخد من\b', r'\bهياخد منك\b', r'\bهيجيلك\b', r'\bجايلك\b', r'\bهيديلك\b'])
+
 # Multi-number requests — «قسم/وزّع المبلغ» (manual at the office) vs «لكل رقم» (same amount each).
 SPLIT = _rx([r'\bقسم\b', r'\bقسمه\b', r'\bقسمها\b', r'\bقسمهم\b', r'\bاقسم\b', r'\bاقسمها\b', r'\bاقسمهم\b',
              r'\bتقسيم\b', r'\bتقسيمه\b', r'\bتقسيمها\b', r'\bوزع\b', r'\bوزعه\b', r'\bوزعها\b', r'\bوزعهم\b',

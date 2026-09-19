@@ -333,11 +333,27 @@ _INTERNAL_NOTE_RE = re.compile(
 
 _TRAILING_PAREN_RE = re.compile(r'^[\(（\[].{1,120}[\)）\]]$', re.DOTALL)
 
+# A tool's own diagnostic text relayed to the customer word for word — «الرسالة المُشار إليها لا
+# تحتوي رقم الحساب — راجِع ربط الرقم بالمبلغ» went out on 2026-09-17 23:52 (chat 13f58d64) — or any
+# field name / snake_case token from a tool result. Only lines written FOR the customer may leave.
+_INTERNAL_TEXT_RE = re.compile(
+    r'(الم[ُ]?شار إليها|راج[ِ]?ع ربط|ربط الرقم بالمبلغ|error_type|source_message|message_id|'
+    r'account_number|customer_reply|reply_fully_handled|cited_message|existing_record|'
+    r'\b[a-z]+_[a-z]+_[a-z]+\b|\{\s*[\'"]?success[\'"]?\s*:)',
+    re.I,
+)
+
 
 def is_internal_note(output: str) -> bool:
     """A phrase that only ever addresses the operator, never the customer."""
     text = str(output or '')
     return bool(text.strip()) and bool(_INTERNAL_NOTE_RE.search(text))
+
+
+def is_internal_text(output: str) -> bool:
+    """A tool's diagnostic wording or a result field name — never a reply."""
+    text = str(output or '')
+    return bool(text.strip()) and bool(_INTERNAL_TEXT_RE.search(text))
 
 
 def _last_inbound_text(conversation_id) -> Optional[str]:
@@ -630,6 +646,8 @@ def decide(content, message_type, conversation, system_partner, *,
         return _block('non_arabic')
     if is_internal_note(text):
         return _block('internal_note')
+    if is_internal_text(text):
+        return _block('internal_text')
     if conv_id and is_echo_with_note(text, conv_id):
         return _block('echo_with_note')
     if conv_id and is_pure_echo(text, conv_id):

@@ -18,6 +18,73 @@ from qurtoba.tools._amounts import normalize_amount, _ar_to_ascii
 # _normalize_phone lives in _phone.py so the reporting tools can reuse it;
 # re-exported here because this module has always been its import site.
 from qurtoba.tools._phone import _normalize_phone  # noqa: F401
+import contextvars
+
+# Set by automation.pending.answer_pending around its call to qurtoba_confirm_pending_repeats: the
+# model read a reply in the customer's own words («تمام يا معلم اعملها») and judged it a yes. Without
+# it the confirm tool accepts only a yes-shaped message or one that quotes our question.
+_REPEAT_MEANING_VERIFIED: 'contextvars.ContextVar[bool]' = contextvars.ContextVar(
+    'qurtoba_repeat_meaning_verified', default=False)
+
+
+def _account_seen_in_chat(conversation, account: str, *, hours: int = 6) -> bool:
+    """True if the customer wrote `account`'s digits in the last `hours` (any spacing / country code).
+
+    A cash number the agent typed that no customer message contains is an INVENTED number — on
+    2026-09-17 23:52 (chat 13f58d64) the model built 01018773577 out of the 9-digit typo «101877357»
+    and tried to send 20,690 to it. The tool, not the prompt, is the last gate."""
+    try:
+        from datetime import timedelta
+        from django.utils import timezone
+        from modules.chat.models import Message
+        tail = re.sub(r'\D', '', str(account or ''))[-9:]
+        if not tail or conversation is None:
+            return True                          # nothing to compare against — the other guards decide
+        since = timezone.now() - timedelta(hours=hours)
+        for m in (Message.objects_all.filter(conversation=conversation, direction='inbound', active=True,
+                                             created_at__gte=since).order_by('-created_at')[:300]):
+            c = m.content if isinstance(m.content, dict) else {}
+            txt = _ar_to_ascii(str(c.get('text') or c.get('caption') or c.get('transcription') or ''))
+            if tail in re.sub(r'\D', '', txt):
+                return True
+        return False
+    except Exception:
+        logger.warning('qurtoba: account-in-chat check failed', exc_info=True)
+        return True
+
+
+def _repeat_confirmation_verdict(conv, asked_dt, held: Dict[str, Any]) -> str:
+    """'yes' only when the customer's NEWEST message after the question confirms it.
+
+    A yes in words (lexicon.is_yes), a reply that quotes our question or the held number message, or —
+    when answer_pending verified the meaning — any newer message that is not itself a request. A newer
+    message carrying a phone or an amount is a NEW request, never a yes: on 2026-09-17 23:48 (chat
+    13f58d64) a re-send with a 9-digit typo counted as «أيوة» and 26,900 was repeated (record 40716).
+    Returns 'yes' | 'no_customer_confirmation_yet' | 'unrelated_message'."""
+    from modules.chat.models import Message as _ChatMessage
+    from qurtoba.automation import lexicon as L
+    from qurtoba.tools.planning import _classify_message
+    newest = (_ChatMessage.objects_all.filter(conversation=conv, direction='inbound', active=True,
+                                              created_at__gt=asked_dt)
+              .select_related('reply_to').order_by('-created_at').first())
+    if newest is None:
+        return 'no_customer_confirmation_yet'
+    text = _message_text_raw(newest)
+    cls = _classify_message(text)
+    if cls['phones'] or cls['amounts']:
+        return 'unrelated_message'
+    if L.is_no(text):
+        return 'unrelated_message'
+    if L.is_yes(text):
+        return 'yes'
+    q = getattr(newest, 'reply_to', None)
+    if q is not None:
+        qt = _message_text_raw(q)
+        if 'تحب أكررها' in qt or 'تحب تتكرر' in qt or str(q.id) == str(held.get('source_message_id') or ''):
+            return 'yes'
+    if _REPEAT_MEANING_VERIFIED.get():
+        return 'yes'
+    return 'unrelated_message'
 
 logger = logging.getLogger(__name__)
 
@@ -522,6 +589,7 @@ def _validate_debt_item(
                 'ok': False,
                 'error_type': 'invalid_account_number',
                 'error': 'من فضلك ارسل رقم صحيح.',
+                'customer_reply': 'الرقم ده مش صحيح — ابعت رقم صحيح 11 رقم',
             }
     return {
         'ok': True,
@@ -680,6 +748,7 @@ def _create_one_debt(
                 'success': False,
                 'error_type': 'offline_cancelled',
                 'error': _lock['reply'],
+                'customer_reply': _lock['reply'],
                 'offline_reason': _lock['reason'],
                 'cancelled_message_id': str(_lock_id),
             }
@@ -700,6 +769,27 @@ def _create_one_debt(
         guard = _noncash_account_guard(customer, type, final_account)
         if guard is not None:
             return guard
+
+    # --- The number must be the customer's own words ---------------------------
+    # A cash destination that no inbound message of the last 6 h contains was INVENTED or
+    # "repaired" by the model (2026-09-17 23:52: «101877357» → 01018773577, 20,690). The tool
+    # refuses it and tells the customer itself; the model has nothing to add. Skipped for the
+    # admin approval path and for a held repeat (its number was verified when it was held).
+    if is_cash and not override_grade_limit and not confirm_repeat:
+        if not _account_seen_in_chat(conversation, final_account):
+            from qurtoba.automation.replies import BAD_NUMBER as _BAD_NUMBER
+            _sent = bool(src) and _send_quoted_text(conversation, social_partner, src, _BAD_NUMBER)
+            logger.warning('qurtoba: create refused — account %s not written by the customer (src=%s)',
+                           final_account, src)
+            return {
+                'success': False,
+                'error_type': 'account_not_in_chat',
+                'error': 'الرقم ده مش في رسائل العميل — ممنوع تأليف أو تكملة رقم.',
+                'customer_reply': _BAD_NUMBER,
+                'reply_sent': bool(_sent),
+                'account_number': final_account,
+                'cited_message_id': src,
+            }
 
     # --- Source-message validation (B2) ---------------------------------------
     # The cited message MUST contain the destination phone. This catches the
@@ -797,11 +887,13 @@ def _create_one_debt(
         from django.utils import timezone as _tz
         _now_local = _tz.localtime(_tz.now())
         _day_start = _now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        # A transfer Cash-SYS cancelled (no wallet / cancel request / agent) is not "done today":
+        # sending it again is a fresh order, not a repeat (scenario J3; owner rule 2026-09-08).
         dup_today = QurtobaRecord.objects.filter(
             customer=customer, type__startswith='كاش',
             account_number=final_account, value=amount,
             created_at__gte=_day_start,
-        ).order_by('-id').first()
+        ).exclude(cash_sys_state='canceled').order_by('-id').first()
         if dup_today is not None:
             # SAME-BURST guard: if the matching record was created just moments ago, this is
             # NOT the customer deliberately repeating — it's the SAME burst being re-processed by
@@ -855,17 +947,23 @@ def _create_one_debt(
                 existing_record_id=dup_today.pk,
                 asked_ts=(_tz.now().timestamp() if _ask_again else _asked_before),
             )
+            # «اتنفذت» only for a transfer Cash-SYS finished; one still in flight is «لسه شغالة»
+            # (2026-09-17 23:48: a pending 26,900 was called executed, then repeated).
+            _executed = bool(getattr(dup_today, 'cash_sys_done', False)) or \
+                getattr(dup_today, 'cash_sys_state', '') in ('done', 'rerouted')
             if _ask_again:
                 _send_quoted_text(
                     conversation, social_partner, src,
                     f'عملية {dup_today.type} بمبلغ {_val_int} جنيه للرقم {final_account} '
-                    f'اتنفذت النهارده بالفعل. تحب أكررها؟',
+                    + ('اتنفذت النهارده بالفعل. تحب أكررها؟' if _executed
+                       else 'لسه شغالة عندنا من شوية. تحب تتكرر تاني؟'),
                 )
             return {
                 'success': True, 'repeat_asked': True, 'already_asked': not _ask_again,
                 'existing_record_id': dup_today.pk, 'type': dup_today.type,
                 'value': dup_today.value, 'account_number': dup_today.account_number,
                 'created_at': dup_today.created_at.isoformat(),
+                'existing_state': 'executed' if _executed else 'in_flight',
             }
 
     # --- High-value confirmation gate -----------------------------------------
@@ -1276,6 +1374,9 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
                 'status': 'rejected',
                 'error_type': outcome.get('error_type'),
                 'error': outcome.get('error'),
+                # the ONLY text of a rejection that may reach the customer; absent → say nothing
+                'customer_reply': outcome.get('customer_reply'),
+                'reply_sent': bool(outcome.get('reply_sent')),
                 'disabled_type': outcome.get('disabled_type'),
                 'current_balance': outcome.get('current_balance'),
                 'grade_limit': outcome.get('grade_limit'),
@@ -1520,7 +1621,9 @@ def qurtoba_create_new_transactions_bulk(
         'customer sent a fresh message AFTER the tool asked (so a repeat can never be '
         'self-confirmed in the same turn). Returns {created:[...], skipped:[...]}: created → the '
         'tool 👍 each, STAY SILENT; skipped reason "no_customer_confirmation_yet" → nothing to '
-        'confirm this turn (do NOT re-ask); note "no_pending" → nothing was being held.'
+        'confirm this turn (do NOT re-ask); "unrelated_message" → the newest message is a NEW '
+        'number/amount or a no, not a yes — handle it as a request, the hold stays; note '
+        '"no_pending" → nothing was being held.'
     ),
     category='qurtoba',
     requires_auth=True,
@@ -1550,18 +1653,16 @@ def qurtoba_confirm_pending_repeats(context) -> Dict[str, Any]:
     skipped: List[Dict[str, Any]] = []
     for sig, m in list(pending.items()):
         asked_dt = _dt.fromtimestamp(float(m.get('asked_ts') or 0), tz=_dttz.utc)
-        # DETERMINISTIC anti-self-confirm: create ONLY if the customer sent a fresh inbound
-        # AFTER the tool asked (a LATER turn). A same-turn "confirm" has no such message and
-        # is refused here — the LLM can never self-approve a repeat.
-        has_confirmation = _ChatMessage.objects_all.filter(
-            conversation=conv, direction='inbound', active=True,
-            created_at__gt=asked_dt,
-        ).exists()
-        if not has_confirmation:
+        # DETERMINISTIC anti-self-confirm: create ONLY when the customer's newest message AFTER the
+        # tool asked is a yes (a yes word, a reply quoting the question, or a meaning the model
+        # verified through answer_pending). Nothing newer → the LLM can never self-approve in the
+        # turn that asked; a newer number/amount → a new request, the hold stays (2026-09-17).
+        verdict = _repeat_confirmation_verdict(conv, asked_dt, m)
+        if verdict != 'yes':
             skipped.append({
                 'type': m.get('type'), 'value': m.get('value'),
                 'account_number': m.get('account_number'),
-                'reason': 'no_customer_confirmation_yet',
+                'reason': verdict,
             })
             continue
 
@@ -1727,6 +1828,7 @@ def qurtoba_register_customer_payment(
             'success': False,
             'error_type': 'offline_cancelled',
             'error': _lock['reply_payment'],
+            'customer_reply': _lock['reply_payment'],
             'offline_reason': _lock['reason'],
             'cancelled_message_id': str(msg.id),
         }
