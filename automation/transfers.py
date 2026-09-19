@@ -34,6 +34,16 @@ PENDING_TTL = 3600
 
 # ── pure decision table ──────────────────────────────────────────────────────
 
+def _stamp_pending(key: str, marker: Dict[str, Any]) -> None:
+    """Store a held question. The SAME question (same number, amount and source) keeps the time it
+    was first asked: a still-open burst is re-planned on every later turn, and re-stamping made the
+    customer's answer look older than the question (2026-09-20, scenario Y21)."""
+    old = cache_get(key) or {}
+    same = all(str(old.get(k)) == str(marker.get(k)) for k in ('account_number', 'value', 'source_message_id'))
+    ts = float(old.get('ts')) if same and old.get('ts') else time.time()
+    cache_set(key, {**marker, 'ts': ts}, PENDING_TTL)
+
+
 def _answer_needs_more(a: Dict[str, Any]) -> str:
     """The line for a bare yes that answers a question asking for a value: what is still missing."""
     import re
@@ -499,7 +509,7 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             # Owner decision 2026-09-06: confirm first — «تقصد تحويل X على الرقم ده؟ ابعت «حول»» —
             # then «حول» creates it instantly (handled in the pre-pass above, no model).
             plan['orphans'] = [o for o in plan['orphans'] if o.get('message_id') != c['source_message_id']]
-            cache_set(CORRECTION_KEY.format(conv=conv_key), {**c, 'ts': time.time()}, PENDING_TTL)
+            _stamp_pending(CORRECTION_KEY.format(conv=conv_key), c)
             if send_quoted(conversation, c['source_message_id'],
                            R.CORRECTION_CONFIRM.format(amount=R._fmt(c['value']), phone=c['account_number'])):
                 summary['replies'] += 1
@@ -571,7 +581,7 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
                       reroute=reroute, texts={mid: _text_of(m) for mid, m in rows.items()}, accounts=accounts,
                       list_pending=list_pending, hv_pending=hv_phone)
     if decision.get('hint_pending'):
-        cache_set(CORRECTION_KEY.format(conv=conv_key), {**decision['hint_pending'], 'ts': time.time()}, PENDING_TTL)
+        _stamp_pending(CORRECTION_KEY.format(conv=conv_key), decision['hint_pending'])
     if decision.get('list_confirm'):
         cache_set(LIST_KEY.format(conv=conv_key), {**decision['list_confirm'], 'ts': time.time()}, PENDING_TTL)
     elif list_pending:
@@ -586,8 +596,14 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         for mid, text in decision['replies']:
             o = next((o for o in plan.get('orphans') or [] if o.get('message_id') == mid and o.get('kind') == 'amount'), None)
             if o is not None:
-                to_model.append({'message_id': mid, 'kind': 'amount_only',
-                                 'text': f"{_text_of(rows[mid])[:80]} — registered accounts: {', '.join(f'{t} {n}' for t, n in reg)}"})
+                raw = _text_of(rows[mid])
+                # the customer NAMED one of their registered accounts («فوري 6099999 500») → say so:
+                # that account, that type, no «أي حساب؟» (scenario Z42, 2026-09-20)
+                named = [(t, n) for t, n in reg if n and n in raw]
+                hint = (f" — the customer NAMED their registered {named[0][0]} account {named[0][1]}: create the amount to it, "
+                        f"type {named[0][0]}, no question" if len(named) == 1 else
+                        f" — registered accounts: {', '.join(f'{t} {n}' for t, n in reg)}")
+                to_model.append({'message_id': mid, 'kind': 'amount_only', 'text': f"{raw[:80]}{hint}"})
             else:
                 keep.append((mid, text))
         decision['replies'] = keep

@@ -65,9 +65,32 @@ def pending_state(conversation) -> Dict[str, Any]:
     return out
 
 
+# The fixed openings of every yes/no question the money path asks. The question's TIME is read from
+# its outbound chat row, not from the cache marker: the marker is re-stamped whenever a still-open
+# burst is re-planned (every later turn), so on 2026-09-20 «yes please» looked OLDER than the
+# question it answered and was refused (scenario Y21).
+_QUESTION_OPENINGS = ('الرقم اللي فات كان غلط', 'المبلغ لـ', 'الأرقام والمبالغ وصلت كقائمتين', 'مبلغ كبير',
+                      'عملية كاش', 'تمام — الرقم اللي عليه', 'تمام — المبلغ لـ')
+
+
 def _question_time(conversation, st: Dict[str, Any]) -> Optional[float]:
     """Unix time of the most recent question behind what is held, or None when unknown."""
-    ts: List[float] = []
+    try:
+        from datetime import timedelta
+        from django.db.models import Q
+        from django.utils import timezone
+        from modules.chat.models import Message
+        cond = Q()
+        for opening in _QUESTION_OPENINGS:
+            cond |= Q(content__text__startswith=opening)
+        q = (Message.objects_all.filter(conversation=conversation, direction='outbound', type='text', active=True,
+                                        is_internal=False, created_at__gte=timezone.now() - timedelta(hours=6))
+             .filter(cond).order_by('-created_at').first())
+        if q is not None:
+            return q.created_at.timestamp()
+    except Exception:
+        pass
+    ts: List[float] = []                      # no row found: fall back to the markers' own stamps
     for k in ('correction', 'list'):
         m = st.get(k)
         if m and m.get('ts'):
@@ -75,16 +98,6 @@ def _question_time(conversation, st: Dict[str, Any]) -> Optional[float]:
     for r in st.get('repeat') or []:
         if r.get('asked_ts'):
             ts.append(float(r['asked_ts']))
-    if st.get('high_value'):
-        try:
-            from modules.chat.models import Message
-            q = (Message.objects_all.filter(conversation=conversation, direction='outbound', type='text', active=True,
-                                            content__text__startswith='مبلغ كبير')
-                 .order_by('-created_at').first())
-            if q is not None:
-                ts.append(q.created_at.timestamp())
-        except Exception:
-            pass
     return max(ts) if ts else None
 
 

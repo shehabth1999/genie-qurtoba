@@ -178,6 +178,12 @@ class QurtobaConfig(AppConfig):
 
             ai_guard.register_system_templates(*_CANCEL_NOTICE_MESSAGES.values())
             ai_guard.register_system_templates('👍', '👍🏿')
+            # The create tool's own repeat question — the model must never echo its tail as a
+            # second message (scenario L1: «تحب تتكرر تاني؟» went out twice, 2026-09-20).
+            ai_guard.register_system_templates(
+                'تحب أكررها؟', 'تحب تتكرر تاني؟',
+                'اتنفذت النهارده بالفعل. تحب أكررها؟', 'لسه شغالة عندنا من شوية. تحب تتكرر تاني؟',
+            )
             # The reroute notices are interpolated with live amounts, so their
             # fixed lines are registered individually.
             ai_guard.register_system_templates(

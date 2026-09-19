@@ -625,6 +625,14 @@ def decide(content, message_type, conversation, system_partner, *,
     sending, sees exactly the production behaviour.
     """
     if in_system_send():
+        # A tool's own quoted line («تحب أكررها؟», the correction question, the bad-number line) IS the
+        # reply to that message: record it under rule C so the model cannot add a second one on the
+        # same message this turn (scenario L1, 2026-09-20: the tool asked, the model paraphrased).
+        if message_type == 'text':
+            quoted_id = _quoted_id_of(reply_to_id, reply_to_message_id)
+            conv_id = getattr(conversation, 'id', None)
+            if quoted_id and conv_id:
+                _note_quoted_reply(conv_id, quoted_id)
         return _send()
     if message_type != 'text':
         return _send()
