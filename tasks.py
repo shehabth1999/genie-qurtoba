@@ -781,19 +781,25 @@ def _send_reroute_ask(record, fulfilled, reroute_amount):
 # zeroed on the accountant ledger before this is sent, so the wording is truthful:
 #   cancel_request → reassure nothing was recorded.
 #   no_wallet      → ask for a different number (the current one has no wallet).
+#   agent          → an operator cancelled it inside the Cash app: same truth, neutral wording.
+#   anything else  → the neutral line too. On 2026-09-18 (chat 13f58d64) three `agent` cancels —
+#                    22,610 / 7,000 / 22,240 — zeroed the ledger and told the customer nothing.
 _CANCEL_NOTICE_MESSAGES = {
     'cancel_request': "تم الغاء التحويل\n\nو لم يتم تسجيل العمليه عليك",
     'no_wallet': "*محتاجين رقم تانى نبعت عليه الرصيد*\n\n*الرقم مش عليه محفظة*",
+    'agent': "تم إلغاء التحويل من إدارة قرطبة\n\nو لم يتم تسجيل العمليه عليك",
 }
+_CANCEL_NOTICE_FALLBACK = _CANCEL_NOTICE_MESSAGES['agent']
 
 
 def _send_cancel_notice(record, reason):
-    """Send the WhatsApp notice for a full-reversal cancel (no_wallet /
-    cancel_request), quoting the original transfer-request message. Best-effort;
-    never raises. Unknown reasons send nothing."""
-    text = _CANCEL_NOTICE_MESSAGES.get(reason)
-    if not text:
-        return
+    """Send the WhatsApp notice for a full-reversal cancel, quoting the original
+    transfer-request message. Best-effort; never raises. A reason without its own
+    wording gets the neutral line — a cancel is never silent."""
+    text = _CANCEL_NOTICE_MESSAGES.get(reason) or _CANCEL_NOTICE_FALLBACK
+    if reason not in _CANCEL_NOTICE_MESSAGES:
+        logger.warning('[CashSys Notify] cancel reason %r has no wording — neutral line sent (record=%d)',
+                       reason, record.pk)
     ctx = _notify_context(record)
     if not ctx:
         return
@@ -1039,6 +1045,71 @@ def handle_cash_sys_order_progress(self, data: dict):
         _webhook_retry_or_record(self, record, 'order_progress', data, exc)
 
 
+def _done_after_cancel(record, data: dict, fulfilled, done_at, last: dict) -> None:
+    """Cash-SYS reported money moved on an order this system had already zeroed as cancelled.
+
+    Ledger: set the value to `fulfilled` (a failed accountant edit RAISES so the webhook retries —
+    the customer must never stay at 0 while money left). Record: done at `fulfilled`, state stays
+    `canceled` so nothing downstream treats it as a clean transfer. Office: one internal note that
+    mentions the staff plus a sync-problem row; customer: nothing (they were told it was cancelled)."""
+    from qurtoba.models import QurtobaRecord, QurtobaSyncProblem
+    from qurtoba.utils_sync import edit_qurtoba_record_value
+    try:
+        amount = float(fulfilled or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if amount > 0 and record.qurtoba_record_id:
+        err = edit_qurtoba_record_value(record.qurtoba_record_id, amount)
+        if err:
+            logger.error('[CashSys DoneAfterCancel] accountant edit FAILED record=%d qid=%s: %s',
+                         record.pk, record.qurtoba_record_id, err)
+            raise RuntimeError(f'accountant edit failed for qid={record.qurtoba_record_id}: {err}')
+    QurtobaRecord.objects.filter(pk=record.pk).update(
+        value=amount if amount > 0 else record.value,
+        cash_sys_done=amount > 0,
+        cash_sys_done_at=done_at,
+        cash_sys_fulfilled=fulfilled,
+        cash_sys_fee=last.get('fee'),
+        cash_sys_sim=last.get('sim_number'),
+        cash_sys_sim_code=last.get('sim_code'),
+        cash_sys_device=last.get('device_name'),
+        cash_sys_operator=last.get('operator'),
+    )
+    record.refresh_from_db()
+    try:
+        record.save()          # recompute_balance() pulls the corrected Rest from the accountant ledger
+    except Exception:
+        logger.warning('[CashSys DoneAfterCancel] balance recompute failed record=%d', record.pk, exc_info=True)
+    msg = (f'Cash-SYS sent «done» ({amount:g}) for order {data.get("order_id")} AFTER «canceled» '
+           f'({record.cash_sys_canceled_reason}). Ledger settled at {amount:g}; the customer was told it was '
+           f'cancelled and got no receipt — review by hand.')
+    try:
+        QurtobaSyncProblem.record(record, 'cash_sys_order_done', msg,
+                                  payload={'order_id': data.get('order_id'), 'fulfilled': fulfilled,
+                                           'canceled_reason': record.cash_sys_canceled_reason,
+                                           'account_number': record.account_number, 'customer_id': record.customer_id})
+    except Exception:
+        logger.warning('[CashSys DoneAfterCancel] sync problem row failed record=%d', record.pk, exc_info=True)
+    try:
+        from qurtoba.staff_notes import post_staff_note
+        ctx = _notify_context(record)
+        if ctx:
+            customer = getattr(record, 'customer', None)
+            post_staff_note(
+                ctx['conv'],
+                ['⚠️ Cash-SYS بعت «تم» بعد «إلغاء» على نفس الطلب',
+                 f'العميل: {getattr(customer, "name", "") or ""}',
+                 f'الرقم: {record.account_number} — اتنفذ فعلياً {amount:g} (سبب الإلغاء: {record.cash_sys_canceled_reason})',
+                 'العميل اتبلغ إن التحويل اتلغى ومبعتلوش إيصال — محتاج مراجعة يدوية.'],
+                subject='⚠️ تم بعد إلغاء — Cash-SYS',
+                body=f'{getattr(customer, "name", "") or ""}: {amount:g} على {record.account_number} اتنفذ بعد الإلغاء — مراجعة يدوية.',
+                reply_to=None, dedupe_key=f'done_after_cancel:{record.pk}',
+            )
+    except Exception:
+        logger.warning('[CashSys DoneAfterCancel] staff note failed record=%d', record.pk, exc_info=True)
+    logger.warning('[CashSys DoneAfterCancel] record=%d order_id=%s fulfilled=%s', record.pk, data.get('order_id'), fulfilled)
+
+
 @shared_task(bind=True, max_retries=3)
 def handle_cash_sys_order_done(self, data: dict):
     """
@@ -1079,6 +1150,14 @@ def handle_cash_sys_order_done(self, data: dict):
         done_at = parse_datetime(data.get('done_at') or '') or timezone.now()
         fulfilled = data.get('fulfilled', data.get('value'))
         last = raw_txns[-1] if raw_txns else {}
+        if record.cash_sys_state == 'canceled':
+            # «done» after «canceled» on the same order (record 41228, 2026-09-19 21:56: order 10096 sent
+            # canceled/no_wallet, then done for 1 EGP). The customer already read «مش عليه محفظة»; a
+            # receipt now contradicts it, and the ledger says 0 while money moved. Settle at what really
+            # went out, send nothing to the customer, and hand it to the office.
+            _done_after_cancel(record, data, fulfilled, done_at, last)
+            _commit_event(record, commit_key)
+            return
         # Don't clobber a reroute that already settled this record.
         state = 'rerouted' if record.cash_sys_state == 'rerouted' else 'done'
         QurtobaRecord.objects.filter(pk=record.pk).update(
@@ -1420,36 +1499,98 @@ def push_record_to_qurtoba_task(self, record_pk: int):
         error = push_record_to_qurtoba(record_pk)
     except Exception as exc:
         error = f'{type(exc).__name__}: {exc}'
-    if error:
-        countdown = _RETRY_COUNTDOWNS[min(self.request.retries, len(_RETRY_COUNTDOWNS) - 1)]
+    if not error:
+        return
+    # Celery 5 raises the given `exc` itself — not MaxRetriesExceededError — once the retries are
+    # used up, so an `except MaxRetriesExceededError` around self.retry() never runs (record 39709,
+    # 2026-09-14: four rejections, no error marked, no problem row, the customer's 👍 the last word).
+    # Decide BEFORE retrying: the last allowed attempt has already happened → settle it here.
+    if self.request.retries >= self.max_retries:
+        _push_exhausted(record_pk, error)
+        return
+    countdown = _RETRY_COUNTDOWNS[min(self.request.retries, len(_RETRY_COUNTDOWNS) - 1)]
+    raise self.retry(exc=Exception(error), countdown=countdown)
+
+
+def _push_exhausted(record_pk: int, error: str) -> None:
+    """Every push attempt failed: mark it, surface it, tell the customer and the office.
+
+    Best-effort, step by step: if the DB is the very thing failing, each step is on its own so one
+    failure never hides the next. The sweeper (reconcile_unsynced_qurtoba_records) stays the backstop."""
+    from qurtoba.utils_sync import _mark_error
+    try:
+        _mark_error(record_pk, error)
+    except Exception as exc:
+        logger.error('Failed to mark sync error on record %s: %s', record_pk, exc)
+    rec = None
+    try:
+        from qurtoba.models import QurtobaRecord
+        rec = QurtobaRecord.objects.filter(pk=record_pk).first()
+    except Exception as exc:
+        logger.error('Failed to load record %s after push failure: %s', record_pk, exc)
+    if rec is None:
+        return
+    _sync_problem(rec, error)
+    # Locally the record never reached the ledger or Cash-SYS: a re-send by the customer is a fresh
+    # order, not a repeat, and no notice/receipt logic must treat it as live.
+    try:
+        from qurtoba.models import QurtobaRecord
+        QurtobaRecord.objects.filter(pk=rec.pk).update(cash_sys_state='canceled', cash_sys_canceled_reason='push_failed')
+    except Exception as exc:
+        logger.error('Failed to mark record %s push_failed: %s', record_pk, exc)
+    ctx = None
+    try:
+        ctx = _notify_context(rec)
+    except Exception:
+        logger.warning('push_exhausted: notify context failed record=%d', rec.pk, exc_info=True)
+    if ctx:
         try:
-            raise self.retry(exc=Exception(error), countdown=countdown)
-        except self.MaxRetriesExceededError:
-            # Best-effort: if the DB is the very thing that's failing, marking the
-            # error can raise too — which would again lose the record silently. The
-            # sweeper (reconcile_unsynced_qurtoba_records) is the backstop for that.
-            try:
-                _mark_error(record_pk, error)
-            except Exception as exc:
-                logger.error('Failed to mark sync error on record %s: %s', record_pk, exc)
-            # Retries exhausted → log a sync-problem row + notify admins so the
-            # failed push is visible and retryable from the UI (not silently lost).
-            try:
-                from qurtoba.models import QurtobaRecord, QurtobaSyncProblem
-                rec = QurtobaRecord.objects.filter(pk=record_pk).first()
-                if rec:
-                    QurtobaSyncProblem.record(
-                        rec, 'push_record', error,
-                        payload={
-                            'type': rec.type,
-                            'value': rec.value,
-                            'account_number': rec.account_number,
-                            'is_down': rec.is_down,
-                            'customer_id': rec.customer_id,
-                        },
-                    )
-            except Exception as exc:
-                logger.error('Failed to record QurtobaSyncProblem for record %s: %s', record_pk, exc)
+            from qurtoba.automation.replies import PUSH_FAILED
+            ctx['svc'].send_and_broadcast(
+                partner=ctx['conv'].social_partner, content={'text': PUSH_FAILED}, message_type='text',
+                conversation=ctx['conv'], system_partner=ctx['system_partner'],
+                reply_to_message_id=ctx['reply_wamid'], reply_to_id=ctx['reply_local_id'], websocket=True,
+            )
+        except Exception:
+            logger.warning('push_exhausted: customer line failed record=%d', rec.pk, exc_info=True)
+        try:
+            from qurtoba.staff_notes import post_staff_note
+            customer = getattr(rec, 'customer', None)
+            post_staff_note(
+                ctx['conv'],
+                ['⚠️ تحويل ما اتسجلش في قرطبة بعد كل المحاولات',
+                 f'العميل: {getattr(customer, "name", "") or ""}',
+                 f'{rec.type} {rec.value:g} → {rec.account_number} (سجل {rec.pk})',
+                 f'السبب: {str(error)[:200]}',
+                 'العميل اتبلغ يبعته تاني لو لسه محتاجه. السجل ظاهر في مشاكل المزامنة.'],
+                subject='⚠️ تحويل ما اتسجلش في قرطبة',
+                body=f'{getattr(customer, "name", "") or ""}: {rec.value:g} على {rec.account_number} — فشل التسجيل بعد كل المحاولات.',
+                dedupe_key=f'push_exhausted:{rec.pk}',
+            )
+        except Exception:
+            logger.warning('push_exhausted: staff note failed record=%d', rec.pk, exc_info=True)
+    logger.error('[Qurtoba Push] record %s failed after every retry: %s', record_pk, error)
+
+
+@shared_task(bind=True, max_retries=0)
+def retry_message_status(self, social_id: str, status: str, attempt: int = 1):
+    """A WhatsApp «sent»/«delivered» callback that found no chat row yet (the send was still being
+    written — the same-second race behind 19 rows stuck at «saved» on 14–19 Sep) is applied here a few
+    seconds later, up to three times. Scheduled by qurtoba.runtime_patches on the inline handler."""
+    from modules.chat.models import Message
+    from modules.chat.services.chat_bridge_service import ChatBridgeService
+    if not Message.objects.filter(social_id=social_id).exists():
+        if attempt < 3:
+            retry_message_status.apply_async(args=[social_id, status, attempt + 1], countdown=10 * attempt)
+        else:
+            logger.warning('[StatusRetry] no chat row for %s after %d tries (status=%s)', str(social_id)[:40], attempt, status)
+        return
+    bridge = ChatBridgeService()
+    if status == 'sent':
+        bridge.mark_as_sent(social_id)
+    elif status == 'delivered':
+        bridge.mark_delivered_cumulative(social_id)
+    logger.info('[StatusRetry] applied %s to %s on attempt %d', status, str(social_id)[:40], attempt)
 
 
 def _sync_problem(rec, error: str) -> None:
@@ -1696,19 +1837,10 @@ def _dispatch_daily_messages(text_template, file_template, partner_ids, sender_p
         except Exception as exc:  # noqa: BLE001 — one bad recipient must not stop the rest
             failed.append({'partner_id': pid, 'part': 'contact', 'error': str(exc)[:200]})
             continue
-        if text_template is not None:
-            try:
-                receiver = resolve_delivery_partner(contact, text_template.whatsapp_account)
-                message_content, body_params, header_params = _build_template_params(text_template, contact)
-                process_sending_whatsapp_template.apply_async(
-                    args=[text_template.id, receiver.id, sender_partner.id, message_content, body_params,
-                          header_params, None],
-                    countdown=base,
-                )
-                texts += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.exception('[Qurtoba Daily] summary text for partner %s failed: %s', pid, exc)
-                failed.append({'partner_id': pid, 'part': 'text', 'error': str(exc)[:200]})
+        # The file goes out AFTER the text has been sent (a callback on the text task), not on its own
+        # countdown: on 2026-09-19 00:10 the Excel arrived before the summary because the text send
+        # was retried (Meta 500) while the file's timer kept running.
+        file_sig = None
         if file_template is not None:
             try:
                 customer = contact.qurtoba_customer
@@ -1720,15 +1852,33 @@ def _dispatch_daily_messages(text_template, file_template, partner_ids, sender_p
                 url, display_name = statement_files[customer.pk]
                 receiver = resolve_delivery_partner(contact, file_template.whatsapp_account)
                 message_content, body_params, _header = _build_template_params(file_template, contact)
-                process_sending_whatsapp_template.apply_async(
-                    args=[file_template.id, receiver.id, sender_partner.id, message_content, body_params,
-                          [{'type': 'document', 'url': url, 'filename': display_name}], None],
-                    countdown=base + QURTOBA_DAILY_FILE_DELAY_S,
-                )
-                files += 1
+                file_sig = process_sending_whatsapp_template.si(
+                    file_template.id, receiver.id, sender_partner.id, message_content, body_params,
+                    [{'type': 'document', 'url': url, 'filename': display_name}], None,
+                ).set(countdown=QURTOBA_DAILY_FILE_DELAY_S)
             except Exception as exc:  # noqa: BLE001
                 logger.exception('[Qurtoba Daily] statement file for partner %s failed: %s', pid, exc)
                 failed.append({'partner_id': pid, 'part': 'file', 'error': str(exc)[:200]})
+        if text_template is not None:
+            try:
+                receiver = resolve_delivery_partner(contact, text_template.whatsapp_account)
+                message_content, body_params, header_params = _build_template_params(text_template, contact)
+                process_sending_whatsapp_template.apply_async(
+                    args=[text_template.id, receiver.id, sender_partner.id, message_content, body_params,
+                          header_params, None],
+                    countdown=base,
+                    link=file_sig, link_error=file_sig,      # the file follows the text, sent or failed
+                )
+                texts += 1
+                if file_sig is not None:
+                    files += 1
+                    file_sig = None
+            except Exception as exc:  # noqa: BLE001
+                logger.exception('[Qurtoba Daily] summary text for partner %s failed: %s', pid, exc)
+                failed.append({'partner_id': pid, 'part': 'text', 'error': str(exc)[:200]})
+        if file_sig is not None:                 # no text template today: the file goes alone
+            file_sig.apply_async(countdown=base + QURTOBA_DAILY_FILE_DELAY_S)
+            files += 1
     return {'texts': texts, 'files': files, 'failed': failed}
 
 
@@ -1948,7 +2098,11 @@ def recover_stranded_conversations():
             chat_key = f'conversation_{conversation_id}'
             marker = f'qurtoba:abdication_retry:{msg.id}'
             if not cache.add(marker, 1, timeout=3600):
-                continue   # already retried once
+                # already re-run once and STILL unanswered: stop retrying, never leave it silent —
+                # the holding line to the customer and one note to the office (once per message)
+                if cache.add(f'qurtoba:abdication_told:{msg.id}', 1, timeout=3600):
+                    _tell_unanswered(msg, 'a transaction message got no tool call and no reply after a re-run')
+                continue
             if cache.get(f'pending_task:{chat_key}'):
                 continue   # a run is scheduled or in flight — leave it
             acc_key = f'accumulated_messages:{chat_key}'
@@ -1965,9 +2119,86 @@ def recover_stranded_conversations():
     except Exception:
         logger.exception('[StrandedRecovery] abdication scan failed')
 
-    if stats['recovered'] or stats['cleared'] or stats.get('abdicated'):
+    # ── Runs that died before the never-silent node could run ────────────────
+    # When primary AND backup model fail, the agent node raises, the execution is marked failed and
+    # function_model_done never runs. The customer would wait for nothing (14 Sep 2026): tell them
+    # once and tell the office, per failed run.
+    try:
+        stats['failed_runs'] = _failed_runs_fallback()
+    except Exception:
+        logger.exception('[StrandedRecovery] failed-run scan failed')
+
+    if stats['recovered'] or stats['cleared'] or stats.get('abdicated') or stats.get('failed_runs'):
         logger.info('[StrandedRecovery] %s', stats)
     return stats
+
+
+def _failed_runs_fallback(minutes: int = 15) -> int:
+    """For every WhatsApp flow run of the last `minutes` that ended failed and whose customer got
+    nothing since it started: the holding line quoted on their newest message + a staff note."""
+    from datetime import timedelta
+    from django.core.cache import cache
+    from django.utils import timezone
+    from modules.aistudio.models import WorkflowExecution
+    from modules.chat.models import Conversation, Message
+    from qurtoba.automation import replies as R
+    from qurtoba.automation.context import send_quoted
+    from qurtoba.staff_notes import post_staff_note
+
+    told = 0
+    since = timezone.now() - timedelta(minutes=minutes)
+    runs = (WorkflowExecution.objects.filter(created_at__gte=since, trigger_context__thread_id__startswith='whatsapp_')
+            .exclude(status__in=('completed', 'running', 'pending', 'paused'))
+            .order_by('created_at')[:50])
+    for run in runs:
+        if not cache.add(f'qurtoba:failed_run_told:{run.pk}', 1, timeout=3600):
+            continue
+        thread = str((run.trigger_context or {}).get('thread_id') or '')
+        conv_id = thread[len('whatsapp_'):] if thread.startswith('whatsapp_') else None
+        conv = Conversation.objects.filter(pk=conv_id).first() if conv_id else None
+        if conv is None or not getattr(conv, 'handled_by_ai', False):
+            continue
+        started = run.started_at or run.created_at
+        if Message.objects_all.filter(conversation=conv, direction='outbound', is_internal=False,
+                                      created_at__gt=started).exclude(type__in=('tool', 'tool_call')).exists():
+            continue                                    # something did reach the customer
+        newest = (Message.objects_all.filter(conversation=conv, direction='inbound', active=True)
+                  .order_by('-created_at').first())
+        if newest is None:
+            continue
+        send_quoted(conv, str(newest.id), R.MODEL_DOWN, once_minutes=30)
+        post_staff_note(
+            conv,
+            ['⚠️ الرد الآلي وقع على رسالة العميل',
+             f'الخطأ: {str(run.error_message or run.status)[:200]}',
+             'العميل اتبلغ «ثواني وهنرد على حضرتك» — محتاج رد يدوي.'],
+            subject='⚠️ الرد الآلي وقع — رد يدوي مطلوب',
+            body=f'{getattr(conv.social_partner, "name", "") or ""}: الرد الآلي فشل — محتاج رد يدوي.',
+            reply_to=newest, dedupe_key=f'model_down:{conv.id}', dedupe_ttl=1800,
+        )
+        logger.warning('[StrandedRecovery] failed run %s in chat %s — customer told, staff noted', run.pk, str(conv.id)[:8])
+        told += 1
+    return told
+
+
+def _tell_unanswered(msg, why: str) -> None:
+    """Never silent: «ثواني وهنرد على حضرتك» quoted on the customer's message + an internal staff note."""
+    try:
+        from qurtoba.automation import replies as R
+        from qurtoba.automation.context import send_quoted
+        from qurtoba.staff_notes import post_staff_note
+        conv = msg.conversation
+        send_quoted(conv, str(msg.id), R.MODEL_DOWN, once_minutes=30)
+        text = (msg.content or {}).get('text', '') if isinstance(msg.content, dict) else ''
+        post_staff_note(
+            conv,
+            ['⚠️ رسالة عميل من غير رد', f'«{str(text)[:120]}»', f'السبب: {why}',
+             'العميل اتبلغ «ثواني وهنرد على حضرتك» — محتاج رد يدوي.'],
+            subject='⚠️ رسالة عميل من غير رد', body=f'{getattr(conv.social_partner, "name", "") or ""}: {str(text)[:60]}',
+            reply_to=msg, dedupe_key=f'unanswered:{msg.id}',
+        )
+    except Exception:
+        logger.warning('[StrandedRecovery] could not tell about unanswered message %s', str(msg.id)[:8], exc_info=True)
 
 
 def _abdicated_transaction_messages(min_age_s: int = 60, max_age_min: int = 6):
