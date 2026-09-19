@@ -30,6 +30,13 @@ class QurtobaConfig(AppConfig):
         self._install_delete_guard()
         self._install_auth_probe()
         self._takeover_celery_config()
+        # Core behaviour the tenant needs changed (LangGraph state dumps, model timeouts and
+        # failover, missed delivery statuses) — patched at import, never edited (2026-09-20).
+        try:
+            from qurtoba import runtime_patches
+            runtime_patches.install()
+        except Exception:
+            logger.exception('qurtoba: runtime patches NOT installed')
 
         # Kick off a catalog pull on first startup so the tables are never empty.
         # Skipped during manage.py migrate / test runs to avoid hitting Cash-SYS

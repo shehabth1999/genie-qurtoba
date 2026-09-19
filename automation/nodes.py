@@ -263,12 +263,48 @@ def model_done_node(input_data, conversation, partner) -> str:
         log('model_done', conversation, seconds=secs, out_len=len(str(out or '')),
             tokens=od.get('tokens_used') if isinstance(od, dict) else None,
             model=od.get('model') if isinstance(od, dict) else None)
+        # The agent node swallows a provider failure into {'error', 'fallback': True} (core
+        # node_executor): the customer would get nothing. Never silent — one holding line and the
+        # office is told (14 Sep 2026: five unanswered turns during a DeepSeek outage).
+        if isinstance(od, dict) and (od.get('fallback') or od.get('error')):
+            _model_failed_fallback(conversation, partner, input_data, str(od.get('error') or 'model failed')[:200])
     except Exception as exc:
         logger.exception('automation model_done failed')
         log('node_error', conversation, node='model_done', error=str(exc)[:200])
     # Every customer-facing word goes through the reply tool; the model's plain output («Done»,
     # a summary) is thrown away here — so nothing ever reaches the outbound gate from it.
     return ''
+
+
+def _model_failed_fallback(conversation, partner, input_data, error: str) -> None:
+    """The thinking model failed (primary and backup): if nothing reached the customer for this
+    batch, send «ثواني وهنرد على حضرتك 🙏» once, quoted on their newest message, and post one internal
+    note that mentions the office staff. Both are deduplicated so a retried run adds nothing."""
+    from .context import send_quoted, log
+    from . import replies as R
+    try:
+        from modules.chat.models import Message
+        route = _route_of(input_data, conversation, partner)
+        mids = [str(x) for x in (route.get('batch_ids') or []) if x]
+        first = Message.objects_all.filter(id__in=mids).order_by('created_at').first() if mids else None
+        reached = first is not None and Message.objects_all.filter(
+            conversation=conversation, direction='outbound', is_internal=False, created_at__gt=first.created_at,
+        ).exclude(type__in=('tool', 'tool_call')).exists()
+        if not reached and mids:
+            send_quoted(conversation, mids[-1], R.MODEL_DOWN, once_minutes=30)
+        from qurtoba.staff_notes import post_staff_note
+        post_staff_note(
+            conversation,
+            ['⚠️ الموديل وقع ومردّ على العميل',
+             f'الخطأ: {error}',
+             'العميل اتبلغ «ثواني وهنرد على حضرتك» — محتاج رد يدوي على رسالته.'],
+            subject='⚠️ الموديل وقع — رد يدوي مطلوب',
+            body=f'{getattr(partner, "name", "") or ""}: الموديل فشل يرد — محتاج رد يدوي.',
+            dedupe_key=f'model_down:{conversation.id}', dedupe_ttl=1800,
+        )
+        log('model_failed', conversation, error=error, customer_told=not reached)
+    except Exception:
+        logger.exception('automation model fallback failed')
 
 
 OFF_HOURS_AGENT_NODE_ID = 'agent_off_hours'

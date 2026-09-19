@@ -25,7 +25,9 @@ from django.db.models.signals import post_save
 
 logger = logging.getLogger('qurtoba.ai_inbound_catcher')
 
-LOG_PATH = '/home/genie/genie/logs/ai_inbound_catcher.log'
+# Next to the automation's own audit log (~/qurtoba_agent.log): the old /home/genie/genie/logs/
+# path did not exist on this box, so every catch since June was silently lost (found 2026-09-20).
+LOG_PATH = os.path.expanduser('~/ai_inbound_catcher.log')
 
 # Agent reply artifacts — text that should only ever come FROM the agent.
 _AI_MARKERS = (
