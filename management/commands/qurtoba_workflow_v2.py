@@ -113,6 +113,10 @@ def build_spec(src_nodes, tool_ids):
     payments = src_cfg(SRC_PAYMENTS_NODE)
     payments['handoff'] = {'enabled': False, 'targets': []}
     payments['update_state'] = []
+    # owner decision 2026-09-15: Claude Haiku 4.5 main, DeepSeek V4 Flash backup (see the thinker below)
+    payments['llm_model_id'] = 21
+    payments['llm_model_name'] = 'Claude Haiku 4.5'
+    payments['backup_llm_model_id'] = 31
 
     thinker = src_cfg(SRC_CASH_NODE)
     thinker['messages'] = [{'role': 'system', 'text': _thinker_prompt(), 'cache': True, 'cache_ttl': '5m', 'attachments': []}]
@@ -122,10 +126,12 @@ def build_spec(src_nodes, tool_ids):
         'tool_description': 'Register سداد payments from a receipt image (شراء كاش / شراء فورى), or explicit payment wording («العميل دفع»).',
     }]}
     thinker['update_state'] = []
-    # owner decision 2026-09-06: DeepSeek V4 Flash (31) reads the customer better than Haiku on
-    # this task (Haiku asked where it should act); Haiku 4.5 (21) stays the backup for outages
-    thinker['llm_model_id'] = 31
-    thinker['backup_llm_model_id'] = 21
+    # owner decision 2026-09-15: Claude Haiku 4.5 (21) is the main model, DeepSeek V4 Flash (31) the
+    # backup — DeepSeek queued every request for 900 s on 2026-09-14 22:35–23:37 (chat 13f58d64) and
+    # its error never tripped the failover. (2026-09-06 had DeepSeek main: Haiku asked where to act.)
+    thinker['llm_model_id'] = 21
+    thinker['llm_model_name'] = 'Claude Haiku 4.5'
+    thinker['backup_llm_model_id'] = 31
     thinker['max_iterations'] = 6
     thinker['max_tokens'] = 1500
     thinker['temperature'] = 0.2
