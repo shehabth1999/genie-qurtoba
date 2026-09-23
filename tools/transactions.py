@@ -1285,13 +1285,26 @@ def _create_debts_batch(conv, customer, items, override_grade_limit, source_mess
         validation = _validate_debt_item(type_, value_, account_)
         if not validation['ok']:
             rejected_count += 1
-            results.append({
+            row = {
                 'index': index,
                 'status': 'rejected',
                 'error_type': validation['error_type'],
                 'error': validation['error'],
                 'input': {'type': type_, 'value': value_, 'account_number': account_},
-            })
+            }
+            if validation.get('customer_reply'):
+                row['customer_reply'] = validation['customer_reply']
+            if validation.get('error_type') == 'invalid_account_number' and validation.get('customer_reply') \
+                    and conv is not None and item_source_message_id:
+                # A bad number is told by the TOOL, quoted on the message that holds it — like account_not_in_chat.
+                # 2026-09-23 (scenario R1): the model got this line back, sent nothing, and the customer waited.
+                from qurtoba.automation.context import said_recently
+                if said_recently(conv, item_source_message_id, validation['customer_reply'], minutes=30):
+                    row['reply_sent'] = True
+                else:
+                    row['reply_sent'] = bool(_send_quoted_text(conv, social_partner, item_source_message_id,
+                                                               validation['customer_reply']))
+            results.append(row)
             continue
 
         outcome = _create_one_debt(

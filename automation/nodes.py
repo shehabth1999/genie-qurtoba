@@ -264,6 +264,17 @@ def ai_context_node(input_data, conversation, partner) -> Dict[str, Any]:
                 speaker = f" {getattr(m.sender, 'name', '') or 'عضو'}:" if m.sender_id else ''
             texts.append(f"[message_id: {m.id}] ({m.type}){quote}{speaker} {str(c.get('text') or c.get('transcription') or c.get('caption') or '')[:300]}")
         if group:
+            # Who is in the group: a line that calls one of these by name («يا محمد …») talks to a member,
+            # not to the office.
+            try:
+                from qurtoba.groups import _member_partners
+                side, office = [], []
+                for p in _member_partners(conversation)[:40]:
+                    (office if is_staff(p) else side).append((getattr(p, 'name', '') or '').strip())
+                texts.insert(0, f"— group members: the customer's side: {', '.join(n for n in side if n) or '—'}; "
+                                f"office staff: {', '.join(n for n in office if n) or '—'}")
+            except Exception:
+                logger.warning('automation ai context: group members unavailable', exc_info=True)
             # Staff lines are CONTEXT: the model reads what the office said, never answers or acts on them.
             from datetime import timedelta
             since = (first_at or timezone.now()) - timedelta(minutes=15)

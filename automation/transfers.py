@@ -504,7 +504,9 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     leftovers: List[Dict[str, Any]] = []
 
     def _say(mid, text, kind):
-        if replies_enabled:
+        # A broken number is refused by the system itself, whoever speaks otherwise: there is nothing to
+        # decide, the customer must resend it (2026-09-23, scenario R1: the model had the line and said nothing).
+        if replies_enabled or text == R.BAD_NUMBER:
             if send_quoted(conversation, mid, text):
                 summary['replies'] += 1
         elif mid and (asked_recently(conversation, mid, minutes=15) or said_recently(conversation, mid, text, minutes=360)):
