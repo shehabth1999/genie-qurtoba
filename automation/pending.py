@@ -142,7 +142,10 @@ def describe(conversation) -> List[str]:
     if st.get('high_value'):
         lines.append(f"  - waiting for «تأكيد» on a HIGH-VALUE transfer to {st['high_value']['account_number']}")
     if st.get('repeat'):
-        items = ', '.join(f"{r['account_number']} ← {R._fmt(r['value'])}" for r in st['repeat'])
+        # the number message's id rides along: a «no, make it 300» creates the new amount citing THAT message
+        # (scenario Y18: the model cited the «ايوه بس خليها 300» line and the create was refused)
+        items = ', '.join(f"{r['account_number']} ← {R._fmt(r['value'])} [number message_id: {r.get('source_message_id')}]"
+                          for r in st['repeat'])
         lines.append(f'  - waiting for yes/no on repeating today\'s transfer(s): {items}')
     return lines
 
