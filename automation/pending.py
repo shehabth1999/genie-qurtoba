@@ -101,7 +101,7 @@ def _question_time(conversation, st: Dict[str, Any]) -> Optional[float]:
     return max(ts) if ts else None
 
 
-def _answer_gate(conversation, st: Dict[str, Any], newest) -> Optional[str]:
+def _answer_gate(conversation, st: Dict[str, Any], newest, yes: bool = True) -> Optional[str]:
     """Why a yes/no must NOT be applied now — the reason, or None when it may.
 
     Money moves on the customer's word, never on the model's: there must be an inbound message
@@ -111,10 +111,15 @@ def _answer_gate(conversation, st: Dict[str, Any], newest) -> Optional[str]:
     if not st:
         return None
     if newest is None:
-        return 'no customer message to read as an answer'
+        # nothing to read: a yes can never be assumed; a no still drops the hold and is confirmed
+        return 'no customer message to read as an answer' if yes else None
     asked = _question_time(conversation, st)
-    if asked is not None and newest.created_at.timestamp() <= asked:
+    created = getattr(newest, 'created_at', None)
+    if asked is not None and created is not None and created.timestamp() <= asked:
         return 'the customer has not answered yet — nothing newer than the question; wait for their reply'
+    if not yes:
+        # a «no» may carry a new amount («ايوه بس خليها 300»): the hold is dropped, the new amount is created apart
+        return None
     from qurtoba.tools.planning import _classify_message
     txt = (newest.content or {}).get('text', '') if isinstance(newest.content, dict) else ''
     cls = _classify_message(txt)
@@ -166,9 +171,9 @@ def answer_pending(conversation, partner, decision: str, answer_message_id: Opti
     # message, not about what we are holding («تأكيد» quoted on a different transfer).
     held_src = (st.get('correction') or {}).get('source_message_id') or (st.get('high_value') or {}).get('source_message_id')
     newest = _newest_inbound(conversation)
-    # Only a YES moves money, so only a yes needs the customer's own newer answer. A no drops what we hold
-    # and is always confirmed to the customer (2026-09-08: a cancel must never be silent).
-    why_not = _answer_gate(conversation, st, newest) if yes else None
+    # A yes moves money: it needs the customer's own newer answer, and never a new number/amount. A no only
+    # drops what we hold (always confirmed — 2026-09-08), but still never before the customer wrote back.
+    why_not = _answer_gate(conversation, st, newest, yes)
     if why_not:
         result.update(success=False, error_type='no_customer_answer', note=why_not,
                       kind=next((k for k in ('correction', 'list', 'high_value', 'repeat') if st.get(k)), 'none'))

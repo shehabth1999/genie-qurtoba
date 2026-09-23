@@ -801,7 +801,7 @@ def _create_one_debt(
             return {
                 'success': False,
                 'error_type': 'account_not_in_chat',
-                'error': 'الرقم ده مش في رسائل العميل — ممنوع تأليف أو تكملة رقم.',
+                'error': 'account_not_in_chat: this number is not in the customer\'s messages (internal — never send)',
                 'customer_reply': _BAD_NUMBER,
                 'reply_sent': bool(_sent),
                 'account_number': final_account,
@@ -816,10 +816,15 @@ def _create_one_debt(
     if is_cash and not override_grade_limit:
         verdict = _source_message_matches_account(src, final_account, conversation)
         if verdict == 'mismatch':
+            # The amount was paired with a number from ANOTHER message (often one the conversation had already
+            # moved past). What the customer needs is the question, never the diagnostic: on 2026-09-17 the
+            # Arabic diagnostic that stood here reached a customer verbatim (chat 13f58d64).
+            from qurtoba.automation.replies import _fmt
             return {
                 'success': False,
                 'error_type': 'source_mismatch',
-                'error': 'الرسالة المُشار إليها لا تحتوي رقم الحساب — راجِع ربط الرقم بالمبلغ.',
+                'error': 'source_mismatch: the cited message does not contain this account number (internal — never send)',
+                'customer_reply': f'الرقم للمبلغ {_fmt(amount)}؟',
                 'expected_account': final_account,
                 'cited_message_id': src,
             }
