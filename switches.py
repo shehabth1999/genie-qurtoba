@@ -51,7 +51,11 @@ def account_flags(conversation) -> Dict[str, bool]:
     if account is None or getattr(account, 'pk', None) is None:
         return flags
     if account._meta.label_lower != WHATSAPP_ACCOUNT_LABEL:
-        return flags
+        account = switch_account(account)
+        if account is None:
+            return flags
+        if account is _NO_TWIN:
+            return {'ai_enabled': False, 'off_hours': False}
 
     try:
         value = _read_flag(account, 'ai_agent_enabled')
@@ -70,6 +74,33 @@ def account_flags(conversation) -> Dict[str, bool]:
         logger.warning('qurtoba.switches: could not read qurtoba_off_hours for account %s, assuming it is off',
                        account.pk, exc_info=True)
     return flags
+
+
+_NO_TWIN = object()
+
+
+def switch_account(account):
+    """The WhatsApp (Cloud API) account whose switches govern `account`.
+
+    A WhatsApp Web account — the office number linked for the customers' groups — has no switches of
+    its own: it obeys the Cloud account of the SAME number, so one «تفعيل الرد الآلي» / «خارج مواعيد
+    العمل» / type toggle covers both channels (owner decision 2026-09-23). Without such a twin it
+    fails CLOSED (``_NO_TWIN``): money is never created on a number nobody can switch off.
+    Any other channel: None (nothing to switch)."""
+    if account is None:
+        return None
+    label = account._meta.label_lower
+    if label == WHATSAPP_ACCOUNT_LABEL:
+        return account
+    from qurtoba.groups import WA_WEB_ACCOUNT_LABEL, twin_cloud_account
+    if label != WA_WEB_ACCOUNT_LABEL:
+        return None
+    twin = twin_cloud_account(account)
+    if twin is None:
+        logger.warning('qurtoba.switches: WhatsApp Web account %s has no Cloud account with the same number — '
+                       'treating the AI as OFF', account.pk)
+        return _NO_TWIN
+    return twin
 
 
 def create_refusal(conversation, *, what: str = 'transaction') -> Optional[Dict[str, Any]]:

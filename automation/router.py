@@ -78,9 +78,14 @@ def load_batch_rows(conversation, input_data: Dict[str, Any]):
     from django.conf import settings as dj
     from django.utils import timezone
     from modules.chat.models import Message
+    from qurtoba.groups import money_rows, settle_staff_window
     ids = set(batch_ids_from_input(input_data))
     cut = timezone.now() - timedelta(minutes=getattr(dj, 'AI_UNPROCESSED_WINDOW_MIN', 6))
-    qs = Message.objects_all.filter(conversation=conversation, direction='inbound', active=True).select_related('reply_to')
+    # In a customer group, staff lines are context only: settled (watermarked) here, never a row of the turn.
+    settle_staff_window(conversation, cut)
+    qs = money_rows(
+        Message.objects_all.filter(conversation=conversation, direction='inbound', active=True).select_related('reply_to'),
+        conversation)
     rows = {str(m.id): m for m in qs.filter(id__in=ids)} if ids else {}
     for m in qs.filter(ai_consumed_at__isnull=True, created_at__gte=cut).exclude(type__in=('tool', 'tool_call')):
         rows.setdefault(str(m.id), m)
@@ -97,9 +102,10 @@ def unprocessed_text_rows(conversation):
     from django.utils import timezone
     from django.db.models.functions import Coalesce
     from modules.chat.models import Message
+    from qurtoba.groups import money_rows
     cut = timezone.now() - timedelta(minutes=getattr(dj, 'AI_UNPROCESSED_WINDOW_MIN', 6))
     return list(
-        Message.objects_all
+        money_rows(Message.objects_all, conversation)
         .filter(conversation=conversation, direction='inbound', active=True, type='text',
                 ai_consumed_at__isnull=True, created_at__gte=cut)
         .select_related('reply_to')

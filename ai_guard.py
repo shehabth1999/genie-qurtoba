@@ -98,6 +98,21 @@ def in_system_send() -> bool:
     return bool(_system_send_flag.get())
 
 
+def _inbound_qs(conversation_id):
+    """The chat's inbound rows the gate reasons about. In a WhatsApp Web customer group a staff
+    member's line is context, never the message a reply belongs to (qurtoba.groups)."""
+    from modules.chat.models import Conversation, Message
+    qs = Message.objects.filter(conversation_id=conversation_id, direction='inbound')
+    try:
+        conv = Conversation._base_manager.filter(pk=conversation_id).only('id', 'type', 'is_group').first()
+        if conv is not None:
+            from qurtoba.groups import exclude_staff
+            qs = exclude_staff(qs, conv)
+    except Exception:
+        logger.warning('ai_guard: group staff filter failed for %s', conversation_id, exc_info=True)
+    return qs
+
+
 # ── "A tool already answered this turn" ──────────────────────────────────────
 
 _REPLY_DONE_TTL = 300  # seconds; the turn is over long before this expires
@@ -141,7 +156,7 @@ def reply_already_delivered(conversation_id) -> bool:
     try:
         from modules.chat.models import Message
         last_inbound = (
-            Message.objects.filter(conversation_id=conversation_id, direction='inbound')
+            _inbound_qs(conversation_id)
             .order_by('-created_at')
             .values_list('created_at', flat=True)
             .first()
@@ -360,7 +375,7 @@ def _last_inbound_text(conversation_id) -> Optional[str]:
     try:
         from modules.chat.models import Message
         content = (
-            Message.objects.filter(conversation_id=conversation_id, direction='inbound')
+            _inbound_qs(conversation_id)
             .order_by('-created_at')
             .values_list('content', flat=True)
             .first()
@@ -535,7 +550,7 @@ def _newest_inbound(conversation_id):
     try:
         from modules.chat.models import Message
         return (
-            Message.objects.filter(conversation_id=conversation_id, direction='inbound')
+            _inbound_qs(conversation_id)
             .order_by('-created_at')
             .first()
         )
@@ -771,4 +786,94 @@ def install() -> bool:
     guarded._qurtoba_original = original
     WhatsAppAPIService.send_and_broadcast = guarded
     logger.info('ai_guard: outbound gate installed on WhatsAppAPIService.send_and_broadcast')
+    install_wa_web()
     return True
+
+
+# ── WhatsApp Web (customer groups, owner decision 2026-09-23) ────────────────
+#
+# Every AI-originated send on the WhatsApp Web channel — the bridge's reply paragraphs, its apology,
+# follow-ups, and the tools through OmnichannelSendService — goes through
+# ``WaWebService.send_omnichannel``, never through WhatsAppAPIService. Same gate, same rules; the
+# quote travels as ``reply_to_social_id`` (a chat Message.social_id) instead of the two Cloud ids.
+# A human agent typing in the inbox uses ``WaWebService.deliver`` and is never gated.
+
+def _wa_web_result(**extra) -> dict:
+    out = {'success': False, 'message_id': None, 'social_id': None, 'channel': 'wa_web', 'error': None}
+    out.update(extra)
+    return out
+
+
+def install_wa_web() -> bool:
+    try:
+        from django.apps import apps
+        if not apps.is_installed('modules.wa_web'):
+            return False
+        from modules.wa_web.services.send_service import WaWebService
+    except Exception:
+        logger.exception('ai_guard: WaWebService unavailable; WhatsApp Web sends are UNGATED')
+        return False
+
+    original = WaWebService.send_omnichannel
+    if getattr(original, '_qurtoba_ai_guard', False):
+        return True
+
+    @wraps(original)
+    def guarded(self, partner, content, *, message_type='text', conversation=None,
+                system_partner=None, **kwargs):
+        from qurtoba.groups import SILENT_SENTINEL
+        text = _text_of(content)
+        if text is not None and text.strip() == SILENT_SENTINEL:
+            # A deliberately silent Qurtoba turn (runtime_patches): nothing goes out, and the bridge
+            # must count it as delivered so it neither apologises nor escalates.
+            return _wa_web_result(success=True, silent=True)
+        reply_social = kwargs.get('reply_to_social_id')
+        quoted_id = _quoted_id_of(None, reply_social) if reply_social else None
+        verdict = _send()
+        try:
+            verdict = decide(content, message_type, conversation, system_partner,
+                             reply_to_id=quoted_id, reply_to_message_id=reply_social)
+        except Exception:
+            logger.exception('ai_guard: gate error (wa_web) — sending anyway')
+        conv_id = getattr(conversation, 'id', None)
+        action = verdict.get('action')
+
+        if action == 'block':
+            reason = verdict.get('reason') or 'blocked'
+            preview = (text or '')[:120].replace('\n', ' ⏎ ')
+            logger.warning('ai_guard: BLOCKED wa_web (%s%s) conv=%s text=%r', reason,
+                           f'/{verdict["detail"]}' if verdict.get('detail') else '', conv_id, preview)
+            return _wa_web_result(blocked=True, error=f'qurtoba_ai_guard:{reason}')
+
+        if action == 'forward':
+            inbound = verdict.get('forward_to')
+            social_id = getattr(inbound, 'social_id', None)
+            if inbound is not None and social_id:
+                kwargs['reply_to_social_id'] = social_id
+                quoted_id = str(inbound.id)
+            logger.warning('ai_guard: FORWARDED wa_web as quote conv=%s on=%s text=%r',
+                           conv_id, getattr(inbound, 'id', None), (text or '')[:120].replace('\n', ' ⏎ '))
+            result = _deliver_wa_web(original, self, partner, content, conversation, system_partner,
+                                     message_type, quoted_id, kwargs)
+            if conversation is not None and isinstance(result, dict) and result.get('success'):
+                mark_reply_delivered(conversation)
+            return result
+
+        return _deliver_wa_web(original, self, partner, content, conversation, system_partner,
+                               message_type, quoted_id, kwargs)
+
+    guarded._qurtoba_ai_guard = True
+    guarded._qurtoba_original = original
+    WaWebService.send_omnichannel = guarded
+    logger.info('ai_guard: outbound gate installed on WaWebService.send_omnichannel')
+    return True
+
+
+def _deliver_wa_web(original, self, partner, content, conversation, system_partner, message_type, quoted_id, kwargs):
+    result = original(self, partner, content, message_type=message_type,
+                      conversation=conversation, system_partner=system_partner, **kwargs)
+    if isinstance(result, dict) and not result.get('success') and message_type == 'text':
+        conv_id = getattr(conversation, 'id', None)
+        if conv_id:
+            _release_duplicate(conv_id, _text_of(content) or '', quoted_id)
+    return result

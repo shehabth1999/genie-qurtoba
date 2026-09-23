@@ -760,10 +760,13 @@ def _send_statement_document(conversation, customer_pk, xlsx: bytes,
     if not url:
         return False, 'no public media URL for the statement file'
 
+    content = {'url': url}
+    if getattr(conversation, 'type', None) == 'wa_web':
+        content['attachment'] = {'url': url}      # WhatsApp Web reads the file from here (a customer group)
     with system_send():
         result = OmnichannelSendService().send_and_broadcast(
             partner=conversation.social_partner,
-            content={'url': url},
+            content=content,
             message_type='document',
             filename=display_name,
             caption=caption,
@@ -1001,8 +1004,9 @@ def qurtoba_get_customer_daily_transactions(
     # turning sending off. Omitted means SEND.
     should_send = True if send_report is None else bool(send_report)
 
+    from qurtoba.groups import chat_partner
     conv = getattr(context, 'conversation', None)
-    partner = getattr(context, 'partner', None)
+    partner = chat_partner(conv, getattr(context, 'partner', None))
     if partner is None and conv is not None:
         partner = getattr(conv, 'social_partner', None)
 

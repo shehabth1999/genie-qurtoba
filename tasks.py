@@ -475,6 +475,26 @@ class _SystemSender:
         return getattr(self._service, name)
 
 
+def _send_wa_web_media(ctx, attachment, url, message_type):
+    """A receipt image into a WhatsApp Web chat (a customer group). The gateway takes the FILE itself
+    (inline, with its real mimetype) — the Cloud API's {'url'} content shape is refused there."""
+    from modules.wa_web.services.send_service import WaWebService
+    from qurtoba.ai_guard import system_send
+    conv = ctx['conv']
+    with system_send():
+        return WaWebService(conv.social_account).send_omnichannel(
+            conv.social_partner,
+            {'url': url, 'filename': getattr(attachment, 'name', None), 'attachment': {'url': url}},
+            message_type=message_type,
+            filename=getattr(attachment, 'name', None),
+            reply_to_social_id=ctx.get('reply_wamid'),
+            conversation=conv,
+            system_partner=ctx['system_partner'],
+            websocket=True,
+            attachment=attachment,
+        )
+
+
 def _notify_context(record):
     """
     Resolve the send context for a record: (conv, system_partner, reply_wamid,
@@ -491,9 +511,19 @@ def _notify_context(record):
     from qurtoba.extensions import _get_system_partner
 
     partner = record.partner
-    conv = (
+    # The chat the transfer was ASKED in comes first: a transfer placed in a customer's WhatsApp group
+    # is answered in that group (its partner is the group's placeholder, which is no participant of any
+    # chat, so the lookup below finds nothing for it — owner decision 2026-09-23).
+    conv = None
+    try:
+        origin_conv = record.origin_message.conversation if record.origin_message_id else None
+        if origin_conv is not None and origin_conv.type in ('whatsapp', 'wa_web', 'messenger', 'instagram', 'tiktok'):
+            conv = origin_conv
+    except Exception:
+        logger.warning('[CashSys Notify] origin conversation of record %d not readable', record.pk, exc_info=True)
+    conv = conv or (
         partner.conversations
-        .filter(type__in=['whatsapp', 'messenger', 'instagram', 'tiktok'])
+        .filter(type__in=['whatsapp', 'wa_web', 'messenger', 'instagram', 'tiktok'])
         .order_by('-updated_at')
         .first()
     )
@@ -614,7 +644,9 @@ def _send_done_receipts(record):
         for brief in pending:
             attachment, url = _build_and_save_receipt_for_txn(record, brief)
             try:
-                if url:
+                if url and getattr(ctx['conv'], 'type', None) == 'wa_web':
+                    result = _send_wa_web_media(ctx, attachment, url, 'image')
+                elif url:
                     result = ctx['svc'].send_and_broadcast(
                         partner=ctx['conv'].social_partner,
                         content={'url': url, 'filename': attachment.name},
@@ -2008,7 +2040,7 @@ def _unanswered_inbound_ids(conversation_id) -> list:
     from django.utils import timezone as _tz
     from modules.chat.models import Conversation, Message
 
-    conv = Conversation.objects.filter(id=conversation_id).only('id', 'handled_by_ai').first()
+    conv = Conversation.objects.filter(id=conversation_id).only('id', 'handled_by_ai', 'type', 'is_group').first()
     if conv is None or not conv.handled_by_ai:
         return []
     now = _tz.now()
@@ -2016,7 +2048,8 @@ def _unanswered_inbound_ids(conversation_id) -> list:
         Message.objects_all.filter(conversation_id=conversation_id, direction='outbound', active=True)
         .order_by('-created_at').values_list('created_at', flat=True).first()
     )
-    qs = Message.objects_all.filter(
+    from qurtoba.groups import exclude_staff
+    qs = exclude_staff(Message.objects_all, conv).filter(
         conversation_id=conversation_id, direction='inbound', active=True,
         created_at__gte=now - timedelta(minutes=_RECOVER_MAX_AGE_MINUTES),
     )
@@ -2035,7 +2068,6 @@ def recover_stranded_conversations():
     """Re-trigger conversations whose messages sit behind a dead processing lock."""
     from django.conf import settings as dj_settings
     from django.core.cache import cache
-    from modules.aistudio_whatsapp.tasks import process_workflow_messages
 
     if not hasattr(cache, 'iter_keys'):
         return {'skipped': 'cache backend has no iter_keys'}
@@ -2078,7 +2110,7 @@ def recover_stranded_conversations():
             chat_key, len(waiting), lock, age,
         )
         cache.delete(key)
-        process_workflow_messages.apply_async(args=[chat_key, conversation_id], countdown=1)
+        _bridge_task(conversation_id).apply_async(args=[chat_key, conversation_id], countdown=1)
         stats['recovered'] += 1
 
     # ── Abdicated transaction messages ───────────────────────────────────
@@ -2114,7 +2146,7 @@ def recover_stranded_conversations():
                 '[StrandedRecovery] %s: transaction message %s got no tool call and no reply — re-running once.',
                 chat_key, str(msg.id)[:8],
             )
-            process_workflow_messages.apply_async(args=[chat_key, conversation_id], countdown=1)
+            _bridge_task(conversation_id).apply_async(args=[chat_key, conversation_id], countdown=1)
             stats['abdicated'] += 1
     except Exception:
         logger.exception('[StrandedRecovery] abdication scan failed')
@@ -2133,6 +2165,22 @@ def recover_stranded_conversations():
     return stats
 
 
+def _bridge_task(conversation_id):
+    """The AI bridge task of the conversation's own channel — a WhatsApp Web group lock must be re-run by
+    the WhatsApp Web bridge (its partner, its group workflow, its gates), never by the Cloud one."""
+    import importlib
+    from modules.chat.models import Conversation
+    conv_type = Conversation.objects.filter(pk=conversation_id).values_list('type', flat=True).first() or 'whatsapp'
+    try:
+        return importlib.import_module(f'modules.aistudio_{conv_type}.tasks').process_workflow_messages
+    except Exception:
+        from modules.aistudio_whatsapp.tasks import process_workflow_messages
+        return process_workflow_messages
+
+
+_FLOW_THREAD_PREFIXES = ('whatsapp_', 'wa_web_')
+
+
 def _failed_runs_fallback(minutes: int = 15) -> int:
     """For every WhatsApp flow run of the last `minutes` that ended failed and whose customer got
     nothing since it started: the holding line quoted on their newest message + a staff note."""
@@ -2147,14 +2195,18 @@ def _failed_runs_fallback(minutes: int = 15) -> int:
 
     told = 0
     since = timezone.now() - timedelta(minutes=minutes)
-    runs = (WorkflowExecution.objects.filter(created_at__gte=since, trigger_context__thread_id__startswith='whatsapp_')
+    from django.db.models import Q
+    thread_q = Q()
+    for prefix in _FLOW_THREAD_PREFIXES:
+        thread_q |= Q(trigger_context__thread_id__startswith=prefix)
+    runs = (WorkflowExecution.objects.filter(thread_q, created_at__gte=since)
             .exclude(status__in=('completed', 'running', 'pending', 'paused'))
             .order_by('created_at')[:50])
     for run in runs:
         if not cache.add(f'qurtoba:failed_run_told:{run.pk}', 1, timeout=3600):
             continue
         thread = str((run.trigger_context or {}).get('thread_id') or '')
-        conv_id = thread[len('whatsapp_'):] if thread.startswith('whatsapp_') else None
+        conv_id = next((thread[len(p):] for p in _FLOW_THREAD_PREFIXES if thread.startswith(p)), None)
         conv = Conversation.objects.filter(pk=conv_id).first() if conv_id else None
         if conv is None or not getattr(conv, 'handled_by_ai', False):
             continue
@@ -2162,8 +2214,8 @@ def _failed_runs_fallback(minutes: int = 15) -> int:
         if Message.objects_all.filter(conversation=conv, direction='outbound', is_internal=False,
                                       created_at__gt=started).exclude(type__in=('tool', 'tool_call')).exists():
             continue                                    # something did reach the customer
-        newest = (Message.objects_all.filter(conversation=conv, direction='inbound', active=True)
-                  .order_by('-created_at').first())
+        from qurtoba.groups import customer_inbound
+        newest = customer_inbound(conv).order_by('-created_at').first()
         if newest is None:
             continue
         send_quoted(conv, str(newest.id), R.MODEL_DOWN, once_minutes=30)
@@ -2206,6 +2258,7 @@ def _abdicated_transaction_messages(min_age_s: int = 60, max_age_min: int = 6):
     from datetime import timedelta
     from django.utils import timezone
     from modules.chat.models import Message
+    from qurtoba.groups import staff_q
     from qurtoba.tools.planning import _classify_message
 
     now = timezone.now()
@@ -2214,8 +2267,10 @@ def _abdicated_transaction_messages(min_age_s: int = 60, max_age_min: int = 6):
         .filter(direction='inbound', type='text', active=True, ai_consumed_at__isnull=True,
                 created_at__lte=now - timedelta(seconds=min_age_s),
                 created_at__gte=now - timedelta(minutes=max_age_min),
-                conversation__handled_by_ai=True, conversation__type='whatsapp',
+                conversation__handled_by_ai=True, conversation__type__in=('whatsapp', 'wa_web'),
                 conversation__social_partner__qurtoba_customer__isnull=False)
+        .exclude(staff_q())
+        .select_related('conversation')
         .order_by('created_at')
     )
     out = []

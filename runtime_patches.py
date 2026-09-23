@@ -33,6 +33,29 @@ def install() -> None:
         except Exception:
             logger.exception('qurtoba runtime patch FAILED: %s', name)
 
+    # WhatsApp Web customer groups (owner decision 2026-09-23) — only when the channel is installed.
+    if not _wa_web_installed():
+        return
+    for name, fn in (
+        ('wa_web: a group run is about the group (its customer), not the member who spoke', _group_run_is_the_group),
+        ('wa_web: a silent turn stays silent (no apology, no escalation)', _silent_wa_web_turns),
+        ('wa_web: groups only on the Cloud API number', _wa_web_groups_only),
+        ('wa_web: an unreadable message never switches a group\'s AI off', _no_group_escalation_on_unsupported),
+    ):
+        try:
+            fn()
+            logger.info('qurtoba runtime patch: %s', name)
+        except Exception:
+            logger.exception('qurtoba runtime patch FAILED: %s', name)
+
+
+def _wa_web_installed() -> bool:
+    try:
+        from django.apps import apps
+        return apps.is_installed('modules.wa_web') and apps.is_installed('modules.aistudio_wa_web')
+    except Exception:
+        return False
+
 
 # ── 1. LangGraph debug output ──────────────────────────────────────────────────
 
@@ -140,3 +163,123 @@ def _retry_missed_statuses() -> None:
     wrapped = staticmethod(update_message_status)
     wrapped._qurtoba_retrying = True
     S._update_message_status = wrapped
+
+
+# ── 5. WhatsApp Web: the run's partner in a group is the GROUP ────────────────
+#
+# One group = one Qurtoba customer, linked on the group's placeholder partner (qurtoba.groups).
+# Core (f678ecce) hands the member who spoke last in as the run's ``partner``; for Qurtoba that
+# would make every «linked?» check, tool and template read an unlinked member (or staff) instead of
+# the group's customer. Returning None keeps the bridge's own default: partner = the group.
+# Who spoke is still on every message's sender (staff filtering) and in ``state.group``.
+
+def _group_run_is_the_group() -> None:
+    import modules.aistudio_wa_web.group_context as gc
+    if getattr(gc.speaker_of, '_qurtoba_group_partner', False):
+        return
+
+    def speaker_of(messages):
+        return None
+
+    speaker_of._qurtoba_group_partner = True
+    speaker_of._qurtoba_original = gc.speaker_of
+    gc.speaker_of = speaker_of
+
+
+# ── 6. WhatsApp Web: an empty output is a deliberate silent turn ──────────────
+#
+# The wa_web bridge counts an empty workflow output as a FAILURE: it re-runs the workflow, then posts
+# the apology to the group, escalates (AI off for that group, for good) and e-mails the failure
+# (aistudio_wa_web/tasks.py, «is_error = … or not result.output»). Every Qurtoba turn whose words went
+# out through the tools ends with ''. The Cloud bridge has an «intentional empty» branch; wa_web does
+# not — so a successful empty run becomes SILENT_SENTINEL, which the outbound gate drops unsent.
+
+def _silent_wa_web_turns() -> None:
+    import modules.aistudio.services as svc
+    orig = svc.execute_workflow_sync
+    if getattr(orig, '_qurtoba_silent', False):
+        return
+
+    def execute_workflow_sync(workflow_id, input_data, **kwargs):
+        result = orig(workflow_id, input_data, **kwargs)
+        try:
+            if (kwargs.get('trigger_source') == 'wa_web' and getattr(result, 'success', False)
+                    and getattr(result, 'status', 'completed') == 'completed'
+                    and not str(getattr(result, 'output', None) or '').strip()):
+                from qurtoba.groups import SILENT_SENTINEL
+                result.output = SILENT_SENTINEL
+        except Exception:
+            logger.warning('qurtoba: silent-turn marker failed', exc_info=True)
+        return result
+
+    execute_workflow_sync._qurtoba_silent = True
+    execute_workflow_sync._qurtoba_original = orig
+    svc.execute_workflow_sync = execute_workflow_sync
+
+
+# ── 7. WhatsApp Web on the Cloud API number keeps the groups only ─────────────
+#
+# The office number is linked to WhatsApp Web for the customers' groups while its 1:1 chats stay on
+# the Cloud API (coexistence). Every private message would otherwise be stored twice — two chats per
+# customer, one of them outside every Qurtoba rule. The switch «واتساب ويب: الجروبات بس» on the Cloud
+# account of the same number decides (default on).
+
+def _wa_web_groups_only() -> None:
+    from modules.wa_web.services.ingest import Ingest
+    orig = Ingest.message
+    if getattr(orig, '_qurtoba_groups_only', False):
+        return
+
+    def message(self, msg, *args, **kwargs):
+        try:
+            if isinstance(msg, dict) and not msg.get('is_group') and _groups_only(self.account):
+                return None
+        except Exception:
+            logger.warning('qurtoba: groups-only check failed — storing the message', exc_info=True)
+        return orig(self, msg, *args, **kwargs)
+
+    message._qurtoba_groups_only = True
+    message._qurtoba_original = orig
+    Ingest.message = message
+
+
+def _groups_only(account) -> bool:
+    from django.core.cache import cache
+    key = f'qurtoba:wa_web_groups_only:{getattr(account, "pk", None)}'
+    cached = cache.get(key)
+    if cached is not None:
+        return bool(cached)
+    from qurtoba.groups import twin_cloud_account
+    twin = twin_cloud_account(account)
+    value = bool(getattr(twin, 'qurtoba_wa_web_groups_only', True)) if twin is not None else False
+    cache.set(key, int(value), 60)
+    return value
+
+
+# ── 8. An unreadable group message must not switch the whole group's AI off ──
+#
+# Core: an inbound row stored as original_type='unsupported' → conversation.escalate_to_human() (AI off
+# for the conversation, for good). Right for a coexistence placeholder in a 1:1 chat; in a customer group
+# any new WhatsApp message kind (an event, a new card type…) would silence the AI for every member. The
+# chat.Message pre_create hook flags exactly that save; the escalation is skipped, core still leaves
+# the row to a human (it returns before the AI).
+
+def _no_group_escalation_on_unsupported() -> None:
+    from modules.chat.models import Conversation
+    orig = Conversation.escalate_to_human
+    if getattr(orig, '_qurtoba_group_guard', False):
+        return
+
+    def escalate_to_human(self, *args, **kwargs):
+        try:
+            from qurtoba.groups import escalation_suppressed
+            if escalation_suppressed():
+                logger.info('qurtoba: unreadable message in group %s — escalation skipped, the AI stays on', self.pk)
+                return False
+        except Exception:
+            pass
+        return orig(self, *args, **kwargs)
+
+    escalate_to_human._qurtoba_group_guard = True
+    escalate_to_human._qurtoba_original = orig
+    Conversation.escalate_to_human = escalate_to_human

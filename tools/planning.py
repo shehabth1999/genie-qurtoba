@@ -167,6 +167,11 @@ def _is_glued_name_label(tok: str) -> bool:
 
 
 # a phone-length digit run (9+) glued to a letter on either side — «01080755798مبلغ», «رقم01012345678»
+# A mobile number that lost its leading 0 (and often a digit): «101877357» — 9–10 digits on a mobile prefix
+# (10/11/12/15). Never an amount (no transfer here is 100,000,000+); a broken number the customer must resend
+# (2026-09-17 23:52, chat 13f58d64: it was asked about as «الرقم للمبلغ 101,877,357؟»).
+_MOBILE_NO_ZERO_RE = re.compile(r'1[0125]\d{7,8}')
+
 _PHONE_GLUE_RES = (re.compile(r'(\d{9,})(?=[^\W\d_])'), re.compile(r'([^\W\d_])(?=\d{9,})'))
 
 
@@ -303,7 +308,7 @@ def _classify_message(text: str) -> Dict[str, Any]:
             if line_phones and re.fullmatch(r'\+2|\+20|002|0020', _tok):
                 continue                   # «+2» / «+20» / «002» next to the number: a country code, not 2 pounds
                                            # (a bare «20» is a number: «01… المبلغ 20 ألف», 2026-09-08)
-            if re.fullmatch(r'0\d{9,11}', _tok):
+            if re.fullmatch(r'0\d{9,11}', _tok) or _MOBILE_NO_ZERO_RE.fullmatch(_tok):
                 has_name = True            # broken phone → noise, not a giant amount
                 _ignore(_tok, 'broken_phone')
             elif _is_glued_name_label(_tok):
@@ -350,7 +355,7 @@ def _classify_message(text: str) -> Dict[str, Any]:
                 _ignore(rest_text, 'fraction')
                 continue
             for tok, rr in toks:
-                if re.fullmatch(r'0\d{9,11}', tok) or _is_phone(tok):
+                if re.fullmatch(r'0\d{9,11}', tok) or _MOBILE_NO_ZERO_RE.fullmatch(tok) or _is_phone(tok):
                     # a phone-shaped run inside the line is a (broken) number, never an amount —
                     # «01080755798مبلغ10700» once yielded the amount 1,080,755,798 (2026-09-18)
                     has_name = True
@@ -727,7 +732,8 @@ def _extract_answers(conv, rows, include_consumed: bool = False):
                         and getattr(prev, 'reply_to', None) is not None \
                         and getattr(prev.reply_to, 'direction', None) == 'inbound' \
                         and _classify_message(_msg_text(prev.reply_to))['phones']:
-                    between = _M.objects_all.filter(
+                    from qurtoba.groups import money_rows
+                    between = money_rows(_M.objects_all, conv).filter(
                         conversation=conv, direction='inbound', type='text', active=True,
                         created_at__gt=prev.created_at, created_at__lt=r.created_at,
                     )
@@ -819,8 +825,9 @@ def consumed_ids_by_source(conv):
         from django.db.models.functions import Coalesce
         from modules.chat.models import Message as _M
         _cut = _tz.now() - timedelta(minutes=getattr(_dj, 'AI_UNPROCESSED_WINDOW_MIN', 6))
+        from qurtoba.groups import money_rows
         rows = list(
-            _M.objects_all
+            money_rows(_M.objects_all, conv)
             .filter(conversation=conv, direction='inbound', active=True, type='text',
                     ai_consumed_at__isnull=True, created_at__gte=_cut)
             .annotate(_ord=Coalesce('social_sent_at', 'created_at'))
@@ -967,8 +974,9 @@ def qurtoba_plan_transactions(
             from django.db.models.functions import Coalesce
             from modules.chat.models import Message as _M
             _cut = _tz.now() - timedelta(minutes=getattr(_dj, 'AI_UNPROCESSED_WINDOW_MIN', 6))
+            from qurtoba.groups import money_rows
             _rows = list(
-                _M.objects_all
+                money_rows(_M.objects_all, conv)
                 .filter(conversation=conv, direction='inbound', active=True, type='text',
                         ai_consumed_at__isnull=True, created_at__gte=_cut)
                 .annotate(_ord=Coalesce('social_sent_at', 'created_at'))

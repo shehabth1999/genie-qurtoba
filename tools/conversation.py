@@ -29,8 +29,9 @@ from modules.aistudio.tools import tool
     rate_limit=20,
 )
 def qurtoba_send_customer_balance_to_chat(context) -> Dict[str, Any]:
+    from qurtoba.groups import chat_partner
     conv = getattr(context, 'conversation', None)
-    partner = getattr(context, 'partner', None)
+    partner = chat_partner(conv, getattr(context, 'partner', None))
     if partner is None and conv is not None:
         partner = getattr(conv, 'social_partner', None)
 
@@ -103,7 +104,8 @@ def qurtoba_clear_pending_transfers(context) -> Dict[str, Any]:
         from modules.chat.models import Message
         window = getattr(_dj, 'AI_UNPROCESSED_WINDOW_MIN', 6)
         cutoff = timezone.now() - timedelta(minutes=window)
-        rows = Message.objects_all.filter(
+        from qurtoba.groups import money_rows
+        rows = money_rows(Message.objects_all, conv).filter(
             conversation=conv, direction='inbound', active=True, type='text',
             ai_consumed_at__isnull=True, created_at__gte=cutoff,
         )

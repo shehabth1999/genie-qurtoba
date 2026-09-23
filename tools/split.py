@@ -42,8 +42,9 @@ def _split_messages(conversation, source):
     from qurtoba.models import QurtobaRecord
     from qurtoba.tools.planning import _classify_message
 
+    from qurtoba.groups import exclude_staff
     rows = list(
-        Message.objects_all
+        exclude_staff(Message.objects_all, conversation)
         .filter(conversation=conversation, direction='inbound', active=True, type='text',
                 created_at__gte=source.created_at - timedelta(seconds=_BURST_BEFORE_SECONDS))
         .annotate(_ord=Coalesce('social_sent_at', 'created_at'))

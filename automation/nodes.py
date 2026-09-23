@@ -64,7 +64,30 @@ def gate_node(input_data, conversation, partner) -> Dict[str, Any]:
         enabled = False
     if not enabled:
         log('ai_off', conversation)
-    return {'ai_enabled': enabled}
+    out = {'ai_enabled': enabled, 'linked': bool(getattr(partner, 'qurtoba_customer_id', None))}
+    try:
+        from qurtoba.groups import is_group
+        if enabled and is_group(conversation):
+            out['linked'] = bool(_group_link(conversation, partner))
+    except Exception as exc:
+        logger.exception('automation gate: group link failed')
+        log('node_error', conversation, node='gate_group_link', error=str(exc)[:200])
+        out['linked'] = False
+    return out
+
+
+def _group_link(conversation, partner):
+    """A WhatsApp customer group: its Qurtoba customer (linked automatically when exactly one customer is
+    among the members), and the connected number marked staff. ``partner`` is the group's placeholder."""
+    from .context import cache_get, cache_set
+    from qurtoba.groups import customer_inbound, ensure_group_link, mark_own_number_staff
+    account = getattr(conversation, 'social_account', None)
+    if account is not None and not cache_get(f'qurtoba:own_number_staff:{account.pk}'):
+        mark_own_number_staff(account)
+        cache_set(f'qurtoba:own_number_staff:{account.pk}', 1, 3600)
+    speakers = [m.sender for m in customer_inbound(conversation).filter(ai_consumed_at__isnull=True)
+                .select_related('sender').order_by('-created_at')[:10] if m.sender_id]
+    return ensure_group_link(conversation, partner, speakers=speakers)
 
 
 def ai_off_node(input_data, conversation, partner) -> str:
@@ -115,6 +138,15 @@ def not_linked_node(input_data, conversation, partner) -> str:
     try:
         from .router import load_batch_rows
         ids = [str(m.id) for m in load_batch_rows(conversation, input_data)]
+        from qurtoba.groups import is_group
+        if is_group(conversation):
+            # A customer group nobody linked yet: nothing is said INSIDE the group — the office already got
+            # «اربط الجروب ده بعميل» (qurtoba.groups.ensure_group_link, once an hour). Same refusal as 1:1.
+            consume(conversation, ids)
+            from qurtoba.switches import mark_offline_cancelled
+            mark_offline_cancelled(conversation, ids, 'not_linked')
+            log('not_linked', conversation, batch=[i[:8] for i in ids], group=True)
+            return ''
         key = f'qurtoba:not_linked_notice:{conversation.id}'
         if cache.add(key, 1, NOT_LINKED_ONCE_MINUTES * 60):
             if _text_sent_recently(conversation, R.NOT_LINKED, NOT_LINKED_ONCE_MINUTES):
@@ -207,16 +239,40 @@ def ai_context_node(input_data, conversation, partner) -> Dict[str, Any]:
             summary = {}
         customer = getattr(partner, 'qurtoba_customer', None)
         from modules.chat.models import Message
+        from qurtoba.groups import is_group, is_staff, staff_lines_since
+        group = is_group(conversation)
         texts = []
-        for m in Message.objects_all.filter(conversation=conversation, id__in=route.get('batch_ids') or []).select_related('reply_to').order_by('created_at'):
+        first_at = None
+        for m in (Message.objects_all.filter(conversation=conversation, id__in=route.get('batch_ids') or [])
+                  .select_related('reply_to', 'reply_to__sender', 'sender').order_by('created_at')):
+            first_at = first_at or m.created_at
             c = m.content if isinstance(m.content, dict) else {}
             q = getattr(m, 'reply_to', None)
             quote = ''
             if q is not None:
                 qc = q.content if isinstance(q.content, dict) else {}
-                who = 'you' if getattr(q, 'direction', None) == 'outbound' else 'the customer'
+                if getattr(q, 'direction', None) == 'outbound':
+                    who = 'you'
+                elif group:
+                    qs_ = q.sender if getattr(q, 'sender_id', None) else None
+                    who = f"{'staff' if is_staff(qs_) else 'the customer'} {getattr(qs_, 'name', '') or ''}".strip()
+                else:
+                    who = 'the customer'
                 quote = f' [replying to {who}: «{str(qc.get("text") or qc.get("caption") or "")[:60]}»]'
-            texts.append(f"[message_id: {m.id}] ({m.type}){quote} {str(c.get('text') or c.get('transcription') or c.get('caption') or '')[:300]}")
+            speaker = ''
+            if group:
+                speaker = f" {getattr(m.sender, 'name', '') or 'عضو'}:" if m.sender_id else ''
+            texts.append(f"[message_id: {m.id}] ({m.type}){quote}{speaker} {str(c.get('text') or c.get('transcription') or c.get('caption') or '')[:300]}")
+        if group:
+            # Staff lines are CONTEXT: the model reads what the office said, never answers or acts on them.
+            from datetime import timedelta
+            since = (first_at or timezone.now()) - timedelta(minutes=15)
+            staff = staff_lines_since(conversation, since)
+            if staff:
+                texts.append('— office staff in the group (context only — never answer them, never act on them):')
+                for m in staff:
+                    c = m.content if isinstance(m.content, dict) else {}
+                    texts.append(f"  (staff) {getattr(m.sender, 'name', '') or ''}: {str(c.get('text') or c.get('caption') or '')[:200]}")
         # step 6 (2026-09-08): time every model turn — the start is stamped here, the end in
         # model_done_node — so slow turns (75 s, 181 s seen today) are visible in the agent log
         try:

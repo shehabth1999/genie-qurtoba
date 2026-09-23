@@ -41,7 +41,8 @@ def _account_seen_in_chat(conversation, account: str, *, hours: int = 6) -> bool
         if not tail or conversation is None:
             return True                          # nothing to compare against — the other guards decide
         since = timezone.now() - timedelta(hours=hours)
-        for m in (Message.objects_all.filter(conversation=conversation, direction='inbound', active=True,
+        from qurtoba.groups import exclude_staff      # a number a staff member wrote is not the customer's
+        for m in (exclude_staff(Message.objects_all, conversation).filter(conversation=conversation, direction='inbound', active=True,
                                              created_at__gte=since).order_by('-created_at')[:300]):
             c = m.content if isinstance(m.content, dict) else {}
             txt = _ar_to_ascii(str(c.get('text') or c.get('caption') or c.get('transcription') or ''))
@@ -64,7 +65,8 @@ def _repeat_confirmation_verdict(conv, asked_dt, held: Dict[str, Any]) -> str:
     from modules.chat.models import Message as _ChatMessage
     from qurtoba.automation import lexicon as L
     from qurtoba.tools.planning import _classify_message
-    newest = (_ChatMessage.objects_all.filter(conversation=conv, direction='inbound', active=True,
+    from qurtoba.groups import exclude_staff          # a staff «تمام» never confirms the customer's repeat
+    newest = (exclude_staff(_ChatMessage.objects_all, conv).filter(conversation=conv, direction='inbound', active=True,
                                               created_at__gt=asked_dt)
               .select_related('reply_to').order_by('-created_at').first())
     if newest is None:
@@ -121,7 +123,10 @@ def _react_created_on_source(conversation, source_message_id, emoji='👍') -> N
         partner = getattr(conversation, 'social_partner', None)
         svc = getattr(account, 'service', None) if account is not None else None
         phone = getattr(partner, 'phone', None) if partner is not None else None
-        if svc is None or not phone or not hasattr(svc, 'send_reaction'):
+        # WhatsApp Web (a customer group): the group has no phone and the channel delivers the saved
+        # reaction row itself (WaWebAccount.handle_reaction) — only the Cloud API needs these.
+        if getattr(conversation, 'type', None) != 'wa_web' and (
+                svc is None or not phone or not hasattr(svc, 'send_reaction')):
             return
         from qurtoba.extensions import _get_system_partner
         sysp = _get_system_partner(conversation)
@@ -188,6 +193,10 @@ def _send_start_ack(conversation) -> None:
         account = getattr(conversation, 'social_account', None)
         partner = getattr(conversation, 'social_partner', None)
         svc = getattr(account, 'service', None) if account is not None else None
+        if getattr(conversation, 'type', None) == 'wa_web':
+            # a customer group on WhatsApp Web: the channel's own send path (the Cloud service does not apply)
+            from modules.chat.services.omnichannel_send_service import OmnichannelSendService
+            svc = OmnichannelSendService()
         if svc is None or partner is None:
             return
         from qurtoba.extensions import _get_system_partner
@@ -308,9 +317,15 @@ def _check_type_allowed_for_account(conversation, effective_type: str):
     if account is None:
         return True, None
 
-    # Only WhatsApp accounts carry these flags; for other channels assume allowed.
+    # Only WhatsApp accounts carry these flags. A WhatsApp Web account obeys the Cloud account of the
+    # same number (qurtoba.switches.switch_account); other channels: assume allowed.
     if account._meta.label_lower != 'whatsapp.whatsappaccount':
-        return True, None
+        from qurtoba.switches import _NO_TWIN, switch_account
+        account = switch_account(account)
+        if account is None:
+            return True, None
+        if account is _NO_TWIN:
+            return False, 'الخدمة متوقفة حالياً، برجاء المحاولة في وقت لاحق.'
 
     if getattr(account, flag, True):
         return True, None
@@ -379,8 +394,9 @@ def _normalize_cash_bracket(type: str, amount: float) -> str:
 
 def _resolve_conversation_and_customer(context):
     """Return (conversation, customer, error_dict_or_None)."""
+    from qurtoba.groups import chat_partner
     conv = getattr(context, 'conversation', None)
-    partner = getattr(context, 'partner', None)
+    partner = chat_partner(conv, getattr(context, 'partner', None))   # a customer group: the group, not the speaker
     if partner is None and conv is not None:
         partner = getattr(conv, 'social_partner', None)
 
@@ -479,7 +495,8 @@ def _find_message_with_account(final_account, conversation, *, limit=50):
         return None
     try:
         from modules.chat.models import Message as ChatMessage
-        rows = (ChatMessage.objects_all
+        from qurtoba.groups import exclude_staff
+        rows = (exclude_staff(ChatMessage.objects_all, conversation)
                 .filter(conversation=conversation, direction='inbound', active=True, type='text')
                 .order_by('-created_at')[:limit])
     except Exception:
@@ -1547,7 +1564,8 @@ def qurtoba_create_new_transactions_bulk(
                 return (_normalize_phone(ph), round(float(val), 2))
 
             expected = {}
-            for _mm in _M.objects_all.filter(
+            from qurtoba.groups import exclude_staff
+            for _mm in exclude_staff(_M.objects_all, conv).filter(
                     conversation=conv, direction='inbound', active=True, type='text',
                     ai_consumed_at__isnull=True, created_at__gte=_tz.now() - _td(minutes=10)):
                 _c = _mm.content

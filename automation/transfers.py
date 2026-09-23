@@ -345,9 +345,55 @@ def run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     conv_key = str(getattr(conversation, 'id', ''))
     _acquire_run_lock(conv_key)
     try:
-        return _run(conversation, partner, route)
+        from qurtoba.groups import open_senders
+        senders = open_senders(conversation, route.get('batch_ids') or [])
+        if len(senders) <= 1:
+            return _run(conversation, partner, route)
+        return _run_per_sender(conversation, partner, route, senders)
     finally:
         _release_run_lock(conv_key)
+
+
+def _run_per_sender(conversation, partner, route: Dict[str, Any], senders) -> Dict[str, Any]:
+    """A customer group where several members wrote in the same burst: the money path runs once per
+    member, so a number from one is never paired by position with an amount from another. Every run
+    charges the group's customer (``partner`` is the group); the results are merged for the model."""
+    from datetime import timedelta
+    from django.conf import settings as dj
+    from django.utils import timezone
+    from qurtoba.groups import customer_inbound, sender_scope
+    batch_ids = [str(i) for i in route.get('batch_ids') or []]
+    cut = timezone.now() - timedelta(minutes=getattr(dj, 'AI_UNPROCESSED_WINDOW_MIN', 6))
+    qs = customer_inbound(conversation)
+    sender_of = {str(k): v for k, v in qs.filter(id__in=batch_ids).values_list('id', 'sender_id')}
+    results = []
+    for sid in senders:
+        ids = [i for i in batch_ids if sender_of.get(i) == sid]
+        if not ids:          # this member only has lines still open from an earlier turn
+            ids = [str(i) for i in qs.filter(sender_id=sid, ai_consumed_at__isnull=True, created_at__gte=cut,
+                                             qurtoba_offline_cancelled_at__isnull=True)
+                   .order_by('created_at').values_list('id', flat=True)]
+        if not ids:
+            continue
+        sub = dict(route)
+        sub['batch_ids'] = ids
+        with sender_scope(sid):
+            results.append(_run(conversation, partner, sub))
+    log('group_per_sender', conversation, senders=len(senders), runs=len(results))
+    if not results:
+        return {'items': 0, 'replies': 0, 'created': [], 'leftovers': [], 'others': [], 'needs_ai': False,
+                'pending': [], 'summary': render_ai_summary({})}
+    merged: Dict[str, Any] = {
+        'items': sum(int(r.get('items') or 0) for r in results),
+        'replies': sum(int(r.get('replies') or 0) for r in results),
+        'created': [c for r in results for c in (r.get('created') or [])],
+        'leftovers': [x for r in results for x in (r.get('leftovers') or [])],
+        'others': [x for r in results for x in (r.get('others') or [])],
+        'needs_ai': any(r.get('needs_ai') for r in results),
+        'pending': results[-1].get('pending') or [],
+    }
+    merged['summary'] = render_ai_summary(merged)
+    return merged
 
 
 def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:

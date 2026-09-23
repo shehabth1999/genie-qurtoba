@@ -12,6 +12,15 @@ qurtoba.switches. Nothing in this graph looks at the clock (owner decision 2026-
     manage.py qurtoba_workflow_v2 --release       # point WhatsApp account 3 at workflow 3
     manage.py qurtoba_workflow_v2 --rollback      # account back to workflow 2, drop partner overrides
 
+    manage.py qurtoba_workflow_v2 --variant group         # build «Qurtoba Groups» (WhatsApp Web customer groups)
+    manage.py qurtoba_workflow_v2 --variant group --release-group   # attach it to the WhatsApp Web account
+    manage.py qurtoba_workflow_v2 --variant group --rollback-group  # detach it (the groups go quiet)
+
+The group variant is W3's graph with the channel-neutral reply tool (qurtoba_reply_to_message — core's
+whatsapp_reply_to_message only works on the Cloud API), a group section in the prompts, the «linked?»
+check read from the gate (the group's customer, linked automatically when exactly one member is a
+customer) and the bridge's ``group`` state declared (owner decision 2026-09-23).
+
 The graph is versioned here (git), not on the canvas: re-running the command restores
 it exactly. Nodes copied from workflow 2 (the shared-core / service-availability function
 nodes and the payments agent) are read from the live workflow 2 at build time so the
@@ -29,6 +38,11 @@ from qurtoba.automation.nodes import NODE_CODE
 TARGET_WORKFLOW_ID = 3
 SOURCE_WORKFLOW_ID = 2
 WHATSAPP_ACCOUNT_ID = 3
+
+GROUP_WORKFLOW_KEY = 'qurtoba_groups'
+GROUP_WORKFLOW_NAME = 'Qurtoba Groups (WhatsApp Web)'
+CLOUD_REPLY_TOOL = 'whatsapp_reply_to_message'
+GROUP_REPLY_TOOL = 'qurtoba_reply_to_message'
 
 SHARED_CORE_NODE = 'function_1783509447802'
 AVAILABILITY_NODE = 'function_1780949181829'
@@ -83,6 +97,28 @@ OFF_HOURS_TOOLS = (
 )
 
 
+def _group_prompt(base: str, addendum_path: str) -> str:
+    """W3's prompt for a customer group: the channel-neutral reply tool, and the group section inserted right
+    after the context block (one source of truth — the 1:1 rules apply in the group unchanged)."""
+    with open(addendum_path, encoding='utf-8') as fh:
+        addendum = fh.read().strip()
+    text = base.replace(CLOUD_REPLY_TOOL, GROUP_REPLY_TOOL)
+    marker = '</context>'
+    at = text.find(marker)
+    if at < 0:
+        return addendum + '\n\n' + text
+    at += len(marker)
+    return text[:at] + '\n\n' + addendum + '\n' + text[at:]
+
+
+_GROUP_PROMPT_PATH = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, 'prompts', 'agents', 'thinker', 'group.md')
+_OFF_HOURS_GROUP_PROMPT_PATH = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, 'prompts', 'agents', 'off_hours', 'group.md')
+
+
+def _swap_tool(names, variant):
+    return tuple(GROUP_REPLY_TOOL if (variant == 'group' and n == CLOUD_REPLY_TOOL) else n for n in names)
+
+
 def _off_hours_prompt() -> str:
     with open(_OFF_HOURS_PROMPT_PATH, encoding='utf-8') as fh:
         text = fh.read()
@@ -101,7 +137,7 @@ def _fn(node_id, label, x, y, code, timeout=60):
                 configuration={'code': code, 'description': '', 'update_state': [], 'timeout_seconds': timeout})
 
 
-def build_spec(src_nodes, tool_ids):
+def build_spec(src_nodes, tool_ids, variant='cloud'):
     """(nodes, edges, global_configuration) for the v2 graph:
     AI on? [off → nothing] → linked? → route → [off-hours → closed agent | receipt → payments agent | money path → needs AI? → thinker | done]"""
     def src_cfg(node_id):
@@ -117,10 +153,17 @@ def build_spec(src_nodes, tool_ids):
     payments['llm_model_id'] = 21
     payments['llm_model_name'] = 'Claude Haiku 4.5'
     payments['backup_llm_model_id'] = 31
+    if variant == 'group':
+        cloud_id, group_id = tool_ids.get(CLOUD_REPLY_TOOL), tool_ids.get(GROUP_REPLY_TOOL)
+        for t in payments.get('selected_tools') or []:
+            if cloud_id and t.get('tool_id') == cloud_id:
+                t['tool_id'] = group_id
 
     thinker = src_cfg(SRC_CASH_NODE)
-    thinker['messages'] = [{'role': 'system', 'text': _thinker_prompt(), 'cache': True, 'cache_ttl': '5m', 'attachments': []}]
-    thinker['selected_tools'] = [{'store': True, 'tool_id': tool_ids[name], 'ask_human': False} for name in THINKER_TOOLS]
+    thinker_text = _thinker_prompt() if variant != 'group' else _group_prompt(_thinker_prompt(), _GROUP_PROMPT_PATH)
+    thinker['messages'] = [{'role': 'system', 'text': thinker_text, 'cache': True, 'cache_ttl': '5m', 'attachments': []}]
+    thinker['selected_tools'] = [{'store': True, 'tool_id': tool_ids[name], 'ask_human': False}
+                                 for name in _swap_tool(THINKER_TOOLS, variant)]
     thinker['handoff'] = {'enabled': True, 'targets': [{
         'node_id': 'agent_payments', 'tool_name': '',
         'tool_description': 'Register سداد payments from a receipt image (شراء كاش / شراء فورى), or explicit payment wording («العميل دفع»).',
@@ -140,12 +183,14 @@ def build_spec(src_nodes, tool_ids):
 
     # Off-hours agent (manual switch «وضع خارج مواعيد العمل»): the thinker's model settings, its own prompt,
     # and ONLY the balance, statement and reply tools — nothing that can create money.
-    missing_off_hours_tools = [n for n in OFF_HOURS_TOOLS if n not in tool_ids]
+    off_hours_tools = _swap_tool(OFF_HOURS_TOOLS, variant)
+    missing_off_hours_tools = [n for n in off_hours_tools if n not in tool_ids]
     if missing_off_hours_tools:
         raise CommandError(f'off-hours tools not registered: {missing_off_hours_tools}')
     off_hours = json.loads(json.dumps(thinker))
-    off_hours['messages'] = [{'role': 'system', 'text': _off_hours_prompt(), 'cache': True, 'cache_ttl': '5m', 'attachments': []}]
-    off_hours['selected_tools'] = [{'store': True, 'tool_id': tool_ids[name], 'ask_human': False} for name in OFF_HOURS_TOOLS]
+    off_text = _off_hours_prompt() if variant != 'group' else _group_prompt(_off_hours_prompt(), _OFF_HOURS_GROUP_PROMPT_PATH)
+    off_hours['messages'] = [{'role': 'system', 'text': off_text, 'cache': True, 'cache_ttl': '5m', 'attachments': []}]
+    off_hours['selected_tools'] = [{'store': True, 'tool_id': tool_ids[name], 'ask_human': False} for name in off_hours_tools]
     off_hours['handoff'] = {'enabled': False, 'targets': []}
     off_hours['update_state'] = []
     off_hours['description'] = ('Off-hours agent: balance and statement only; refuses every transfer, payment, status check '
@@ -165,7 +210,10 @@ def build_spec(src_nodes, tool_ids):
             NODE_CODE['function_ai_off'], timeout=30),
         dict(node_id='conditional_linked', node_type='conditional', label='linked to a Qurtoba customer?', x=X0, y=300,
              configuration={'conditions': [{'operator': 'is_true', 'data_type': 'boolean',
-                                            'variable1': '{{partner.has_qurtoba_customer}}', 'variable2': ''}],
+                                            # a group: the gate linked (or found) the group's customer this turn
+                                            'variable1': ('{{ function_gate.linked }}' if variant == 'group'
+                                                          else '{{partner.has_qurtoba_customer}}'),
+                                            'variable2': ''}],
                             'default_branch': 'default'}),
         _fn('function_not_linked', 'NOT LINKED: notice once, messages cancelled on arrival', X1, 560, NODE_CODE['function_not_linked']),
         _fn('function_route', 'ROUTE: off-hours switch? receipt image? else money', X1, 300, NODE_CODE['function_route']),
@@ -191,7 +239,11 @@ def build_spec(src_nodes, tool_ids):
         dict(node_id=AVAILABILITY_NODE, node_type='function', label='service_availability', x=X3, y=40,
              configuration=src_cfg(AVAILABILITY_NODE)),
         dict(node_id=SHARED_CORE_NODE, node_type='function', label='shared_roles', x=X4, y=40,
-             configuration=src_cfg(SHARED_CORE_NODE)),
+             configuration=(src_cfg(SHARED_CORE_NODE) if variant != 'group' else {
+                 **src_cfg(SHARED_CORE_NODE),
+                 'code': ("def execute(input_data):\n"
+                          "    from qurtoba.agent_prompts import SHARED_CORE\n"
+                          f"    return SHARED_CORE.replace('{CLOUD_REPLY_TOOL}', '{GROUP_REPLY_TOOL}')\n")})),
         dict(node_id='agent_payments', node_type='agent_chat', label='payments_agent (vision model)', x=X5, y=40, configuration=payments),
     ]
     edges = [
@@ -216,7 +268,10 @@ def build_spec(src_nodes, tool_ids):
     ]
     global_configuration = {
         'schedules': [], 'chat_based': False, 'input_message': '', 'record_trigger': {}, 'recursion_limit': 25,
-        'state_injections': [],   # off-hours is the manual account switch (qurtoba.switches), not workflow state
+        # off-hours is the manual account switch (qurtoba.switches), not workflow state. A group run gets
+        # the bridge's roster/speakers as ``state.group`` — declared, or the engine drops it.
+        'state_injections': ([{'key': 'group', 'type': 'object', 'initial_value': {}, 'persist': False}]
+                             if variant == 'group' else []),
         'schedules_runtime': [],
     }
     return nodes, edges, global_configuration
@@ -232,28 +287,44 @@ class Command(BaseCommand):
         parser.add_argument('--canary', type=int, metavar='PARTNER_ID', help='route this partner to the v2 workflow')
         parser.add_argument('--release', action='store_true', help=f'point WhatsApp account {WHATSAPP_ACCOUNT_ID} at the v2 workflow')
         parser.add_argument('--rollback', action='store_true', help='account back to the source workflow; drop partner overrides')
+        parser.add_argument('--variant', choices=('cloud', 'group'), default='cloud',
+                            help='cloud = W3 (1:1 on the Cloud API); group = «Qurtoba Groups» (WhatsApp Web customer groups)')
+        parser.add_argument('--release-group', action='store_true',
+                            help='attach the group workflow to the WhatsApp Web account of the office number')
+        parser.add_argument('--rollback-group', action='store_true',
+                            help='detach it: the WhatsApp Web account answers no group')
 
     def handle(self, *args, **opts):
         from modules.aistudio.models import ToolDefinition, WorkflowDefinition, WorkflowEdge, WorkflowNode
         wf_id, src_id = opts['workflow_id'], opts['source_workflow']
+        variant = opts['variant']
 
+        if opts['release_group'] or opts['rollback_group']:
+            return self._rollout_group(opts)
         if opts['canary'] or opts['release'] or opts['rollback']:
             return self._rollout(opts, wf_id, src_id)
 
+        if variant == 'group':
+            wf_id = self._group_workflow(create=not opts['dry_run'])
+            if wf_id is None:
+                self.stdout.write('(dry run) the group workflow does not exist yet — it would be cloned from '
+                                  f'workflow {TARGET_WORKFLOW_ID}')
+                wf_id = TARGET_WORKFLOW_ID
         wf = WorkflowDefinition.objects.filter(pk=wf_id).first()
         src = WorkflowDefinition.objects.filter(pk=src_id).first()
         if wf is None or src is None:
             raise CommandError(f'workflow {wf_id} or {src_id} not found')
         src_nodes = {n.node_id: n for n in WorkflowNode.objects.filter(workflow=src)}
-        new_defs = _ensure_tool_definitions(THINKER_TOOLS)
+        wanted = tuple(dict.fromkeys(THINKER_TOOLS + (GROUP_REPLY_TOOL,)))
+        new_defs = _ensure_tool_definitions(wanted)
         if new_defs:
             self.stdout.write(f'tool definitions created: {new_defs}')
-        tool_ids = dict(ToolDefinition.objects.filter(name__in=THINKER_TOOLS).values_list('name', 'id'))
-        missing = [t for t in THINKER_TOOLS if t not in tool_ids]
+        tool_ids = dict(ToolDefinition.objects.filter(name__in=wanted).values_list('name', 'id'))
+        missing = [t for t in _swap_tool(THINKER_TOOLS, variant) if t not in tool_ids]
         if missing:
             raise CommandError(f'tools not registered in ToolDefinition: {missing}')
 
-        nodes, edges, gconf = build_spec(src_nodes, tool_ids)
+        nodes, edges, gconf = build_spec(src_nodes, tool_ids, variant=variant)
         if opts['dry_run']:
             for n in nodes:
                 self.stdout.write(f"NODE {n['node_id']:32s} {n['node_type']:12s} {n['label']}")
@@ -299,3 +370,59 @@ class Command(BaseCommand):
             WhatsAppAccount.objects.filter(pk=WHATSAPP_ACCOUNT_ID).update(workflow_id=src_id)
             n = Partner.all_objects.filter(workflow_id=wf_id).update(workflow_id=None)
             self.stdout.write(f'WhatsApp account {WHATSAPP_ACCOUNT_ID}: workflow → {src_id}; {n} partner override(s) cleared')
+
+    # ── WhatsApp Web customer groups (owner decision 2026-09-23) ─────────────────────────────────────
+
+    def _group_workflow(self, create=True):
+        """The «Qurtoba Groups» workflow id — cloned once from W3's definition row (the graph is then
+        rebuilt from this spec, like W3's)."""
+        from modules.aistudio.models import WorkflowDefinition
+        wf = WorkflowDefinition.objects.filter(key=GROUP_WORKFLOW_KEY).first()
+        if wf is not None:
+            return wf.pk
+        if not create:
+            return None
+        base = WorkflowDefinition.objects.get(pk=TARGET_WORKFLOW_ID)
+        wf = WorkflowDefinition.objects.get(pk=TARGET_WORKFLOW_ID)
+        wf.pk = None
+        wf.id = None
+        wf.key = GROUP_WORKFLOW_KEY
+        wf.name = GROUP_WORKFLOW_NAME
+        wf.description = ('Qurtoba accountant automations for the customers\' WhatsApp GROUPS on WhatsApp Web '
+                          '(one group = one customer; staff lines are context only). Built by qurtoba_workflow_v2 '
+                          '--variant group.')
+        wf.graph_data = base.graph_data
+        wf.save()
+        self.stdout.write(f'workflow {wf.pk} «{wf.name}» created from workflow {TARGET_WORKFLOW_ID}')
+        return wf.pk
+
+    def _rollout_group(self, opts):
+        from modules.chat.models import Conversation
+        from modules.wa_web.models import WaWebAccount
+        from qurtoba.groups import twin_cloud_account
+        wf_id = self._group_workflow(create=False)
+        accounts = [a for a in WaWebAccount.objects.all()
+                    if twin_cloud_account(a) is not None and twin_cloud_account(a).pk == WHATSAPP_ACCOUNT_ID]
+        if not accounts:
+            raise CommandError(f'no WhatsApp Web account with the number of WhatsApp account {WHATSAPP_ACCOUNT_ID} '
+                               '— connect the number first')
+        for acc in accounts:
+            if opts['rollback_group']:
+                WaWebAccount.objects.filter(pk=acc.pk).update(group_workflow=None, ai_in_groups=False)
+                self.stdout.write(f'WhatsApp Web account {acc.pk}: group workflow detached, AI in groups OFF')
+                continue
+            if wf_id is None:
+                raise CommandError('the group workflow does not exist — run --variant group first')
+            WaWebAccount.objects.filter(pk=acc.pk).update(
+                group_workflow_id=wf_id, handled_by_ai=True, ai_in_groups=True, ai_in_private=False)
+            # Switching the account on does not wake the groups that already exist (core sets a group's
+            # handled_by_ai only when it is created): turn on the groups linked to a Qurtoba customer.
+            from django.contrib.contenttypes.models import ContentType
+            linked = Conversation._base_manager.filter(
+                type='wa_web', is_group=True, social_account_object_id=acc.pk,
+                social_account_content_type=ContentType.objects.get_for_model(WaWebAccount),
+                social_partner__qurtoba_customer__isnull=False, handled_by_ai=False)
+            n = linked.update(handled_by_ai=True)
+            self.stdout.write(f'WhatsApp Web account {acc.pk}: group workflow → {wf_id}; AI in groups ON, private OFF; '
+                              f'{n} linked group(s) switched on')
+

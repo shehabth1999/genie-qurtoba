@@ -61,6 +61,14 @@ def _detect(instance):
     text = content.get('text') if isinstance(content, dict) else None
     sp_id = getattr(getattr(instance, 'conversation', None), 'social_partner_id', None)
 
+    if getattr(getattr(instance, 'conversation', None), 'type', None) == 'wa_web':
+        # WhatsApp Web: in a group every member writes (sender ≠ the group's placeholder), and what the
+        # office types on the phone is an outbound row authored by the number's own user-less partner —
+        # both are normal there. Only an AI partner stored as an inbound sender is still a bug.
+        if direction == 'inbound' and instance.sender_id and instance.sender_id in _get_ai_partner_ids():
+            return 'inbound_sender_is_ai_partner'
+        return None
+
     if direction == 'inbound':
         # An AI/business message stored as an inbound row (data bug / echo).
         if instance.sender_id and instance.sender_id in _get_ai_partner_ids():

@@ -372,6 +372,74 @@ class MessageQurtobaExtension(ModelExtension):
     # its only purpose was to guess sub-second order, which is unrecoverable, so the planner
     # clusters same-second messages and asks instead of guessing.
 
+    def pre_create(self):
+        """A WhatsApp Web customer group: an inbound kind the gateway cannot read is stored as
+        'unsupported', and core then calls ``escalate_to_human()`` — which switches the AI off for the
+        WHOLE group for good. Core's «do not process it with AI» still applies; only that escalation is
+        suppressed (qurtoba.groups.suppress_escalation, read by the runtime patch on escalate_to_human)."""
+        try:
+            if getattr(self, 'direction', None) == 'inbound' and getattr(self, 'original_type', None) == 'unsupported':
+                from qurtoba.groups import is_group, suppress_escalation
+                if is_group(getattr(self, 'conversation', None)):
+                    suppress_escalation(True)
+        except Exception:
+            pass
+
+    def post_create(self):
+        try:
+            from qurtoba.groups import suppress_escalation
+            suppress_escalation(False)
+        except Exception:
+            pass
+
+    # ── WhatsApp customer groups: staff marking and the group's customer (owner decision 2026-09-23) ──
+
+    @action
+    def action_qurtoba_toggle_staff(self):
+        """«موظف ⇄ عميل»: the senders of the selected group messages become office staff — in EVERY
+        group at once — or, if they already all are, customers again."""
+        from modules.base.models import Partner
+        msgs = [m for m in self if getattr(m, 'direction', None) == 'inbound' and getattr(m, 'sender_id', None)]
+        if not msgs:
+            return {'status': False, 'open_mode': 'message', 'data': {},
+                    'message': gettext('اختار رسالة واردة من عضو في الجروب')}
+        senders = {m.sender_id: m.sender for m in msgs}
+        make_staff = any(not getattr(p, 'employee', False) for p in senders.values())
+        Partner._base_manager.filter(pk__in=list(senders)).update(employee=make_staff)
+        names = '، '.join((p.name or '') for p in senders.values())
+        role = gettext('موظف') if make_staff else gettext('عميل')
+        try:
+            from qurtoba.staff_notes import post_staff_note
+            for conv in {m.conversation for m in msgs}:
+                post_staff_note(conv, [f'👤 {names} ← {role} (في كل الجروبات)'],
+                                subject=gettext('تغيير نوع عضو'), body=f'{names} ← {role}',
+                                dedupe_key=f'staff_toggle:{conv.id}:{sorted(senders)}:{make_staff}', dedupe_ttl=30)
+        except Exception:
+            pass
+        return {'status': True, 'open_mode': 'message', 'data': {},
+                'message': gettext('%(names)s بقى %(role)s في كل الجروبات') % {'names': names, 'role': role}}
+
+    @action
+    def action_qurtoba_link_group_to_sender(self):
+        """«ربط الجروب بعميل الرقم ده»: link the selected message's group to the Qurtoba customer its sender
+        stands for (the sender's own link, its star-linked parent's, or its phone on a customer)."""
+        from qurtoba.groups import customers_of_partner, is_group, is_staff, link_group
+        msg = next((m for m in self if getattr(m, 'direction', None) == 'inbound' and getattr(m, 'sender_id', None)), None)
+        if msg is None or not is_group(msg.conversation):
+            return {'status': False, 'open_mode': 'message', 'data': {},
+                    'message': gettext('اختار رسالة من العميل جوه جروب واتساب')}
+        if is_staff(msg.sender):
+            return {'status': False, 'open_mode': 'message', 'data': {},
+                    'message': gettext('الرقم ده متعلم موظف — اختار رسالة من العميل')}
+        found = customers_of_partner(msg.sender)
+        if len(found) != 1:
+            return {'status': False, 'open_mode': 'message', 'data': {},
+                    'message': gettext('الرقم ده مش مربوط بعميل قرطبة واحد — اربطه من صفحة العميل الأول')}
+        user = getattr(getattr(self, 'env', None), 'user', None)
+        link_group(msg.conversation, found[0], by=getattr(user, 'username', None))
+        return {'status': True, 'open_mode': 'message', 'data': {},
+                'message': gettext('الجروب اتربط بالعميل')}
+
     def mark_ai_consumed(self, record=None):
         """Best-effort: flag this message as consumed into `record`.
 
@@ -439,6 +507,15 @@ class WhatsAppAccountQurtobaExtension(ModelExtension):
         default=False,
         verbose_name=_('وضع خارج مواعيد العمل'),
         help_text=_('تشغيل يدوي فقط (لا يعمل بالتوقيت). أثناء التشغيل لا يتم تنفيذ أي معاملة أو سداد، ويستلم العميل رسالة خارج مواعيد العمل.'),
+    )
+
+    # The same office number is also linked to WhatsApp Web for the customers' groups (owner decision
+    # 2026-09-23). ON: WhatsApp Web keeps the GROUPS only — 1:1 chats already arrive here through the
+    # Cloud API, and storing them a second time would duplicate every chat (runtime_patches).
+    qurtoba_wa_web_groups_only = models.BooleanField(
+        default=True,
+        verbose_name=_('واتساب ويب: الجروبات بس'),
+        help_text=_('لما يكون شغال: واتساب ويب لنفس الرقم بيستقبل رسايل الجروبات بس، والشات الفردي يفضل على الـ API.'),
     )
 
     qurtoba_allow_cash = models.BooleanField(

@@ -40,7 +40,8 @@ from modules.aistudio.tools import tool
 def qurtoba_answer_pending(context, decision: str) -> Dict[str, Any]:
     from qurtoba.automation.pending import answer_pending
     conv = getattr(context, 'conversation', None)
-    partner = getattr(context, 'partner', None) or getattr(conv, 'social_partner', None)
+    from qurtoba.groups import chat_partner
+    partner = chat_partner(conv, getattr(context, 'partner', None)) or getattr(conv, 'social_partner', None)
     if conv is None or partner is None:
         return {'success': False, 'error_type': 'no_conversation', 'error': 'No active conversation in context.'}
     if decision not in ('yes', 'no'):

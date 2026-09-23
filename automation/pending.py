@@ -166,7 +166,9 @@ def answer_pending(conversation, partner, decision: str, answer_message_id: Opti
     # message, not about what we are holding («تأكيد» quoted on a different transfer).
     held_src = (st.get('correction') or {}).get('source_message_id') or (st.get('high_value') or {}).get('source_message_id')
     newest = _newest_inbound(conversation)
-    why_not = _answer_gate(conversation, st, newest)
+    # Only a YES moves money, so only a yes needs the customer's own newer answer. A no drops what we hold
+    # and is always confirmed to the customer (2026-09-08: a cancel must never be silent).
+    why_not = _answer_gate(conversation, st, newest) if yes else None
     if why_not:
         result.update(success=False, error_type='no_customer_answer', note=why_not,
                       kind=next((k for k in ('correction', 'list', 'high_value', 'repeat') if st.get(k)), 'none'))
@@ -279,9 +281,10 @@ def answer_pending(conversation, partner, decision: str, answer_message_id: Opti
 
 
 def _newest_inbound(conversation):
+    """The customer's newest line — in a group never a staff member's: a staff «تمام» answers nothing."""
     try:
-        from modules.chat.models import Message
-        return (Message.objects_all.filter(conversation=conversation, direction='inbound', active=True)
+        from qurtoba.groups import customer_inbound
+        return (customer_inbound(conversation)
                 .select_related('reply_to').order_by('-created_at').first())
     except Exception:
         return None
