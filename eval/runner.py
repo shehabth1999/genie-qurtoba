@@ -43,6 +43,20 @@ SANDBOX_PHONE = '201000000099'
 WORKFLOW_ID = 2
 WHATSAPP_ACCOUNT_ID = 3
 
+# WhatsApp Web customer-group sandbox (owner decision 2026-09-23): a never-connected WhatsApp Web
+# account, one group, three members — the sandbox customer (same phone as the 1:1 sandbox partner, so
+# the group links to the sandbox customer on its own), an employee of the customer, office staff.
+GROUP_WORKFLOW_ID = None            # set by the command (--workflow for a group run)
+WA_WEB_SANDBOX_NAME = 'SANDBOX · WhatsApp Web'
+WA_WEB_SANDBOX_PHONE = '201000000097'
+GROUP_SANDBOX_JID = '120363000000000099@g.us'
+GROUP_SANDBOX_SUBJECT = 'SANDBOX · جروب اختبار'
+GROUP_MEMBERS = {
+    'customer': ('201000000099', 'SANDBOX · العميل'),
+    'employee': ('201000000096', 'SANDBOX · موظف العميل'),
+    'staff': ('201000000095', 'SANDBOX · موظف المكتب'),
+}
+
 
 # ── captured side effects ────────────────────────────────────────────────────
 
@@ -161,7 +175,8 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
                     type='text' if message_type == 'text' else message_type,
                     content=content if isinstance(content, dict) else {'text': content},
                     direction='outbound', status='delivered',
-                    social_id=f'wamid.sandbox.{capture.counter}', reply_to=reply_to,
+                    social_id=(f'wa_web:sandbox:{capture.counter}' if getattr(conversation, 'type', None) == 'wa_web'
+                               else f'wamid.sandbox.{capture.counter}'), reply_to=reply_to,
                     social_sent_at=timezone.now(),
                     social_account_content_type=ContentType.objects.get_for_model(sa) if sa else None,
                     social_account_object_id=sa.id if sa else None,
@@ -216,6 +231,38 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
     except Exception:
         pass
 
+    # WhatsApp Web (customer groups): the channel's send path, captured BELOW the tenant gate exactly like
+    # the Cloud one — the gate's verdict is asked here, the silent-turn marker is dropped unsent.
+    wa_web_service = None
+    try:
+        from django.apps import apps as _apps
+        if _apps.is_installed('modules.wa_web'):
+            from modules.wa_web.services.send_service import WaWebService as wa_web_service
+            originals['wa_web_send'] = wa_web_service.send_omnichannel
+
+            def fake_wa_web_send(self, partner, content, *, message_type='text', caption=None, filename=None,
+                                 reply_to_social_id=None, conversation=None, system_partner=None, websocket=True,
+                                 preview_url=False, bulk=False, paced=False, attachment=None):
+                from qurtoba.groups import SILENT_SENTINEL
+                text = content.get('text') if isinstance(content, dict) else (content if isinstance(content, str) else None)
+                if text is not None and text.strip() == SILENT_SENTINEL:
+                    return {'success': True, 'message_id': None, 'social_id': None, 'channel': 'wa_web', 'silent': True}
+                reply_to_id = None
+                if reply_to_social_id:
+                    reply_to_id = (Message.objects_all.filter(social_id=str(reply_to_social_id))
+                                   .values_list('id', flat=True).first())
+                res = _record_send(content, message_type, system_partner, str(reply_to_id) if reply_to_id else None,
+                                   caption, filename, reply_to_message_id=reply_to_social_id)
+                return {'success': res.get('success'), 'message_id': res.get('chat_message_id'),
+                        'social_id': res.get('message_id'), 'channel': 'wa_web', 'error': res.get('error')}
+
+            wa_web_service.send_omnichannel = fake_wa_web_send
+            from modules.wa_web.tasks.outbound import send_wa_web_reaction
+            originals['wa_react_delay'] = send_wa_web_reaction.delay
+            send_wa_web_reaction.delay = lambda *a, **k: None
+    except Exception:
+        logger.exception('sandbox: WhatsApp Web capture not installed')
+
     WhatsAppAPIService.send_and_broadcast = fake_sab
     WhatsAppAPIService.send_text_message = fake_text
     WhatsAppAPIService.send_media_message = fake_media
@@ -240,6 +287,14 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
                 from modules.whatsapp.tasks import process_handling_reaction
                 process_handling_reaction.delay = originals['react_delay']
                 process_handling_reaction.apply_async = originals['react_async']
+            except Exception:
+                pass
+        if wa_web_service is not None and 'wa_web_send' in originals:
+            wa_web_service.send_omnichannel = originals['wa_web_send']
+        if 'wa_react_delay' in originals:
+            try:
+                from modules.wa_web.tasks.outbound import send_wa_web_reaction
+                send_wa_web_reaction.delay = originals['wa_react_delay']
             except Exception:
                 pass
 
@@ -316,6 +371,65 @@ def reset_sandbox(conversation, customer, keep_rows: bool = False):
                 pass
 
 
+def get_group_sandbox():
+    """(group_partner, customer, conversation, wa_web_account, ai_partner, admin_partner, members) — created once,
+    reused. Nothing here talks to the WhatsApp Web gateway: plain rows, the group built with fetch/roster off."""
+    from modules.base.models import Partner
+    from modules.wa_web.models import WaWebAccount, WaWebGroupMember
+    from modules.wa_web.services.group_service import GroupService
+    _p, customer, _c, _a, ai_partner, admin_partner = get_sandbox()
+    acc = WaWebAccount.objects.filter(name=WA_WEB_SANDBOX_NAME).first()
+    if acc is None:
+        acc = WaWebAccount.objects.create(name=WA_WEB_SANDBOX_NAME, phone_number=WA_WEB_SANDBOX_PHONE,
+                                          handled_by_ai=True, ai_in_groups=True, ai_in_private=False)
+    conv, _ = GroupService(acc).get_or_create_group(GROUP_SANDBOX_JID, subject=GROUP_SANDBOX_SUBJECT,
+                                                    fetch=False, roster=False)
+    members = {}
+    for role, (phone, name) in GROUP_MEMBERS.items():
+        jid = f'{phone}@s.whatsapp.net'
+        p = Partner.all_objects.filter(wa_web_account=acc, wa_id=jid).first()
+        if p is None:
+            p = Partner(name=name, phone=phone, wa_web_account=acc, wa_id=jid, wa_phone_jid=jid)
+            p.save()
+        staff = role == 'staff'
+        if bool(p.employee) != staff:
+            Partner.all_objects.filter(pk=p.pk).update(employee=staff)
+            p.employee = staff
+        WaWebGroupMember.objects.get_or_create(conversation=conv, jid=jid, defaults={
+            'partner': p, 'phone_jid': jid, 'role': 'participant', 'is_self': False, 'joined_at': timezone.now()})
+        members[role] = p
+    if not conv.handled_by_ai:
+        type(conv)._base_manager.filter(pk=conv.pk).update(handled_by_ai=True)
+        conv.handled_by_ai = True
+    return conv.social_partner, customer, conv, acc, ai_partner, admin_partner, members
+
+
+def set_group_state(conversation, customer, members, *, linked: bool = True, present=('customer', 'employee', 'staff')):
+    """Put the sandbox group in a scenario's starting state: linked or not, which members are in it."""
+    from modules.wa_web.models import WaWebGroupMember
+    gp = conversation.social_partner
+    type(gp)._base_manager.filter(pk=gp.pk).update(qurtoba_customer=customer if linked else None)
+    gp.qurtoba_customer_id = customer.pk if linked else None
+    for role, p in members.items():
+        WaWebGroupMember.objects.filter(conversation=conversation, partner=p).update(
+            left_at=None if role in present else timezone.now())
+
+
+@contextlib.contextmanager
+def group_twin(wa_web_account):
+    """The sandbox WhatsApp Web account obeys Cloud account WHATSAPP_ACCOUNT_ID's switches (in production the
+    twin is found by the shared phone number)."""
+    from modules.whatsapp.models import WhatsAppAccount
+    from qurtoba import groups
+    orig = groups.twin_cloud_account
+    twin = WhatsAppAccount._base_manager.get(pk=WHATSAPP_ACCOUNT_ID)
+    groups.twin_cloud_account = lambda acc: twin if getattr(acc, 'pk', None) == wa_web_account.pk else orig(acc)
+    try:
+        yield
+    finally:
+        groups.twin_cloud_account = orig
+
+
 def insert_inbound(conversation, partner, text: str, reply_to=None, sent_at=None, msg_type: str = 'text'):
     """An inbound row exactly as the bridge writes it.
 
@@ -334,7 +448,8 @@ def insert_inbound(conversation, partner, text: str, reply_to=None, sent_at=None
         social_account_object_id=sa.id if sa else None,
     )
     Message.objects_all.filter(pk=row.pk).update(
-        social_id=f'wamid.sandbox.in.{time.time_ns()}',
+        social_id=(f'wa_web:sandbox:in.{time.time_ns()}' if getattr(conversation, 'type', None) == 'wa_web'
+                   else f'wamid.sandbox.in.{time.time_ns()}'),
         **({'created_at': sent_at} if sent_at else {}),
     )
     row.refresh_from_db()
@@ -369,10 +484,12 @@ def backdate(conversation, customer, seconds: int):
 
 # ── one turn ─────────────────────────────────────────────────────────────────
 
-def _partner_message(rows, expose_ids: bool):
+def _partner_message(rows, expose_ids: bool, group: bool = False):
     content = []
     for m in rows:
         text = m.content.get('text', '') if isinstance(m.content, dict) else str(m.content)
+        if group and getattr(m, 'sender_id', None):
+            text = f"{m.sender.name}: {text}"          # as the WhatsApp Web bridge writes group lines
         prefix = ''
         if m.reply_to is not None:
             q = m.reply_to.content.get('text', '') if isinstance(m.reply_to.content, dict) else ''
@@ -389,24 +506,32 @@ def run_turn(scenario_id: str, turn_index: int, rows, sandbox, capture: Capture)
     from modules.aistudio.services.workflow_executor import execute_workflow_sync
     from modules.aistudio.utils.omni_channel_utils import clean_and_validate_xml_tags, normalize_dashes
     from modules.chat.models import Message
-    partner, customer, conversation, account, ai_partner, admin_partner = sandbox
+    partner, customer, conversation, account, ai_partner, admin_partner = sandbox[:6]
+    group = getattr(conversation, 'type', None) == 'wa_web'
 
-    expose_ids = bool(getattr(account, 'send_message_ids_to_ai', False))
-    pm = _partner_message(rows, expose_ids)
+    expose_ids = False if group else bool(getattr(account, 'send_message_ids_to_ai', False))
+    pm = _partner_message(rows, expose_ids, group=group)
     texts = [c['text'] for c in pm[0]['content']]
     input_data = {'message': texts[0]} if len(texts) == 1 else {'message': texts[0], 'content': pm}
     history = conversation.get_conversation_history_as_langchain(
         limit=getattr(account, 'history_ingest_limit', None) or 25,
-        exclude_ids=[str(m.id) for m in rows], accepts_images=False)
+        exclude_ids=[str(m.id) for m in rows], accepts_images=False, **({'prefix_senders': True} if group else {}))
+    if group:
+        from modules.aistudio_wa_web.group_context import build_group_state
+        input_data['group'] = build_group_state(conversation, account, rows)
 
     t0 = timezone.now()
     started = time.time()
     sends_before = len(capture.sends)
-    with sandbox_patches(capture, conversation, ai_partner):
+    twin = group_twin(account) if group else contextlib.nullcontext()
+    with sandbox_patches(capture, conversation, ai_partner), twin:
+        # a group run: the run's partner is the GROUP (runtime_patches keeps the bridge from swapping the
+        # speaker in), the channel is wa_web, the workflow is the group variant
         result = execute_workflow_sync(
-            workflow_id=WORKFLOW_ID, input_data=input_data, partner=partner,
-            conversation=conversation, conversation_history=history, partner_message=pm,
-            thread_id=f'sandbox_{conversation.id}_{scenario_id}_{RUN_TOKEN}', trigger_source='whatsapp',
+            workflow_id=(GROUP_WORKFLOW_ID or WORKFLOW_ID) if group else WORKFLOW_ID, input_data=input_data,
+            partner=partner, conversation=conversation, conversation_history=history, partner_message=pm,
+            thread_id=f"sandbox_{'wa_web_' if group else ''}{conversation.id}_{scenario_id}_{RUN_TOKEN}",
+            trigger_source='wa_web' if group else 'whatsapp',
         )
         output = result.output
         output_text = ''
@@ -417,8 +542,13 @@ def run_turn(scenario_id: str, turn_index: int, rows, sandbox, capture: Capture)
         # the channel task's send step: paragraphs through the (captured, gated) send path
         agent_paragraphs = [p.strip() for p in output_text.split('\n\n') if p.strip()] if output_text else []
         for p in agent_paragraphs:
-            account.service.send_and_broadcast(partner=partner, content=p, message_type='text',
-                                               conversation=conversation, system_partner=ai_partner, websocket=False)
+            if group:
+                from modules.wa_web.services.send_service import WaWebService
+                WaWebService(account).send_omnichannel(partner, {'text': p}, message_type='text',
+                                                       conversation=conversation, system_partner=ai_partner, paced=True)
+            else:
+                account.service.send_and_broadcast(partner=partner, content=p, message_type='text',
+                                                   conversation=conversation, system_partner=ai_partner, websocket=False)
     elapsed = time.time() - started
 
     trace = list(Message.objects_all.filter(conversation=conversation, type__in=['tool_call', 'tool'],
@@ -594,6 +724,14 @@ def score_turn(turn: Dict[str, Any], expect: Dict[str, Any],
 # ── driver ───────────────────────────────────────────────────────────────────
 
 def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, Any]:
+    members = None
+    if scn.get('channel') == 'group':
+        # a WhatsApp Web customer group: its own sandbox; each turn names its sender (customer / employee / staff)
+        *six, members = get_group_sandbox()
+        sandbox = tuple(six)
+        gsetup = scn.get('setup') or {}
+        set_group_state(sandbox[2], sandbox[1], members, linked=not gsetup.get('unlinked'),
+                        present=tuple(gsetup.get('members') or ('customer', 'employee', 'staff')))
     partner, customer, conversation, account, ai_partner, admin_partner = sandbox
     reset_sandbox(conversation, customer)
     capture = Capture()
@@ -609,7 +747,7 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
         if setup.get('prior_create'):
             from qurtoba.models import QurtobaRecord
             pc = setup['prior_create']
-            m0 = insert_inbound(conversation, partner, f"{pc['account']}\n\n{pc['value']}")
+            m0 = insert_inbound(conversation, members['customer'] if members else partner, f"{pc['account']}\n\n{pc['value']}")
             rec = QurtobaRecord.objects.create(customer=customer, type='كاش', account_number=pc['account'],
                                                value=float(pc['value']), partner=partner, origin_message_id=m0.id,
                                                date=timezone.localdate(), time=timezone.localtime().time())
@@ -652,7 +790,8 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
                 batch_clock = timezone.now() - timedelta(seconds=3 * (n_batch - 1))
             else:
                 batch_clock = batch_clock + timedelta(seconds=t.get('offset', 3))
-            row = insert_inbound(conversation, partner, t['text'], reply_to=reply_to, sent_at=batch_clock, msg_type=t.get('type', 'text'))
+            sender = members[t.get('sender', 'customer')] if members else partner
+            row = insert_inbound(conversation, sender, t['text'], reply_to=reply_to, sent_at=batch_clock, msg_type=t.get('type', 'text'))
             rows_by_turn[i] = row
             batch.append(row)
         if batch:
