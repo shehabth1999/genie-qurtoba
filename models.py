@@ -359,6 +359,13 @@ class QurtobaCustomer(BaseModel):
         """When name is edited in the UI, keep 'Name (device_no)' format."""
         self.name = _apply_name_format(self.name, self.device_no)
 
+    def pre_save(self):
+        super().pre_save()
+        # Owner rule 2026-09-26: the name ALWAYS ends with «(device no)» — on every save, whatever wrote it
+        # (the Qurtoba webhooks, the sync button, a form). The webhooks used to store the bare name.
+        if self.device_no:
+            self.name = _apply_name_format(self.name, self.device_no)
+
     def pre_create(self):
         super().pre_create()
         # Block manual creation from the Genie UI.
