@@ -61,6 +61,21 @@ menu_dict = {
                     "confirm_required": False,
                 },
             },
+            # ربط الجروب بعميل قرطبة — which Qurtoba customer this WhatsApp group is for (staff only; the
+            # action refuses non-group chats). Many groups may share one customer.
+            {
+                "operation": "append",
+                "target": "actions",
+                "content": {
+                    "string": _("ربط الجروب بعميل قرطبة"),
+                    "icon": "Link",
+                    "name": "action_qurtoba_link_group",
+                    "type": "server",
+                    "as": "button",
+                    "view_type": ["form"],
+                    "confirm_required": False,
+                },
+            },
         ]
     }
 }

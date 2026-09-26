@@ -419,27 +419,6 @@ class MessageQurtobaExtension(ModelExtension):
         return {'status': True, 'open_mode': 'message', 'data': {},
                 'message': gettext('%(names)s بقى %(role)s في كل الجروبات') % {'names': names, 'role': role}}
 
-    @action
-    def action_qurtoba_link_group_to_sender(self):
-        """«ربط الجروب بعميل الرقم ده»: link the selected message's group to the Qurtoba customer its sender
-        stands for (the sender's own link, its star-linked parent's, or its phone on a customer)."""
-        from qurtoba.groups import customers_of_partner, is_group, is_staff, link_group
-        msg = next((m for m in self if getattr(m, 'direction', None) == 'inbound' and getattr(m, 'sender_id', None)), None)
-        if msg is None or not is_group(msg.conversation):
-            return {'status': False, 'open_mode': 'message', 'data': {},
-                    'message': gettext('اختار رسالة من العميل جوه جروب واتساب')}
-        if is_staff(msg.sender):
-            return {'status': False, 'open_mode': 'message', 'data': {},
-                    'message': gettext('الرقم ده متعلم موظف — اختار رسالة من العميل')}
-        found = customers_of_partner(msg.sender)
-        if len(found) != 1:
-            return {'status': False, 'open_mode': 'message', 'data': {},
-                    'message': gettext('الرقم ده مش مربوط بعميل قرطبة واحد — اربطه من صفحة العميل الأول')}
-        user = getattr(getattr(self, 'env', None), 'user', None)
-        link_group(msg.conversation, found[0], by=getattr(user, 'username', None))
-        return {'status': True, 'open_mode': 'message', 'data': {},
-                'message': gettext('الجروب اتربط بالعميل')}
-
     def mark_ai_consumed(self, record=None):
         """Best-effort: flag this message as consumed into `record`.
 
@@ -818,6 +797,51 @@ class ConversationQurtobaExtension(ModelExtension):
                 },
             },
         }
+
+    @action
+    def action_qurtoba_link_group(self):
+        """«ربط الجروب بعميل قرطبة»: pick the Qurtoba customer this WhatsApp group is for (or clear it).
+        The link belongs to the GROUP, never to its members' numbers; many groups may share a customer.
+        Opens the wizard pre-filled with the current link; action_qurtoba_save_group_link saves it."""
+        from qurtoba.groups import is_group
+        conv, customer = _get_conv_and_customer(self)
+        if conv is None or not is_group(conv):
+            return {'status': False, 'open_mode': 'message', 'data': {},
+                    'message': gettext('الزرار ده لجروبات واتساب بس')}
+        return {
+            'status': True,
+            'open_mode': 'slideover',
+            'on_success': {'type': 'refresh'},
+            'data': {
+                'view_key': 'qurtoba_group_link_wizard_form',
+                'view_type': 'form',
+                'id': None,
+                'action_name': 'action_qurtoba_save_group_link',
+                'model': 'chat.conversation',        # Save runs on THIS group, with the wizard as `form`
+                'selected_ids': [str(conv.id)],
+                'type': 'action',
+                'title': gettext('ربط الجروب بعميل قرطبة'),
+                'context': {'default_fields': {
+                    'group_name': conv.name or '',
+                    'customer': {'id': customer.pk, 'name': customer.name} if customer else None,
+                }},
+            },
+        }
+
+    @action
+    def action_qurtoba_save_group_link(queryset, form=None):
+        """Save of the «ربط الجروب بعميل قرطبة» wizard: ``queryset`` is the group, ``form`` the
+        QurtobaGroupLinkWizard (its customer, or empty to unlink)."""
+        from qurtoba.groups import is_group, link_group
+        conv = queryset.first() if hasattr(queryset, 'first') else None
+        if conv is None or not is_group(conv) or form is None:
+            return {'status': False, 'open_mode': 'message', 'data': {},
+                    'message': gettext('الزرار ده لجروبات واتساب بس')}
+        user = getattr(getattr(queryset, 'env', None), 'user', None)
+        customer_id = getattr(form, 'customer_id', None)
+        link_group(conv, customer_id, by=getattr(user, 'username', None))
+        return {'status': True, 'open_mode': 'message', 'data': {}, 'on_success': {'type': 'refresh'},
+                'message': gettext('الجروب اتربط بالعميل') if customer_id else gettext('اتشال ربط الجروب')}
 
     @action
     def action_qurtoba_check_balance(self):

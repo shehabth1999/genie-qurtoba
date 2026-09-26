@@ -230,64 +230,38 @@ def _member_partners(conversation) -> list:
         return []
 
 
-def customers_of_partner(p) -> List[int]:
-    """The Qurtoba customer ids a member stands for: its own link, its star-linked parent's link, or its
-    phone number on a Qurtoba customer."""
-    from qurtoba.models import QurtobaCustomer
-    if p is None:
-        return []
-    cid = getattr(p, 'qurtoba_customer_id', None)
-    if cid:
-        return [cid]
-    parent = getattr(p, 'parent_id', None)
-    if parent is not None and getattr(parent, 'qurtoba_customer_id', None):
-        return [parent.qurtoba_customer_id]
-    tail = _local10(getattr(p, 'phone', None) or (getattr(p, 'wa_id', None) or '').split('@')[0])
-    if not tail:
-        return []
-    return sorted({c[0] for c in QurtobaCustomer.objects.filter(phone_no__endswith=tail).values_list('id', 'phone_no')
-                   if _local10(c[1]) == tail})
-
-
 def link_group(conversation, customer_id, *, by=None) -> None:
-    """Link a customer group to a Qurtoba customer (staff action), with one internal note."""
+    """Set (or, with ``customer_id=None``, remove) the Qurtoba customer of a customer group — a staff
+    action only (owner decision 2026-09-26: a group is NEVER linked from its members' numbers). Many
+    groups may share one customer. One internal note records who changed it."""
     group_partner = getattr(conversation, 'social_partner', None)
     if group_partner is None:
         return
-    type(group_partner)._base_manager.filter(pk=group_partner.pk).update(qurtoba_customer_id=customer_id)
+    type(group_partner)._base_manager.filter(pk=group_partner.pk).update(qurtoba_customer_id=customer_id or None)
     try:
         from qurtoba.models import QurtobaCustomer
         from qurtoba.staff_notes import post_staff_note
-        name = getattr(QurtobaCustomer.objects.filter(pk=customer_id).first(), 'name', '') or str(customer_id)
-        post_staff_note(
-            conversation,
-            [f'🔗 الجروب اتربط بعميل قرطبة: {name}' + (f' (بواسطة {by})' if by else '')],
-            subject='🔗 جروب اتربط بعميل', body=f'الجروب «{getattr(conversation, "name", "") or ""}» ← {name}',
-            dedupe_key=f'group_linked_by_staff:{conversation.id}:{customer_id}', dedupe_ttl=60,
-        )
+        who = f' (بواسطة {by})' if by else ''
+        if customer_id:
+            name = getattr(QurtobaCustomer.objects.filter(pk=customer_id).first(), 'name', '') or str(customer_id)
+            line, subject, body = (f'🔗 الجروب اتربط بعميل قرطبة: {name}{who}', '🔗 جروب اتربط بعميل',
+                                   f'الجروب «{getattr(conversation, "name", "") or ""}» ← {name}')
+        else:
+            line, subject, body = (f'⛓️‍💥 اتشال ربط الجروب بعميل قرطبة{who} — مفيش أي تحويل هيتعمل منه',
+                                   '⛓️‍💥 جروب اتشال ربطه', f'الجروب «{getattr(conversation, "name", "") or ""}» مبقاش مربوط')
+        post_staff_note(conversation, [line], subject=subject, body=body,
+                        dedupe_key=f'group_linked_by_staff:{conversation.id}:{customer_id}', dedupe_ttl=60)
     except Exception:
         logger.warning('qurtoba.groups: link note failed', exc_info=True)
-    _log('group_linked', conversation, customer=customer_id, how='staff')
+    _log('group_linked' if customer_id else 'group_unlinked', conversation, customer=customer_id, how='staff')
 
 
-def candidate_customers(conversation, extra_partners=()) -> List[int]:
-    """Qurtoba customer ids found among the group's non-staff members (see customers_of_partner)."""
-    ids = set()
-    seen = set()
-    for p in list(_member_partners(conversation)) + [p for p in extra_partners if p is not None]:
-        if p.pk in seen or is_staff(p) or getattr(p, 'is_wa_group', False):
-            continue
-        seen.add(p.pk)
-        ids.update(customers_of_partner(p))
-    return sorted(ids)
+def ensure_group_link(conversation, partner=None) -> Optional[int]:
+    """The group's Qurtoba customer id — only what staff set with «ربط الجروب بعميل قرطبة». Nothing is
+    ever linked automatically; an unlinked group gets the office reminder (once an hour) and no service.
 
-
-def ensure_group_link(conversation, partner=None, speakers=()) -> Optional[int]:
-    """The group's Qurtoba customer id, linking it automatically when exactly ONE customer is found among
-    the non-staff members. Otherwise the office is asked (once an hour) to link it by hand.
-
-    `partner` is the group's placeholder the run holds; it is updated in memory too so the workflow's
-    «linked?» condition sees the new link in this very turn."""
+    `partner` is the group's placeholder the run holds; it is updated in memory so the workflow's
+    «linked?» condition sees the current link."""
     if not is_group(conversation):
         return getattr(partner, 'qurtoba_customer_id', None) if partner is not None else None
     group_partner = getattr(conversation, 'social_partner', None)
@@ -298,16 +272,7 @@ def ensure_group_link(conversation, partner=None, speakers=()) -> Optional[int]:
     if current:
         _sync_in_memory(current, group_partner, partner)
         return current
-    found = candidate_customers(conversation, extra_partners=speakers)
-    if len(found) == 1:
-        cid = found[0]
-        type(group_partner)._base_manager.filter(pk=group_partner.pk, qurtoba_customer__isnull=True).update(
-            qurtoba_customer_id=cid)
-        _sync_in_memory(cid, group_partner, partner)
-        _link_note(conversation, cid)
-        _log('group_linked', conversation, customer=cid, how='auto')
-        return cid
-    _ask_to_link(conversation, found)
+    _ask_to_link(conversation)
     return None
 
 
@@ -320,34 +285,13 @@ def _sync_in_memory(cid, *partners) -> None:
                 pass
 
 
-def _link_note(conversation, customer_id) -> None:
-    try:
-        from qurtoba.models import QurtobaCustomer
-        from qurtoba.staff_notes import post_staff_note
-        c = QurtobaCustomer.objects.filter(pk=customer_id).first()
-        name = getattr(c, 'name', '') or str(customer_id)
-        post_staff_note(
-            conversation,
-            [f'🔗 الجروب اتربط تلقائيًا بعميل قرطبة: {name}',
-             'اتربط برقم واحد من أعضاء الجروب. لو غلط غيّره من «ربط الجروب بعميل».'],
-            subject='🔗 جروب جديد اتربط بعميل',
-            body=f'الجروب «{getattr(conversation, "name", "") or ""}» اتربط بـ {name} — راجِع.',
-            dedupe_key=f'group_linked:{conversation.id}', dedupe_ttl=LINK_NOTE_TTL * 24,
-        )
-    except Exception:
-        logger.warning('qurtoba.groups: link note failed', exc_info=True)
-
-
-def _ask_to_link(conversation, found) -> None:
+def _ask_to_link(conversation) -> None:
     try:
         from qurtoba.staff_notes import post_staff_note
-        why = ('لقيت أكتر من عميل قرطبة بين أعضاء الجروب' if found
-               else 'مفيش عضو في الجروب مربوط بعميل قرطبة')
         post_staff_note(
             conversation,
-            ['⚠️ الجروب ده مش مربوط بعميل قرطبة — مفيش أي تحويل هيتعمل منه.',
-             f'السبب: {why}.',
-             'اربطه من «ربط الجروب بعميل» في الشات.'],
+            ['⚠️ الجروب ده مش مربوط بعميل قرطبة — مفيش أي تحويل ولا رد هيتعمل منه.',
+             'اربطه من زرار «ربط الجروب بعميل قرطبة» فوق في الشات.'],
             subject='⚠️ جروب مش مربوط بعميل',
             body=f'الجروب «{getattr(conversation, "name", "") or ""}» محتاج يتربط بعميل قرطبة.',
             dedupe_key=f'group_unlinked:{conversation.id}', dedupe_ttl=LINK_NOTE_TTL,

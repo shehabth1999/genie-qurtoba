@@ -12,6 +12,7 @@ import re
 from modules.base.decorators import action, onchange
 from modules.base.fields import AttachmentForeignKeyField
 from modules.base.models.base import BaseModel
+from modules.base.models.mixins import TransientModel
 
 logger = logging.getLogger(__name__)
 
@@ -1849,3 +1850,16 @@ class QurtobaSyncProblem(BaseModel):
             'data': {},
             'on_success': {'type': 'refresh'},
         }
+
+
+class QurtobaGroupLinkWizard(TransientModel):
+    """«ربط الجروب بعميل قرطبة» (owner decision 2026-09-26): staff choose the ONE Qurtoba customer a
+    WhatsApp group is for. Never automatic, never taken from a member's number; empty = unlinked.
+    Save runs ConversationQurtobaExtension.action_qurtoba_save_group_link on the group's conversation."""
+    group_name = models.CharField(max_length=255, blank=True, null=True, verbose_name=_('الجروب'))
+    customer = models.ForeignKey('qurtoba.QurtobaCustomer', null=True, blank=True, on_delete=models.CASCADE,
+                                 related_name='+', verbose_name=_('عميل قرطبة'))
+
+    class Meta:
+        abstract = False
+        verbose_name = _('ربط الجروب بعميل قرطبة')

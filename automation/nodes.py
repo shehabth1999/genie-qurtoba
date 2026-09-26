@@ -77,17 +77,15 @@ def gate_node(input_data, conversation, partner) -> Dict[str, Any]:
 
 
 def _group_link(conversation, partner):
-    """A WhatsApp customer group: its Qurtoba customer (linked automatically when exactly one customer is
-    among the members), and the connected number marked staff. ``partner`` is the group's placeholder."""
+    """A WhatsApp customer group: the Qurtoba customer staff linked it to (never automatic), and the
+    connected number marked staff. ``partner`` is the group's placeholder."""
     from .context import cache_get, cache_set
-    from qurtoba.groups import customer_inbound, ensure_group_link, mark_own_number_staff
+    from qurtoba.groups import ensure_group_link, mark_own_number_staff
     account = getattr(conversation, 'social_account', None)
     if account is not None and not cache_get(f'qurtoba:own_number_staff:{account.pk}'):
         mark_own_number_staff(account)
         cache_set(f'qurtoba:own_number_staff:{account.pk}', 1, 3600)
-    speakers = [m.sender for m in customer_inbound(conversation).filter(ai_consumed_at__isnull=True)
-                .select_related('sender').order_by('-created_at')[:10] if m.sender_id]
-    return ensure_group_link(conversation, partner, speakers=speakers)
+    return ensure_group_link(conversation, partner)
 
 
 def ai_off_node(input_data, conversation, partner) -> str:
@@ -141,7 +139,8 @@ def not_linked_node(input_data, conversation, partner) -> str:
         from qurtoba.groups import is_group
         if is_group(conversation):
             # A customer group nobody linked yet: nothing is said INSIDE the group — the office already got
-            # «اربط الجروب ده بعميل» (qurtoba.groups.ensure_group_link, once an hour). Same refusal as 1:1.
+            # «ربط الجروب بعميل قرطبة» reminder (qurtoba.groups.ensure_group_link, once an hour). Groups are linked
+            # only by staff, never from a member's number. Same refusal as 1:1.
             consume(conversation, ids)
             from qurtoba.switches import mark_offline_cancelled
             mark_offline_cancelled(conversation, ids, 'not_linked')
