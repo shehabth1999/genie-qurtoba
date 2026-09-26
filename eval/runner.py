@@ -691,6 +691,14 @@ def score_turn(turn: Dict[str, Any], expect: Dict[str, Any],
         add('no 👍 acknowledgement', not acked, f"reactions={turn['reactions']}")
     if expect.get('acked'):
         liked = any((s.get('text') or '').strip() in ('👍', '👍🏿') for s in sends if not s['blocked']) or bool(turn['reactions'])
+        if not liked:
+            # core delivers a saved reaction row itself (post_save), outside the stubbed senders
+            try:
+                from modules.chat.models import MessageReaction
+                liked = MessageReaction.objects.filter(message_id__in=[i['id'] for i in turn.get('inbound') or []],
+                                                       direction='outbound', emoji='👍').exists()
+            except Exception:
+                pass
         add('👍 acknowledgement', liked, f"reactions={turn['reactions']} sends={[s.get('text') for s in sends]}")
     reply = expect.get('reply') or expect.get('agent_reply')
     if reply == 'silent':
