@@ -496,13 +496,19 @@ SCENARIOS += [
         'id': 'X18', 'title': 'x: «قسم 1500 على الأرقام» → لا تنفيذ، تنبيه بشري',
         'turns': [{'text': f'{P1}\n{P2}\n{P3}\nقسم 1500 عليهم'}],
         'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_request_split', 'must': True}],
-                             'tool_texts_contain': ['طلب التقسيم'], 'forbid': SAFE}},
+                             'acked': True, 'forbid': SAFE + ['طلب التقسيم']}},
+    },
+    {   # the office's example (2026-09-26): two named numbers, one amount, «قسم» → 👍 + the accountant is told
+        'id': 'X18c', 'title': 'x: رقمين بأسماء + «218140 ج» + «قسم المبلغ على الرقمين» → 👍 بس، لا تنفيذ، إشعار للمحاسب',
+        'turns': [{'text': f'{P1}\nبيشوي نبيل\n{P2}\nوليد مصطفي\n218140 ج\nقسم المبلغ على الرقمين'}],
+        'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_request_split', 'must': True}],
+                             'acked': True, 'forbid': SAFE + ['طلب التقسيم']}},
     },
     {   # a split spread over several messages → nothing paired by position, the split tool runs (2026-09-13)
         'id': 'X18b', 'title': 'x: «01… ⏎ 01… ⏎ قسم 1000 عليهم» رسائل منفصلة → لا تنفيذ، طلب تقسيم',
         'turns': [{'text': P1}, {'text': P2}, {'text': 'قسم 1000 عليهم'}],
         'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_request_split', 'must': True}],
-                             'tool_texts_contain': ['طلب التقسيم'], 'forbid': SAFE}},
+                             'acked': True, 'forbid': SAFE + ['طلب التقسيم']}},
     },
     {   # one number, an amount and a split word → never created on sight (2026-09-13)
         'id': 'X18c', 'title': 'x: «01… 1000 قسمها نصين» → لا تنفيذ، طلب تقسيم',

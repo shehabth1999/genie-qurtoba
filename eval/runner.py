@@ -689,6 +689,9 @@ def score_turn(turn: Dict[str, Any], expect: Dict[str, Any],
     if expect.get('no_ack'):
         acked = any((s.get('text') or '').strip() in ('👍', '👍🏿') for s in sends if not s['blocked']) or bool(turn['reactions'])
         add('no 👍 acknowledgement', not acked, f"reactions={turn['reactions']}")
+    if expect.get('acked'):
+        liked = any((s.get('text') or '').strip() in ('👍', '👍🏿') for s in sends if not s['blocked']) or bool(turn['reactions'])
+        add('👍 acknowledgement', liked, f"reactions={turn['reactions']} sends={[s.get('text') for s in sends]}")
     reply = expect.get('reply') or expect.get('agent_reply')
     if reply == 'silent':
         add('agent silent (no customer-visible agent text)', len(agent_texts) == 0, f'agent_texts={agent_texts} blocked={[b["blocked"] for b in blocked]}')

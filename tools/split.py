@@ -6,7 +6,7 @@ Owner decision 2026-09-13: the AI never splits money. When a customer asks for a
   1. reads the split from the customer's own messages, never from the model's transcription;
   2. posts an INTERNAL note in the chat (never sent to the customer) that @mentions the office staff;
   3. notifies those staff like a receipt waiting for review: inbox + push, deep-linked to the note;
-  4. sends the customer ONE short quoted line and marks the turn answered;
+  4. gives the customer's request the normal 👍 (owner 2026-09-26: no sentence) and marks the turn answered;
   5. marks the split messages handled, so nothing ever replays them into a transfer.
 
 Idempotent per request message: a second call notifies no one and sends nothing.
@@ -63,6 +63,20 @@ def _split_messages(conversation, source):
     return out
 
 
+def _like_request(conv, source) -> bool:
+    """👍 on the customer's split request: the reaction a created transfer gets, or — when the message
+    cannot be reacted to — a quoted «👍». True when the customer got it."""
+    from modules.chat.models import MessageReaction
+    from qurtoba.tools.transactions import _react_created_on_source, _send_quoted_text
+    try:
+        _react_created_on_source(conv, str(source.id))
+        if MessageReaction.objects.filter(message=source).exists():
+            return True
+    except Exception:
+        logger.warning('qurtoba_request_split: 👍 reaction failed', exc_info=True)
+    return _send_quoted_text(conv, getattr(conv, 'social_partner', None), str(source.id), '👍')
+
+
 @tool(
     name='qurtoba_request_split',
     display_name='Request a Manual Split (Qurtoba)',
@@ -71,7 +85,7 @@ def _split_messages(conversation, source):
         '(«قسم», «وزّع», «نص نص», «بالتساوي», «بالنص»). Splitting is done by hand at the office, never by you. '
         'Before calling it you MUST have: source_message_id = the [message_id] of the customer message that asks for '
         'the split. The tool itself posts an internal note in this chat that mentions the office staff, notifies them '
-        'like a receipt waiting for review, and sends the customer one short quoted reply. It returns '
+        'like a receipt waiting for review, and gives the customer\'s message the normal 👍. It returns '
         'reply_fully_handled=true: after it succeeds output ZERO characters. Do NOT create any transfer for those '
         'numbers, do NOT ask how much per number, and do NOT call alert_qurtoba_human as well.'
     ),
@@ -185,7 +199,9 @@ def qurtoba_request_split(context, source_message_id: str, note: Optional[str] =
         except Exception:
             logger.warning('qurtoba_request_split: staff notification failed', exc_info=True)
 
-    sent = _send_quoted_text(conv, getattr(conv, 'social_partner', None), str(source.id), R.SPLIT_RECEIVED)
+    # Owner 2026-09-26: the customer gets the normal 👍 on the request (like a transfer), no sentence;
+    # the accountant does the split by hand from the note and the notification above.
+    sent = _like_request(conv, source)
     consume(conv, [str(r.id) for r, _, _ in parts])
     log_event('split_request', conversation=conv, mid=str(source.id)[:8], numbers=len(phones),
               amounts=amounts, staff=[u.id for u in staff], notified=notified, replied=bool(sent))
@@ -201,5 +217,5 @@ def qurtoba_request_split(context, source_message_id: str, note: Optional[str] =
         'customer_reply_sent': bool(sent),
     }
     if not sent:
-        result['note'] = f'The customer was NOT told. Reply «{R.SPLIT_RECEIVED}» quoted on {source.id}.'
+        result['note'] = 'The customer was NOT acknowledged; the office was told. Output nothing.'
     return result
