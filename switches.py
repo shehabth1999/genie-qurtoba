@@ -103,6 +103,21 @@ def switch_account(account):
     return twin
 
 
+def private_closed(conversation) -> bool:
+    """True when this is a PRIVATE chat and the office number's «الشات الخاص مقفول» switch is on."""
+    try:
+        from qurtoba.groups import is_group
+        if conversation is None or is_group(conversation):
+            return False
+        account = switch_account(getattr(conversation, 'social_account', None))
+        if account is None or account is _NO_TWIN:
+            return False
+        return bool(getattr(account, 'qurtoba_private_closed', False))
+    except Exception:
+        logger.warning('qurtoba: private-closed check failed', exc_info=True)
+        return False
+
+
 def create_refusal(conversation, *, what: str = 'transaction') -> Optional[Dict[str, Any]]:
     """None when the AI may create; otherwise the structured refusal an AI create tool returns."""
     flags = account_flags(conversation)

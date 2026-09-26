@@ -64,6 +64,8 @@ def gate_node(input_data, conversation, partner) -> Dict[str, Any]:
         enabled = False
     if not enabled:
         log('ai_off', conversation)
+    elif _private_closed_reply(input_data, conversation):
+        enabled = False                  # → ai_off_node: the batch is consumed, nothing else happens
     out = {'ai_enabled': enabled, 'linked': bool(getattr(partner, 'qurtoba_customer_id', None))}
     try:
         from qurtoba.groups import is_group
@@ -74,6 +76,32 @@ def gate_node(input_data, conversation, partner) -> Dict[str, Any]:
         log('node_error', conversation, node='gate_group_link', error=str(exc)[:200])
         out['linked'] = False
     return out
+
+
+PRIVATE_CLOSED_ONCE_MINUTES = 6 * 60
+
+
+def _private_closed_reply(input_data, conversation) -> bool:
+    """Owner decision 2026-09-26: no service in private chats — everything happens in the groups. A
+    private chat on a closed office number gets the fixed line (once per 6 h) quoted on the newest
+    message, and the turn ends like AI-off: nothing is created, the batch is consumed. True when closed."""
+    try:
+        from qurtoba.switches import private_closed
+        if not private_closed(conversation):
+            return False
+        from . import replies as R
+        from .context import send_quoted
+        from .router import load_batch_rows
+        rows = load_batch_rows(conversation, input_data)
+        newest = str(rows[-1].id) if rows else None
+        if not _text_sent_recently(conversation, R.PRIVATE_CLOSED, PRIVATE_CLOSED_ONCE_MINUTES):
+            send_quoted(conversation, newest, R.PRIVATE_CLOSED)
+        log('private_closed', conversation, batch=[str(r.id)[:8] for r in rows])
+        return True
+    except Exception as exc:
+        logger.exception('automation: private-closed reply failed')
+        log('node_error', conversation, node='private_closed', error=str(exc)[:200])
+        return False
 
 
 def _group_link(conversation, partner):

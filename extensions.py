@@ -497,6 +497,15 @@ class WhatsAppAccountQurtobaExtension(ModelExtension):
         help_text=_('لما يكون شغال: واتساب ويب لنفس الرقم بيستقبل رسايل الجروبات بس، والشات الفردي يفضل على الـ API.'),
     )
 
+    # Owner decision 2026-09-26: all service happens in the customer GROUPS. ON: a private chat gets
+    # the fixed «الشغل في الجروبات بس» line (once per 6 h), never the AI or a transfer, and no nightly
+    # statement goes to private numbers — only to the groups.
+    qurtoba_private_closed = models.BooleanField(
+        default=True,
+        verbose_name=_('الشات الخاص مقفول — الشغل في الجروبات بس'),
+        help_text=_('لما يكون شغال: أي رسالة على الخاص بيرد عليها رد ثابت إن الشغل في الجروبات بس، من غير ذكاء اصطناعي ولا تحويلات، وكشف نهاية اليوم بيتبعت للجروبات بس.'),
+    )
+
     qurtoba_allow_cash = models.BooleanField(
         default=True,
         verbose_name=_('السماح بـ كاش'),

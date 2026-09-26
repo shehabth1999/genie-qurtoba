@@ -301,3 +301,24 @@ class SplitNumberTests(SimpleTestCase):
         self.assertEqual((c['phones'], c['amounts'], c['reassembled']), (['01080755798'], [500.0], []))
         c = _classify_message('150 2000\n01012345678')
         self.assertEqual((c['phones'], c['amounts']), (['01012345678'], [150.0, 2000.0]))
+
+
+class GroupStatementTests(SimpleTestCase):
+    """The nightly statement goes to the groups (owner decision 2026-09-26), same wording as template #2."""
+
+    def test_text_mirrors_the_private_template(self):
+        import datetime
+        from qurtoba import tasks
+        customer = NS(name='حسين بركات (696)', balance=12500.0, refresh_from_db=lambda **k: None)
+        conv = NS(name='تيست', social_partner=NS(qurtoba_customer=customer, pk=1))
+        with patch('qurtoba.services.daily_totals.partner_day_totals', return_value={'count': 2, 'debit': 51501.0, 'credit': 0}):
+            text = tasks.group_statement_text(conv, datetime.date(2026, 9, 26))
+        self.assertTrue(text.startswith('*كشف نهاية اليوم*'))
+        self.assertIn('*العميل :* حسين بركات (696)', text)
+        self.assertIn('تيست : ( *51,501* )', text)
+        self.assertIn('( عليك 12,500 جنيه )', text)
+        self.assertTrue(text.endswith('_مكتب قرطبة — كشف تلقائي فى نهاية اليوم_'))
+
+    def test_private_closed_line(self):
+        from qurtoba.automation.replies import PRIVATE_CLOSED
+        self.assertIn('الجروبات بس', PRIVATE_CLOSED)

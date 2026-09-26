@@ -1763,6 +1763,120 @@ QURTOBA_DAILY_FILE_DELAY_S = 4       # the file follows its summary text by this
 
 @shared_task(bind=True, max_retries=0)
 def send_qurtoba_daily_reminder(self, report_date=None, dry_run=False):
+    """End-of-day statements, 00:10 Cairo, for the day that has just closed.
+
+    Owner decision 2026-09-26: all service happens in the customer GROUPS. Every linked group whose customer
+    side wrote to us that day gets the summary text and then its Excel (_dispatch_group_statements). The
+    private numbers get the old template pair only while the office number's «الشات الخاص مقفول» switch is OFF.
+    """
+    import datetime as _dt
+    from qurtoba.services.daily_totals import reporting_day
+
+    day = _dt.date.fromisoformat(report_date) if report_date else reporting_day()
+    groups = _dispatch_group_statements(day, dry_run=dry_run)
+    if _private_statements_closed():
+        logger.info('[Qurtoba Daily] private chats are closed — groups only for %s: %s', day, groups)
+        return {'report_date': str(day), 'private': 'closed', 'groups': groups}
+    private = _send_private_statements(day.isoformat(), dry_run)
+    return {**private, 'groups': groups}
+
+
+def _private_statements_closed() -> bool:
+    try:
+        from modules.whatsapp.models import WhatsAppAccount
+        acc = WhatsAppAccount._base_manager.filter(pk=3).first()
+        return bool(getattr(acc, 'qurtoba_private_closed', True)) if acc is not None else True
+    except Exception:
+        logger.warning('[Qurtoba Daily] private-closed check failed — treating private chats as closed', exc_info=True)
+        return True
+
+
+QURTOBA_GROUP_STATEMENT_SPACING_S = 8      # seconds between two groups' statements
+
+
+def _dispatch_group_statements(day, dry_run=False):
+    """One per-group task for every linked group whose customer side wrote on `day`, spaced out."""
+    from qurtoba.services.daily_totals import groups_chatted_on
+    conv_ids = groups_chatted_on(day)
+    if dry_run or not conv_ids:
+        return {'groups': len(conv_ids), 'dry_run': bool(dry_run), 'would_send_to': conv_ids if dry_run else []}
+    for slot, cid in enumerate(conv_ids):
+        send_qurtoba_group_statement.apply_async(args=[cid, day.isoformat()],
+                                                 countdown=slot * QURTOBA_GROUP_STATEMENT_SPACING_S)
+    return {'groups': len(conv_ids)}
+
+
+def group_statement_text(conversation, day) -> str:
+    """The nightly summary for a GROUP — the same wording as the private template (#2: header, body,
+    footer), the per-number line reading the group's transfers (records of a group sit on its partner)."""
+    from qurtoba.services.daily_totals import fmt_amount, fmt_day_ar, partner_day_totals
+    gp = conversation.social_partner
+    customer = gp.qurtoba_customer
+    customer.refresh_from_db(fields=['balance'])
+    balance = customer.balance or 0
+    balance_txt = (f'عليك {fmt_amount(abs(balance))} جنيه' if balance > 0
+                   else f'ليك {fmt_amount(abs(balance))} جنيه' if balance < 0 else 'مفيش مديونية')
+    total = fmt_amount(partner_day_totals(gp, day)['debit'])
+    name = (getattr(customer, 'name', '') or '').strip() or '—'
+    group_name = (conversation.name or '').strip() or '—'
+    return ('*كشف نهاية اليوم*\n\n'
+            f'*العميل :* {name}\n\n'
+            f'ملخص عمليات يوم : {fmt_day_ar(day)}\n'
+            '━━━━━━━━━━━━━\n'
+            '💸 إجمالي تحويلات الجروب :\n'
+            f'{group_name} : ( *{total}* )\n\n'
+            '━━━━━━━━━━━━━\n'
+            '🏦 إجمالي الحساب الان :\n'
+            f'      ( {balance_txt} )\n\n'
+            '_مكتب قرطبة — كشف تلقائي فى نهاية اليوم_')
+
+
+@shared_task(bind=True, max_retries=0, name='qurtoba.tasks.send_qurtoba_group_statement')
+def send_qurtoba_group_statement(self, conversation_id, day_iso):
+    """The two nightly messages into ONE customer group: the summary text, then 4 s later the Excel alone.
+    max_retries=0 on purpose — a retry would send the statement twice."""
+    import datetime as _dt
+    import time as _time
+    from modules.chat.models import Conversation
+    from modules.chat.services.omnichannel_send_service import OmnichannelSendService
+    from qurtoba.ai_guard import system_send
+    from qurtoba.extensions import _get_system_partner
+    from qurtoba.services.daily_totals import fmt_day_ar
+    from qurtoba.tools.reports import _send_statement_document
+
+    day = _dt.date.fromisoformat(day_iso)
+    conv = Conversation._base_manager.select_related('social_partner').filter(pk=conversation_id).first()
+    customer = getattr(getattr(conv, 'social_partner', None), 'qurtoba_customer', None)
+    if conv is None or customer is None:
+        return {'sent': False, 'reason': 'not_a_linked_group'}
+    out = {'conversation': str(conv.pk), 'customer': customer.pk}
+    try:
+        with system_send():
+            res = OmnichannelSendService().send_and_broadcast(
+                partner=conv.social_partner, content={'text': group_statement_text(conv, day)},
+                message_type='text', conversation=conv, system_partner=_get_system_partner(conv), websocket=True)
+        out['text'] = bool(isinstance(res, dict) and res.get('success'))
+    except Exception as exc:  # noqa: BLE001 — the file still goes
+        logger.exception('[Qurtoba Daily] group %s: summary text failed', conversation_id)
+        out['text'] = False
+        out['text_error'] = str(exc)[:200]
+    _time.sleep(QURTOBA_DAILY_FILE_DELAY_S)
+    try:
+        xlsx, _url, _name = build_customer_day_statement(customer, day)
+        ok, err = _send_statement_document(conv, customer.pk, xlsx, day.isoformat(),
+                                           f'كشف حساب يوم {fmt_day_ar(day)} 📎')
+        out['file'] = ok
+        if err:
+            out['file_error'] = err
+    except Exception as exc:  # noqa: BLE001
+        logger.exception('[Qurtoba Daily] group %s: statement file failed', conversation_id)
+        out['file'] = False
+        out['file_error'] = str(exc)[:200]
+    logger.info('[Qurtoba Daily] group statement %s', out)
+    return out
+
+
+def _send_private_statements(report_date=None, dry_run=False):
     """
     End-of-day messages, TWO per recipient: the summary text (QURTOBA_DAILY_REMINDER_TEMPLATE, unchanged) and
     then, as a separate message, the customer's Excel statement alone (QURTOBA_DAILY_FILE_TEMPLATE).

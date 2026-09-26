@@ -277,6 +277,11 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
     # put «SANDBOX …» in the office's inbox or on their phones (it did on 2026-09-26).
     import modules.notifications.services as _notif_services
     originals['post_notification'] = _notif_services.post_notification
+    # The 1:1 scenarios exercise the money logic the groups share; private chats being closed on the
+    # office number (2026-09-26) must not turn every one of them into the fixed «الجروبات بس» line.
+    import qurtoba.switches as _switches
+    originals['private_closed'] = _switches.private_closed
+    _switches.private_closed = lambda conversation: False
 
     def fake_notification(*args, **kwargs):
         capture.notifications.append({'subject': kwargs.get('subject'), 'body': kwargs.get('body'),
@@ -295,6 +300,7 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
         push_record_to_qurtoba_task.delay = originals['push_delay']
         push_record_to_qurtoba_task.apply_async = originals['push_async']
         _notif_services.post_notification = originals['post_notification']
+        _switches.private_closed = originals['private_closed']
         if 'react_delay' in originals:
             try:
                 from modules.whatsapp.tasks import process_handling_reaction

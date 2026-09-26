@@ -79,6 +79,32 @@ def partner_day_totals(partner, day: Optional[datetime.date] = None) -> dict:
     }
 
 
+def groups_chatted_on(day: Optional[datetime.date] = None):
+    """Conversation ids of the WhatsApp Web customer GROUPS the nightly statement goes to (owner decision
+    2026-09-26): linked to a Qurtoba customer, and the customer's side (not office staff, not a join/leave
+    notice) wrote at least one message in the group on `day`."""
+    from modules.chat.models import Message
+    from qurtoba.groups import staff_q
+
+    if day is None:
+        day = reporting_day()
+    tz = timezone.get_current_timezone()
+    start = datetime.datetime.combine(day, datetime.time.min, tzinfo=tz)
+    end = start + datetime.timedelta(days=1)
+    return sorted(
+        str(cid) for cid in (
+            Message.objects_all
+            .filter(direction='inbound', created_at__gte=start, created_at__lt=end,
+                    conversation__type='wa_web', conversation__is_group=True,
+                    conversation__social_partner__qurtoba_customer__isnull=False)
+            .exclude(type='system').exclude(staff_q())
+            .order_by()
+            .values_list('conversation_id', flat=True)
+            .distinct()
+        ) if cid
+    )
+
+
 def partners_chatted_on(day: Optional[datetime.date] = None):
     """Partner ids the end-of-day messages go to: every Qurtoba-linked number that sent US at least one
     WhatsApp message on `day`, and nobody else.

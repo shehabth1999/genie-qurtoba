@@ -185,3 +185,9 @@ def pick(variants: List[str], seed: str) -> str:
         return ''
     h = sum(ord(c) for c in str(seed or ''))
     return variants[h % len(variants)]
+
+# Owner decision 2026-09-26: no service in private chats any more — everything happens in the groups.
+PRIVATE_CLOSED = ('أهلاً بيك 🌹\n'
+                  'الشغل دلوقتي في الجروبات بس — ابعت طلبك في جروب قرطبة بتاعك.\n'
+                  'لو لسه مش في جروب كلمنا وهنضيفك.')
+
