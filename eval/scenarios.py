@@ -122,13 +122,18 @@ SCENARIOS = [
     },
 
     # ── D. high value ────────────────────────────────────────────────────────
+    {'id': 'D1b', 'title': 'مبلغ كبير في كلام (مثال المكتب 2026-09-26) → «المبلغ 150 ألف مظبوط ؟؟» مقتبسة، لا إنشاء',
+     'turns': [{'text': 'الراجل عندك هيديك 150000\nتحولهم عليا\n01039744988'}],
+     'expect': {'final': {'no_records': True,
+                          'contains': ['المبلغ 150 ألف مظبوط ؟؟', 'برجاء التاكيد ل تنفيذ العملية'], 'forbid': NARRATION_FORBID}}},
     {
         'id': 'D1', 'title': 'مبلغ ≥ 100,000 → احتجاز وسؤال تأكيد واحد مقتبس على رسالة التحويل بلا 👍',
         'turns': [{'text': f'{P1}\n\n150000'}],
         'expect': {'final': {
             'tools': [{'name': 'qurtoba_create_new_transactions_bulk', 'must': True}],
             'no_records': True,
-            'reply': 'one_message', 'quoted_replies': 1, 'quoted_on': [0], 'contains': ['تأكيد'],
+            'reply': 'one_message', 'quoted_replies': 1, 'quoted_on': [0],
+            'contains': ['المبلغ 150 ألف مظبوط ؟؟', 'برجاء التاكيد ل تنفيذ العملية'],
             'no_success_list': True, 'forbid': NARRATION_FORBID,
             'no_ack': True,
         }},
@@ -636,7 +641,7 @@ SCENARIOS += [
     {'id': 'Z6', 'title': 'z: «+2 01012345678»', 'turns': [{'text': '+2 01012345678\n500'}], 'expect': {'final': {'creates': [{'account': P1, 'value': 500}], 'forbid': SAFE}}},
     {'id': 'Z8', 'title': 'z: «1,5» فاصلة عشرية', 'turns': [{'text': f'{P1}\n1,5'}], 'expect': {'final': {'no_records': True, 'forbid': SAFE}}},
     {'id': 'Z9', 'title': 'z: «5.000.000» → احتجاز مبلغ كبير', 'turns': [{'text': f'{P1}\n5.000.000'}],
-     'expect': {'final': {'no_records': True, 'contains_any': ['مبلغ كبير', 'تأكيد'], 'forbid': SAFE}}},
+     'expect': {'final': {'no_records': True, 'contains_any': ['المبلغ 5 مليون مظبوط ؟؟'], 'forbid': SAFE}}},
     {'id': 'Z11', 'title': 'z: «الف» وحدها = 1000', 'turns': [{'text': f'{P1}\nالف'}], 'expect': {'final': {'creates': [{'account': P1, 'value': 1000}], 'forbid': SAFE}}},
     {'id': 'Z12', 'title': 'z: «نص مليون» → احتجاز', 'turns': [{'text': f'{P1}\nنص مليون'}], 'expect': {'final': {'no_creates': [{'account': P1, 'value': 500}], 'no_records': True, 'forbid': SAFE}}},
     {'id': 'Z13', 'title': 'z: «الغي» داخل نفس رسالة الرقم والمبلغ', 'turns': [{'text': f'{P1}\n500\nالغي'}], 'expect': {'final': {'no_records': True, 'forbid': SAFE}}},

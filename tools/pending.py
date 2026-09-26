@@ -18,8 +18,8 @@ from modules.aistudio.tools import tool
     side_effect=True,
     description=(
         'The system asked the customer a fixed yes/no question and is HOLDING a transfer behind it '
-        '(a corrected number «ابعت حول», a positional list «تأكيد المطابقة», a high value «مبلغ كبير — '
-        'محتاج تأكيد», a same-day repeat «تحب أكررها؟», a question-shaped message). When the customer '
+        '(a corrected number «ابعت حول», a positional list «تأكيد المطابقة», a high value «المبلغ 150 ألف '
+        'مظبوط ؟؟», a same-day repeat «تحب أكررها؟», a question-shaped message). When the customer '
         'answers in their own words, call this with decision="yes" or "no". The tool executes or drops '
         'the HELD item from its own stored state (it never takes an amount from you) and 👍s what it '
         'creates. Returns {handled, kind, created[], note}. kind=none → nothing was pending; then answer '

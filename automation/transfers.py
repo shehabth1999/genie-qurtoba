@@ -110,8 +110,8 @@ def decide(plan: Dict[str, Any], *, hv_threshold: float, repeat_pending,
     unclear_answers = set()
     for a in plan.get('answers') or []:
         kind, text, phone = a.get('kind'), a.get('text') or '', a.get('about_phone')
-        if kind == 'amount_reply' and 'مبلغ كبير' in (a.get('question_text') or ''):
-            # «100 ج» to «مبلغ كبير — محتاج تأكيد» → «قصدك نأكد الـ100,000 ولا المبلغ 100 بس؟»
+        if kind == 'amount_reply' and R.is_high_value_question(a.get('question_text')):
+            # «100 ج» to «المبلغ 100 ألف مظبوط ؟؟» → «قصدك نأكد الـ100,000 ولا المبلغ 100 بس؟»
             src_txt = texts.get(a.get('about_message_id') or '', '')
             orig = (_classify_message(src_txt).get('amounts') or [None])[0]
             replies.append((a['message_id'], R.UNCLEAR_HV_ANSWER.format(text=text[:20], amount=R._fmt(orig or '?'))))
@@ -481,9 +481,13 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             to_model.append({'message_id': mid, 'kind': 'multi_number', 'text': text[:200]})
             pre_consume.append(mid)
             continue
-        if cls['phones'] and cls['amounts'] and (L.HOLD.search(t) or L.THIRD_PARTY.search(t)):
+        third_party_hv = (L.THIRD_PARTY.search(t) and not L.HOLD.search(t) and len(cls['phones']) == 1
+                          and len(cls['amounts']) == 1 and float(cls['amounts'][0]) >= _high_value_threshold())
+        if cls['phones'] and cls['amounts'] and (L.HOLD.search(t) or L.THIRD_PARTY.search(t)) and not third_party_hv:
             # a STOP word inside the order («الغي», «متبعتش», «بكرة», «تحصيل», «سداد»), or someone else
-            # handing the money over («هيديك … تحولهم عليا») — held for the model, never created on sight
+            # handing the money over («هيديك … تحولهم عليا») — held for the model, never created on sight.
+            # Except (owner 2026-09-26) ONE number + ONE amount ≥ the high-value line: that is an order,
+            # and the normal path holds it and asks «المبلغ 150 ألف مظبوط ؟؟» — still never executed on sight.
             to_model.append({'message_id': mid, 'kind': 'hold_word', 'text': text[:200]})
             pre_consume.append(mid)
             continue
@@ -600,10 +604,10 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         cls = _classify_message(text)
         waiting = bool(repeat_pending or list_pending or hv_phone)
         if hv_phone and not cls['phones'] and len(cls['amounts']) == 1 and not (L.is_bare_yes(text) or L.is_bare_no(text)):
-            # «100 ج» to the high-value hold (its line carries no «؟», so the planner does not see an answer)
+            # «100 ج» to the high-value hold (answered here, whatever the planner made of its «؟؟»)
             plan.setdefault('answers', []).append({'message_id': mid, 'text': text, 'kind': 'amount_reply',
                                                    'value': float(cls['amounts'][0]), 'about_phone': hv_phone,
-                                                   'about_message_id': hv_src, 'question_text': R.HIGH_VALUE})
+                                                   'about_message_id': hv_src, 'question_text': R.HIGH_VALUE_MARK})
             continue
         if not (L.is_bare_yes(text) or L.is_bare_no(text)):
             if waiting and not cls['phones'] and not cls['amounts']:
@@ -705,7 +709,7 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
     for h in held_items:
         leftovers.append({'message_id': h.get('source_message_id'), 'kind': 'high_value_held',
                           'text': f"{h.get('account_number')} ← {R._fmt(h.get('value'))}",
-                          'suggested_reply': R.HIGH_VALUE})
+                          'suggested_reply': R.high_value(h.get('value'))})
     for rj in summary.pop('_rejected', []):
         leftovers.append({**rj, 'text': (_text_of(rows[rj['message_id']]) if rj.get('message_id') in rows else '')[:80]})
     for tm in to_model:
@@ -901,7 +905,7 @@ def _replied_on(conversation, message_id, *, minutes: int = 360) -> bool:
 
 
 def _hv_question_pending(conversation):
-    """(phone, source message id) of the transfer our «مبلغ كبير — محتاج تأكيد» line (≤ 6 h, among the
+    """(phone, source message id) of the transfer our «المبلغ X مظبوط ؟؟» line (≤ 6 h, among the
     last 12 outbound lines) is holding — as long as that transfer's message is still unconsumed —
     else (None, None)."""
     try:
@@ -912,7 +916,7 @@ def _hv_question_pending(conversation):
                                              created_at__gte=timezone.now() - timedelta(hours=6))
                   .select_related('reply_to').order_by('-created_at')[:12]):
             txt = (m.content or {}).get('text') if isinstance(m.content, dict) else ''
-            if not txt or not str(txt).startswith('مبلغ كبير'):
+            if not txt or not R.is_high_value_question(txt):
                 continue
             q = m.reply_to
             if q is None or getattr(q, 'direction', None) != 'inbound' or getattr(q, 'ai_consumed_at', None):
@@ -1066,10 +1070,10 @@ def _handle_create_result(conversation, partner, result: Dict[str, Any], items: 
         src = r.get('source_message_id') or item.get('source_message_id')
         status = r.get('status')
         if status == 'needs_confirmation' and r.get('confirm_kind', 'high_value') == 'high_value':
-            # «Held → on the transfer message: مبلغ كبير — محتاج منك كلمة «تأكيد» …» — once.
+            # «Held → on the transfer message: المبلغ X مظبوط ؟؟ / برجاء التاكيد …» — once.
             if replies_enabled:
                 if not r.get('already_asked') and not asked_recently(conversation, src, minutes=360):
-                    if send_quoted(conversation, src, R.HIGH_VALUE):
+                    if send_quoted(conversation, src, R.high_value(item.get('value') or r.get('value'))):
                         summary['replies'] += 1
             elif not asked_recently(conversation, src, minutes=360):
                 held.append({**item, 'source_message_id': src})

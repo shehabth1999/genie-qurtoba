@@ -74,7 +74,34 @@ LIST_CONFIRM = 'تأكيد: {phone} ← {amount}؟'
 LIST_CONFIRM_HEADER = 'الأرقام والمبالغ وصلت كقائمتين — دي المطابقة اللي فهمتها:'
 LIST_CONFIRM_TAIL = 'صح؟ (رد بـ«أيوة» وأنفذها، أو ابعت كل رقم ومبلغه في رسالة واحدة)'
 UNREADABLE_AMOUNT = 'المبلغ متكتب «{raw}» ومش قادر أقراه — ابعته تاني: الرقم في سطر والمبلغ في سطر بالأرقام بس'
-HIGH_VALUE = 'مبلغ كبير — محتاج منك كلمة «تأكيد» على الرسالة دي قبل ما ننفّذه'
+# A high amount is held until the customer confirms it (owner wording 2026-09-26; was «مبلغ كبير — محتاج
+# منك كلمة «تأكيد» …»). The amount is spelled the way the office says it: 150000 → «150 ألف».
+HIGH_VALUE_MARK = 'برجاء التاكيد ل تنفيذ العملية'
+
+
+def amount_words(value) -> str:
+    """150000 → «150 ألف», 150500 → «150 ألف و500», 2500000 → «2 مليون و500 ألف»; up to 99,999 → «45,000»."""
+    try:
+        v = int(round(float(value)))
+    except (TypeError, ValueError):
+        return str(value)
+    if v <= 99999:
+        return _fmt(v)
+    millions, rest = divmod(v, 1_000_000)
+    thousands, units = divmod(rest, 1000)
+    parts = ([f'{millions} مليون'] if millions else []) + ([f'{thousands} ألف'] if thousands else []) \
+        + ([str(units)] if units else [])
+    return ' و'.join(parts)
+
+
+def high_value(amount) -> str:
+    return f'المبلغ {amount_words(amount)} مظبوط ؟؟\n\n{HIGH_VALUE_MARK}'
+
+
+def is_high_value_question(text) -> bool:
+    """Our «المبلغ … مظبوط ؟؟» hold question — or the old «مبلغ كبير …» one still open in a chat."""
+    t = str(text or '')
+    return HIGH_VALUE_MARK in t or t.startswith('مبلغ كبير')
 BAD_NUMBER = 'الرقم ده مش صحيح — ابعت رقم صحيح 11 رقم'
 CORRECTION_CONFIRM = ('الرقم اللي فات كان غلط 🙏\n'
                       'تقصد تحويل {amount} على الرقم ده {phone}؟\n'

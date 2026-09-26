@@ -3,7 +3,7 @@
 Markers (cache, per conversation):
     correction   «تقصد تحويل X على الرقم ده؟ ابعت حول»   → CORRECTION_KEY {type, value, account_number, source_message_id, correction_of}
     list         «تأكيد المطابقة: …»                        → LIST_KEY {pairs:[{account_number,value,source_message_id}]}
-    high_value   «مبلغ كبير — محتاج تأكيد»                 → found in the chat (the tool's own hold)
+    high_value   «المبلغ X مظبوط ؟؟ / برجاء التاكيد»        → found in the chat (the tool's own hold)
     repeat       «…اتنفذت النهارده بالفعل. تحب أكررها؟»   → the create tool's repeat_pending store
 
 ``describe`` renders them for the model; ``answer_pending`` executes a yes or a no
@@ -83,6 +83,8 @@ def _question_time(conversation, st: Dict[str, Any]) -> Optional[float]:
         cond = Q()
         for opening in _QUESTION_OPENINGS:
             cond |= Q(content__text__startswith=opening)
+        from .replies import HIGH_VALUE_MARK
+        cond |= Q(content__text__contains=HIGH_VALUE_MARK)     # «المبلغ X مظبوط ؟؟ … برجاء التاكيد»
         q = (Message.objects_all.filter(conversation=conversation, direction='outbound', type='text', active=True,
                                         is_internal=False, created_at__gte=timezone.now() - timedelta(hours=6))
              .filter(cond).order_by('-created_at').first())

@@ -254,3 +254,30 @@ class ImageRequestTests(SimpleTestCase):
         for text in ('01012345678\n500', 'صورة 500', 'وصل؟', 'تم؟', 'حسابي كام',
                      'الصورة اللي بعتها امبارح كانت مش واضحة خالص يا باشا', 'تصوير'):
             self.assertFalse(is_image_request(text), text)
+
+
+class HighValueWordingTests(SimpleTestCase):
+    """«المبلغ 150 ألف مظبوط ؟؟ / برجاء التاكيد ل تنفيذ العملية» (owner wording 2026-09-26)."""
+
+    def test_amount_words(self):
+        from qurtoba.automation.replies import amount_words
+        self.assertEqual(amount_words(45000), '45,000')
+        self.assertEqual(amount_words(99999), '99,999')
+        self.assertEqual(amount_words(100000), '100 ألف')
+        self.assertEqual(amount_words(150000), '150 ألف')
+        self.assertEqual(amount_words('150000.0'), '150 ألف')
+        self.assertEqual(amount_words(150500), '150 ألف و500')
+        self.assertEqual(amount_words(1000000), '1 مليون')
+        self.assertEqual(amount_words(2500000), '2 مليون و500 ألف')
+
+    def test_line_and_detection(self):
+        from qurtoba.automation.replies import high_value, is_high_value_question
+        line = high_value(150000)
+        self.assertEqual(line, 'المبلغ 150 ألف مظبوط ؟؟\n\nبرجاء التاكيد ل تنفيذ العملية')
+        self.assertTrue(is_high_value_question(line))
+        self.assertTrue(is_high_value_question('مبلغ كبير — محتاج منك كلمة «تأكيد» على الرسالة دي قبل ما ننفّذه'))
+        self.assertFalse(is_high_value_question('المبلغ لـ 01012345678؟'))
+
+    def test_mazboot_is_a_yes(self):
+        from qurtoba.automation import lexicon as L
+        self.assertTrue(L.is_bare_yes('مظبوط'))
