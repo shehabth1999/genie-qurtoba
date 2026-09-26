@@ -837,9 +837,13 @@ class ConversationQurtobaExtension(ModelExtension):
         if conv is None or not is_group(conv) or form is None:
             return {'status': False, 'open_mode': 'message', 'data': {},
                     'message': gettext('الزرار ده لجروبات واتساب بس')}
-        user = getattr(getattr(queryset, 'env', None), 'user', None)
+        try:
+            from modules.base.middleware import get_current_user
+            user = get_current_user()
+        except Exception:
+            user = None
         customer_id = getattr(form, 'customer_id', None)
-        link_group(conv, customer_id, by=getattr(user, 'username', None))
+        link_group(conv, customer_id, by=getattr(user, 'name', None) or getattr(user, 'username', None))
         return {'status': True, 'open_mode': 'message', 'data': {}, 'on_success': {'type': 'refresh'},
                 'message': gettext('الجروب اتربط بالعميل') if customer_id else gettext('اتشال ربط الجروب')}
 
