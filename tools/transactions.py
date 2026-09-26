@@ -54,6 +54,36 @@ def _account_seen_in_chat(conversation, account: str, *, hours: int = 6) -> bool
         return True
 
 
+_NONCASH_WORDS = {
+    'فورى': re.compile(r'فور+[يى]|fawry', re.I),
+    'أمان': re.compile(r'[اأإآ]مان|aman', re.I),
+    'طاير': re.compile(r'طاي[ر]|tayer|tayr', re.I),
+}
+
+
+def _noncash_type_seen_in_chat(conversation, type_: str, *, hours: int = 6) -> bool:
+    """True if the customer (not staff) named this non-cash type in the last `hours`."""
+    rx = _NONCASH_WORDS.get(type_)
+    if rx is None or conversation is None:
+        return True
+    try:
+        from datetime import timedelta
+        from django.utils import timezone
+        from modules.chat.models import Message
+        from qurtoba.groups import exclude_staff
+        since = timezone.now() - timedelta(hours=hours)
+        for m in (exclude_staff(Message.objects_all, conversation).filter(
+                conversation=conversation, direction='inbound', active=True, created_at__gte=since)
+                  .order_by('-created_at')[:300]):
+            c = m.content if isinstance(m.content, dict) else {}
+            if rx.search(str(c.get('text') or c.get('caption') or c.get('transcription') or '')):
+                return True
+        return False
+    except Exception:
+        logger.warning('qurtoba: non-cash type check failed', exc_info=True)
+        return True
+
+
 def _repeat_confirmation_verdict(conv, asked_dt, held: Dict[str, Any]) -> str:
     """'yes' only when the customer's NEWEST message after the question confirms it.
 
@@ -786,6 +816,24 @@ def _create_one_debt(
         guard = _noncash_account_guard(customer, type, final_account)
         if guard is not None:
             return guard
+
+    # --- A فورى / أمان / طاير transfer must be ASKED for -------------------------
+    # The customer's messages (6 h) must name the type or write the account. 2026-09-26: «رقم المستلم:
+    # 2095565 0112 / القيمة: 51,501» (a cash number the planner could not read) became a فورى of 51,501
+    # on the customer's registered account 2924523 — nobody had said فوري. Refused; the model is told.
+    if not is_cash and type in ('فورى', 'أمان', 'طاير') and not override_grade_limit and not confirm_repeat:
+        if not (_account_seen_in_chat(conversation, final_account) or _noncash_type_seen_in_chat(conversation, type)):
+            logger.warning('qurtoba: create refused — %s %s not asked for by the customer (src=%s)',
+                           type, final_account, src)
+            return {
+                'success': False,
+                'error_type': 'noncash_not_asked',
+                'error': (f'noncash_not_asked: the customer never wrote «{type}» or the account {final_account} — '
+                          'do NOT create it. If their message holds a phone number you cannot read, call '
+                          'alert_qurtoba_human and reply «لحظة». (internal — never send)'),
+                'account_number': final_account,
+                'cited_message_id': src,
+            }
 
     # --- The number must be the customer's own words ---------------------------
     # A cash destination that no inbound message of the last 6 h contains was INVENTED or

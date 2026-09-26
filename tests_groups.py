@@ -281,3 +281,23 @@ class HighValueWordingTests(SimpleTestCase):
     def test_mazboot_is_a_yes(self):
         from qurtoba.automation import lexicon as L
         self.assertTrue(L.is_bare_yes('مظبوط'))
+
+
+class SplitNumberTests(SimpleTestCase):
+    """«رقم المستلم: 2095565 0112» (right-to-left text) is 01122095565 — shown back to the customer."""
+
+    def test_reversed_and_spaced_groups_rebuild_the_number(self):
+        from qurtoba.tools.planning import _classify_message
+        c = _classify_message('رقم العملية: #110305MS\nرقم المستلم: 2095565 0112\nالقيمة: 51,501')
+        self.assertEqual((c['phones'], c['amounts']), (['01122095565'], [51501.0]))
+        self.assertEqual(c['reassembled'][0]['phone'], '01122095565')
+        c = _classify_message('0112 209 5565\n500')
+        self.assertEqual((c['phones'], c['amounts']), (['01122095565'], [500.0]))
+        self.assertTrue(c['reassembled'])
+
+    def test_plain_numbers_and_amount_lines_are_untouched(self):
+        from qurtoba.tools.planning import _classify_message
+        c = _classify_message('01080755798\n500')
+        self.assertEqual((c['phones'], c['amounts'], c['reassembled']), (['01080755798'], [500.0], []))
+        c = _classify_message('150 2000\n01012345678')
+        self.assertEqual((c['phones'], c['amounts']), (['01012345678'], [150.0, 2000.0]))

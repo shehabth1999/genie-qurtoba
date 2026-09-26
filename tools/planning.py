@@ -194,6 +194,30 @@ def _is_phone(s: str) -> Optional[str]:
     return None
 
 
+def _split_phone(tokens: List[str]):
+    """(phone, token indexes) for a run of 2–4 adjacent digit groups (2–8 digits each) that joins into a
+    valid mobile — as written, or in reverse order (right-to-left text) — else None."""
+    idx = [i for i, t in enumerate(tokens) if re.fullmatch(r'\d{2,8}', t)]
+    runs, cur = [], []
+    for i in idx:
+        if cur and i != cur[-1] + 1:
+            runs.append(cur); cur = []
+        cur.append(i)
+    if cur:
+        runs.append(cur)
+    for run in runs:
+        for size in range(min(len(run), 4), 1, -1):
+            for start in range(0, len(run) - size + 1):
+                part = run[start:start + size]
+                groups = [tokens[i] for i in part]
+                if not 10 <= sum(len(g) for g in groups) <= 11:
+                    continue
+                for cand in (''.join(groups), ''.join(reversed(groups))):
+                    if re.fullmatch(r'01[0125]\d{8}', cand):
+                        return cand, set(part)
+    return None
+
+
 def _is_multiplier_only(line: str) -> bool:
     """True if the line is ONLY a multiplier word (الف/الفين/مليون…) with NO digits.
 
@@ -280,6 +304,7 @@ def _classify_message(text: str) -> Dict[str, Any]:
     amounts: List[float] = []
     ambiguous: List[float] = []
     name_led: List[tuple] = []     # (value, line) — a name then a small number: tally or orphan amount?
+    reassembled: List[Dict[str, str]] = []     # phones rebuilt from digit groups — the customer is shown them
     has_name = False
 
     for line in text.splitlines():
@@ -297,6 +322,21 @@ def _classify_message(text: str) -> Dict[str, Any]:
             joined = _is_phone(line)
             if joined:
                 line_phones, rest = [joined], []
+                groups = re.findall(r'\d+', line)
+                if len(groups) > 1 and not re.fullmatch(r'(?:\+?20|0020|002)', groups[0]):
+                    # «0112 209 5565» → one number written in pieces: shown to the customer too
+                    reassembled.append({'phone': joined, 'raw': ' '.join(groups)})
+        # 3) else a number split into digit groups next to a label, possibly stored in REVERSE by
+        #    right-to-left text («رقم المستلم: 2095565 0112» shows as «0112 2095565», 2026-09-26: read
+        #    as two amounts, and the model created a فورى on an invented account). Join the groups as
+        #    written, then reversed; the result is kept only if it is a valid mobile.
+        if not line_phones:
+            found = _split_phone(tokens)
+            if found:
+                ph, used = found
+                line_phones = [ph]
+                rest = [t for i, t in enumerate(tokens) if i not in used]
+                reassembled.append({'phone': ph, 'raw': ' '.join(tokens[i] for i in sorted(used))})
         phones.extend(line_phones)
 
         # A leftover token shaped like a phone (leading 0, 10–12 digits) but that
@@ -386,6 +426,7 @@ def _classify_message(text: str) -> Dict[str, Any]:
         'ambiguous': ambiguous,
         'has_name': has_name,
         'ignored': ignored,
+        'reassembled': reassembled,
     }
 
 

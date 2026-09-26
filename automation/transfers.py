@@ -687,6 +687,7 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
         if created_items:
             from .pending import clear_pending
             clear_pending(conversation)          # a created transfer ends any «حول»/list question
+            _show_reassembled_numbers(conversation, rows, created_items)
             # «The expectation expires: any other transaction since → a bare number is a normal op.»
             # The customer moved on — a rejected message older than what was just created is retired,
             # so a later bare number can never pick up its amount by mistake.
@@ -762,6 +763,21 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
 _LAYOUT_OK_WORDS = {'كاش', 'فودافون', 'فدفون', 'اتصالات', 'اورانج', 'وي', 'محفظه', 'المحفظه', 'جنيه', 'جنيها', 'ج', 'م', 'مصري',
                     'الف', 'الاف', 'مبلغ', 'المبلغ', 'رقم', 'الرقم', 'القيمه', 'قيمه', 'القيمة', 'حواله', 'تحويل', 'فوري', 'امان', 'طاير',
                     'المستلم', 'المرسل', 'مستلم', 'حساب', 'الحساب', 'تليفون', 'موبايل', 'نمره', 'النمره', 'النوع', 'صافي'}
+
+
+def _show_reassembled_numbers(conversation, rows, created_items) -> None:
+    """A transfer created on a number the planner REBUILT from split / reversed digit groups: quote the
+    number actually used on the customer's message, so a wrong reading is caught at once."""
+    for item in created_items:
+        src = item.get('source_message_id')
+        m = rows.get(src)
+        if m is None:
+            continue
+        rebuilt = {r['phone'] for r in (_classify_message(_text_of(m)).get('reassembled') or [])}
+        phone = _normalize_phone(item.get('account_number') or '')
+        if phone and phone in rebuilt:
+            send_quoted(conversation, src, R.NUMBER_REASSEMBLED.format(phone=phone))
+            log('number_reassembled', conversation, mid=str(src)[:8], phone=phone)
 
 
 def _number_inside_prose(text: str, cls: Dict[str, Any]) -> bool:

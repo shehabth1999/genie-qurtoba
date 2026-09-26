@@ -103,6 +103,9 @@ def is_high_value_question(text) -> bool:
     t = str(text or '')
     return HIGH_VALUE_MARK in t or t.startswith('مبلغ كبير')
 BAD_NUMBER = 'الرقم ده مش صحيح — ابعت رقم صحيح 11 رقم'
+# A number the system rebuilt from split / reversed digit groups («2095565 0112» → 01122095565): once the
+# transfer is created the customer is shown the number used, quoted on their message (owner 2026-09-26).
+NUMBER_REASSEMBLED = 'اتسجل على الرقم {phone} ✅\nلو الرقم غلط بلغنا فوراً'
 CORRECTION_CONFIRM = ('الرقم اللي فات كان غلط 🙏\n'
                       'تقصد تحويل {amount} على الرقم ده {phone}؟\n'
                       'لو أيوة ابعت «حول» وننفذها فوراً.')
