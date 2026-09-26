@@ -238,3 +238,19 @@ class GroupPromptTests(SimpleTestCase):
         self.assertEqual(cls['phones'], [])
         self.assertEqual(cls['amounts'], [20690.0])
         self.assertIn('broken_phone', [i.get('reason') for i in cls['ignored']])
+
+
+class ImageRequestTests(SimpleTestCase):
+    """«فين الصورة» → «لحظة» + the staff are told, never the model (owner decision 2026-09-26)."""
+
+    def test_short_image_questions_are_caught(self):
+        from qurtoba.automation.image_request import is_image_request
+        for text in ('الصورة', 'الصوره', 'فين الصورة؟', 'ابعت صورة التحويل', 'الاسكرين لو سمحت',
+                     'فين الايصال', 'سكرين', 'screenshot'):
+            self.assertTrue(is_image_request(text), text)
+
+    def test_orders_questions_and_long_text_are_not(self):
+        from qurtoba.automation.image_request import is_image_request
+        for text in ('01012345678\n500', 'صورة 500', 'وصل؟', 'تم؟', 'حسابي كام',
+                     'الصورة اللي بعتها امبارح كانت مش واضحة خالص يا باشا', 'تصوير'):
+            self.assertFalse(is_image_request(text), text)

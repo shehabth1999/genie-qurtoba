@@ -164,10 +164,12 @@ def build_spec(src_nodes, tool_ids, variant='cloud'):
     thinker['messages'] = [{'role': 'system', 'text': thinker_text, 'cache': True, 'cache_ttl': '5m', 'attachments': []}]
     thinker['selected_tools'] = [{'store': True, 'tool_id': tool_ids[name], 'ask_human': False}
                                  for name in _swap_tool(THINKER_TOOLS, variant)]
-    thinker['handoff'] = {'enabled': True, 'targets': [{
-        'node_id': 'agent_payments', 'tool_name': '',
-        'tool_description': 'Register سداد payments from a receipt image (شراء كاش / شراء فورى), or explicit payment wording («العميل دفع»).',
-    }]}
+    # Handoff OFF (2026-09-26): the core engine runs a handoff's goto AND the thinker's own edge to
+    # function_model_done in the same step; both write `message` and LangGraph aborts the run
+    # (INVALID_CONCURRENT_GRAPH_UPDATE — W3 4×, W10 2× on «الصورة»; no handoff ever completed). Receipt
+    # images still reach agent_payments through the router's RECEIPT intent. Re-enable only after the
+    # engine routes a handoff INSTEAD of the node's edge.
+    thinker['handoff'] = {'enabled': False, 'targets': []}
     thinker['update_state'] = []
     # owner decision 2026-09-15: Claude Haiku 4.5 (21) is the main model, DeepSeek V4 Flash (31) the
     # backup — DeepSeek queued every request for 900 s on 2026-09-14 22:35–23:37 (chat 13f58d64) and

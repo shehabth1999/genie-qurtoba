@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from qurtoba.tools.planning import _classify_message, _looks_like_spelled_amount
 from qurtoba.tools.transactions import _normalize_phone
+from . import image_request
 from . import lexicon as L
 from . import replies as R
 from .arabic_numbers import parse_arabic_amount
@@ -729,6 +730,9 @@ def _run(conversation, partner, route: Dict[str, Any]) -> Dict[str, Any]:
             continue                     # still part of the money path (an orphan / a held pair)
         if m.type == 'text' and _is_noise_line(txt):
             consume(conversation, [mid])
+            continue
+        if m.type == 'text' and image_request.is_image_request(txt) and image_request.handle(conversation, m):
+            consume(conversation, [mid])     # «فين الصورة»: «لحظة» + the staff are told; never the model
             continue
         others.append({'message_id': mid, 'type': m.type, 'text': txt[:200]})
         consume(conversation, [mid])     # the model answers it this turn; never re-read next turn

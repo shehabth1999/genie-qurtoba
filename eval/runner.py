@@ -66,6 +66,7 @@ class Capture:
     reactions: List[Dict[str, Any]] = field(default_factory=list)
     alerts: List[Dict[str, Any]] = field(default_factory=list)
     pushes: List[int] = field(default_factory=list)
+    notifications: List[Dict[str, Any]] = field(default_factory=list)
     counter: int = 0
 
     def agent_sends(self) -> List[Dict[str, Any]]:
@@ -271,6 +272,17 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
     Conversation.alert_human = fake_alert
     push_record_to_qurtoba_task.delay = fake_push
     push_record_to_qurtoba_task.apply_async = fake_push
+
+    # Staff notifications (split / image requests) are recorded, never delivered: a sandbox run must not
+    # put «SANDBOX …» in the office's inbox or on their phones (it did on 2026-09-26).
+    import modules.notifications.services as _notif_services
+    originals['post_notification'] = _notif_services.post_notification
+
+    def fake_notification(*args, **kwargs):
+        capture.notifications.append({'subject': kwargs.get('subject'), 'body': kwargs.get('body'),
+                                      'partner_ids': list(kwargs.get('partner_ids') or [])})
+        return None
+    _notif_services.post_notification = fake_notification
     try:
         yield
     finally:
@@ -282,6 +294,7 @@ def sandbox_patches(capture: Capture, conversation, ai_partner):
         Conversation.alert_human = originals['alert']
         push_record_to_qurtoba_task.delay = originals['push_delay']
         push_record_to_qurtoba_task.apply_async = originals['push_async']
+        _notif_services.post_notification = originals['post_notification']
         if 'react_delay' in originals:
             try:
                 from modules.whatsapp.tasks import process_handling_reaction
