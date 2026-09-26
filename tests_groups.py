@@ -311,11 +311,10 @@ class GroupStatementTests(SimpleTestCase):
         from qurtoba import tasks
         customer = NS(name='حسين بركات (696)', balance=12500.0, refresh_from_db=lambda **k: None)
         conv = NS(name='تيست', social_partner=NS(qurtoba_customer=customer, pk=1))
-        with patch('qurtoba.services.daily_totals.partner_day_totals', return_value={'count': 2, 'debit': 51501.0, 'credit': 0}):
-            text = tasks.group_statement_text(conv, datetime.date(2026, 9, 26))
+        text = tasks.group_statement_text(conv, datetime.date(2026, 9, 26))
         self.assertTrue(text.startswith('*كشف نهاية اليوم*'))
         self.assertIn('*العميل :* حسين بركات (696)', text)
-        self.assertIn('تيست : ( *51,501* )', text)
+        self.assertNotIn('إجمالي تحويلات', text)       # owner 2026-09-26: balance only
         self.assertIn('( عليك 12,500 جنيه )', text)
         self.assertTrue(text.endswith('_مكتب قرطبة — كشف تلقائي فى نهاية اليوم_'))
 

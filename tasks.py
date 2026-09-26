@@ -1808,23 +1808,18 @@ def _dispatch_group_statements(day, dry_run=False):
 
 def group_statement_text(conversation, day) -> str:
     """The nightly summary for a GROUP — the same wording as the private template (#2: header, body,
-    footer), the per-number line reading the group's transfers (records of a group sit on its partner)."""
-    from qurtoba.services.daily_totals import fmt_amount, fmt_day_ar, partner_day_totals
+    footer) without the per-number transfers line (owner 2026-09-26: the group gets the balance only)."""
+    from qurtoba.services.daily_totals import fmt_amount, fmt_day_ar
     gp = conversation.social_partner
     customer = gp.qurtoba_customer
     customer.refresh_from_db(fields=['balance'])
     balance = customer.balance or 0
     balance_txt = (f'عليك {fmt_amount(abs(balance))} جنيه' if balance > 0
                    else f'ليك {fmt_amount(abs(balance))} جنيه' if balance < 0 else 'مفيش مديونية')
-    total = fmt_amount(partner_day_totals(gp, day)['debit'])
     name = (getattr(customer, 'name', '') or '').strip() or '—'
-    group_name = (conversation.name or '').strip() or '—'
     return ('*كشف نهاية اليوم*\n\n'
             f'*العميل :* {name}\n\n'
             f'ملخص عمليات يوم : {fmt_day_ar(day)}\n'
-            '━━━━━━━━━━━━━\n'
-            '💸 إجمالي تحويلات الجروب :\n'
-            f'{group_name} : ( *{total}* )\n\n'
             '━━━━━━━━━━━━━\n'
             '🏦 إجمالي الحساب الان :\n'
             f'      ( {balance_txt} )\n\n'
