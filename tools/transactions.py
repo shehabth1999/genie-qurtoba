@@ -48,6 +48,11 @@ def _account_seen_in_chat(conversation, account: str, *, hours: int = 6) -> bool
             txt = _ar_to_ascii(str(c.get('text') or c.get('caption') or c.get('transcription') or ''))
             if tail in re.sub(r'\D', '', txt):
                 return True
+            # written in pieces / reversed by right-to-left text («2095565 0112» → 01122095565)
+            if len(re.findall(r'\d+', txt)) > 1:
+                from qurtoba.tools.planning import _classify_message
+                if any(r['phone'][-9:] == tail for r in _classify_message(txt).get('reassembled') or []):
+                    return True
         return False
     except Exception:
         logger.warning('qurtoba: account-in-chat check failed', exc_info=True)

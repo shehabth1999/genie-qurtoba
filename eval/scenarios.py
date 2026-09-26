@@ -498,6 +498,12 @@ SCENARIOS += [
         'expect': {'final': {'no_records': True, 'tools': [{'name': 'qurtoba_request_split', 'must': True}],
                              'acked': True, 'forbid': SAFE + ['طلب التقسيم']}},
     },
+    {   # 2026-09-26 «تيست»: a phone in two groups stored reversed by RTL text → read, created, shown back
+        'id': 'N1', 'title': 'n: «رقم المستلم: 2095565 0112 / القيمة: 51,501» → تحويل على 01122095565 + رسالة بالرقم',
+        'turns': [{'text': 'رقم العملية: #110305MS\nرقم المستلم: 2095565 0112\nالقيمة: 51,501'}],
+        'expect': {'final': {'creates': [{'account': '01122095565', 'value': 51501}],
+                             'tool_texts_contain': ['اتسجل على الرقم 01122095565'], 'forbid': SAFE}},
+    },
     {   # the office's example (2026-09-26): two named numbers, one amount, «قسم» → 👍 + the accountant is told
         'id': 'X18c', 'title': 'x: رقمين بأسماء + «218140 ج» + «قسم المبلغ على الرقمين» → 👍 بس، لا تنفيذ، إشعار للمحاسب',
         'turns': [{'text': f'{P1}\nبيشوي نبيل\n{P2}\nوليد مصطفي\n218140 ج\nقسم المبلغ على الرقمين'}],
