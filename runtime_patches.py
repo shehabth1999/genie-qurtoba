@@ -26,6 +26,8 @@ def install() -> None:
         ('LLM calls bounded (timeout / retries)', _bound_llm_calls),
         ('LLM failover widened (timeouts, DeepSeek queue error)', _widen_llm_failover),
         ('WhatsApp status retry on a missing row', _retry_missed_statuses),
+        ('voice notes: a failed transcription never switches the AI off; no hold without a transcriber',
+         _voice_notes_never_stop_the_ai),
     ):
         try:
             fn()
@@ -283,3 +285,74 @@ def _no_group_escalation_on_unsupported() -> None:
     escalate_to_human._qurtoba_group_guard = True
     escalate_to_human._qurtoba_original = orig
     Conversation.escalate_to_human = escalate_to_human
+
+
+# ── 9. Voice notes ─────────────────────────────────────────────────────────────
+# 2026-09-26 (group «تيست»): a voice note froze the chat 6 minutes (the audio gate waits for Whisper,
+# which retried 3× — no OpenAI/Groq key on this server) and then core ESCALATED the chat: the AI went
+# off and every queued message («سجلها», a transfer) was dropped. Owner rule: only the AI switch turns
+# the AI off. Now a failed transcription posts a staff note on the voice message and lets the queued
+# messages run; and while no transcriber has a key, voice notes do not hold the chat at all.
+
+_TRANSCRIBER_CACHE = {'at': 0.0, 'ok': True}
+
+
+def _transcriber_available() -> bool:
+    import time
+    if time.time() - _TRANSCRIBER_CACHE['at'] < 300:
+        return _TRANSCRIBER_CACHE['ok']
+    ok = True
+    try:
+        from modules.aistudio.engines.node_executor import resolve_provider_key
+        from modules.aistudio.models import LLMModel
+        providers = {'openai'} | set(LLMModel._base_manager.filter(
+            supports_audio_transcription=True, is_active=True).values_list('provider__name', flat=True))
+        ok = any(_has_key(resolve_provider_key, p) for p in providers)
+    except Exception:
+        logger.warning('qurtoba: transcriber check failed', exc_info=True)
+    _TRANSCRIBER_CACHE.update(at=time.time(), ok=ok)
+    return ok
+
+
+def _has_key(resolve, provider) -> bool:
+    try:
+        return bool(resolve(provider))
+    except Exception:
+        return False
+
+
+def _voice_notes_never_stop_the_ai() -> None:
+    import modules.chat.tasks as chat_tasks
+    import modules.chat.utils.audio_gate as gate
+    if getattr(chat_tasks, '_qurtoba_voice_patched', False):
+        return
+
+    def _escalate_after_transcription_failure(message, error):
+        conversation = message.conversation
+        try:
+            from qurtoba.staff_notes import post_staff_note
+            who = getattr(getattr(message, 'sender', None), 'name', '') or ''
+            post_staff_note(
+                conversation,
+                ['🎤 رسالة صوتية ماتفرغتش — اسمعها ورد على العميل بنفسك.' + (f' (من: {who})' if who else '')],
+                subject='🎤 رسالة صوتية محتاجة حد يسمعها',
+                body=f'«{getattr(conversation, "name", "") or ""}»: رسالة صوتية ماتفرغتش.',
+                reply_to=message, dedupe_key=f'voice_failed:{message.id}', dedupe_ttl=24 * 3600,
+            )
+        except Exception:
+            logger.warning('qurtoba: voice-note staff note failed', exc_info=True)
+        logger.info('qurtoba: transcription failed for %s (%s) — no escalation, the AI stays on', message.id, error)
+        try:
+            message.handle_inbound_message_batching()     # what was queued behind the voice note runs now
+        except Exception:
+            logger.warning('qurtoba: batching after a failed transcription failed', exc_info=True)
+
+    chat_tasks._escalate_after_transcription_failure = _escalate_after_transcription_failure
+
+    orig_enabled = gate._enabled
+
+    def _enabled():
+        return orig_enabled() and _transcriber_available()
+    gate._enabled = _enabled
+    chat_tasks._qurtoba_voice_patched = True
+
