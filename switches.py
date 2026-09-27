@@ -150,7 +150,7 @@ def _log(event: str, conversation, **fields) -> None:
 def mark_offline_cancelled(conversation, message_ids, reason: str) -> int:
     """Stamp the inbound messages of a turn handled while offline as CANCELLED ON ARRIVAL.
 
-    `reason` is 'off_hours', 'ai_off' or 'not_linked'. Uses ``.update()`` so no signal fires. Never raises."""
+    `reason` is 'off_hours', 'ai_off', 'not_linked' or 'service_disabled'. Uses ``.update()`` so no signal fires. Never raises."""
     ids = [str(i) for i in (message_ids or []) if i]
     if not ids or conversation is None:
         return 0
@@ -183,6 +183,8 @@ def offline_cancellation(message_id) -> Optional[Dict[str, str]]:
     reason = row.get('qurtoba_offline_reason') or 'off_hours'
     if reason == 'ai_off':
         return {'reason': reason, 'reply': R.OFFLINE_CANCELLED_AI_OFF, 'reply_payment': R.OFFLINE_CANCELLED_PAYMENT_AI_OFF}
+    if reason == 'service_disabled':
+        return {'reason': reason, 'reply': '', 'reply_payment': ''}
     if reason == 'not_linked':
         return {'reason': reason, 'reply': R.OFFLINE_CANCELLED_NOT_LINKED, 'reply_payment': R.OFFLINE_CANCELLED_PAYMENT_NOT_LINKED}
     return {'reason': reason, 'reply': R.OFFLINE_CANCELLED_OFF_HOURS, 'reply_payment': R.OFFLINE_CANCELLED_PAYMENT_OFF_HOURS}

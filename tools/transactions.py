@@ -795,6 +795,12 @@ def _create_one_debt(
         from qurtoba.switches import offline_cancellation
         _lock_id = src or correction_src_id
         _lock = offline_cancellation(_lock_id) if _lock_id else None
+        if _lock and _lock.get('reason') == 'service_disabled':
+            # already refused and answered while the service was stopped — refused again, silently
+            return {'success': False, 'error_type': 'offline_cancelled', 'reply_sent': True,
+                    'offline_reason': 'service_disabled', 'cancelled_message_id': str(_lock_id),
+                    'error': 'cancelled on arrival while the service was stopped; the customer was already told '
+                             '(internal — never send)'}
         if _lock:
             return {
                 'success': False,
@@ -808,11 +814,29 @@ def _create_one_debt(
     # Pre-check: is this type enabled on the current WhatsApp account?
     allowed, disabled_msg = _check_type_allowed_for_account(conversation, type)
     if not allowed:
+        # Owner 2026-09-27: the request is cancelled on arrival — the tool tells the customer itself, and the
+        # message is stamped + handled so it is NEVER created later, when the service is back on (eval SD1–SD6:
+        # cash was re-created with the next request; فورى/أمان/طاير left the customer untold, then refused
+        # the NEW request too). Staff approvals (override_grade_limit) are not affected.
+        _sent = False
+        if src and not override_grade_limit:
+            _sent = _send_quoted_text(conversation, social_partner, src, disabled_msg)
+            try:
+                from django.utils import timezone as _tz
+                from modules.chat.models import Message as _Msg
+                from qurtoba.switches import mark_offline_cancelled
+                mark_offline_cancelled(conversation, [src], 'service_disabled')
+                _Msg.objects_all.filter(id=str(src), ai_consumed_at__isnull=True).update(ai_consumed_at=_tz.now())
+            except Exception:
+                logger.warning('qurtoba: could not cancel a service-disabled request on arrival', exc_info=True)
         return {
             'success': False,
             'error_type': 'service_disabled',
             'error': disabled_msg,
+            'customer_reply': disabled_msg,
+            'reply_sent': bool(_sent),
             'disabled_type': type,
+            'note': 'The customer was already told this service is stopped. Output nothing about it.',
         }
 
     # ACCOUNT GUARD (فورى / أمان / طاير): the account must be registered for this customer

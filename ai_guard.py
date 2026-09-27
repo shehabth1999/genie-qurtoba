@@ -282,6 +282,7 @@ _SUCCESS_CLAIM_RE = re.compile(
     r'nothing\s+(further|else|more)|silent|silence|auto-?ack|👍|✅)',
     re.I,
 )
+_SERVICE_STOPPED_RE = re.compile(r'متوقف[ةه]\s+حالي')
 _ARABIC_RE = re.compile(r'[؀-ۿ]')
 _LATIN_RE = re.compile(r'[A-Za-z]')
 
@@ -661,6 +662,10 @@ def decide(content, message_type, conversation, system_partner, *,
     # ── Content rules: what the text IS, whoever it quotes ──────────────────
     if is_system_template_impersonation(text):
         return _block('system_template')
+    if _SERVICE_STOPPED_RE.search(text):
+        # only the create tool may say a service is stopped (it checks the live switch); the model repeating an
+        # old refusal refused a request after the service was back on (eval SD5, 2026-09-27)
+        return _block('service_stopped_by_model')
     if conv_id and reply_already_delivered(conv_id) and is_redundant_after_tool_reply(text):
         return _block('reply_already_delivered')
     if is_non_message(text):

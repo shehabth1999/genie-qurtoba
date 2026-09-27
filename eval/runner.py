@@ -766,6 +766,10 @@ def _apply_before(before, conversation, customer, members, flag_override) -> Non
     for key in ('off_hours', 'ai_enabled'):
         if key in before:
             flag_override[key] = bool(before[key])
+    # a service (type) switched off / back on — sandbox-only, the live toggles are never touched
+    disabled = flag_override.setdefault('__disabled_types__', set())
+    disabled.update(before.get('disable') or [])
+    disabled.difference_update(before.get('enable') or [])
     if 'handled_by_ai' in before:
         Conversation._base_manager.filter(pk=conversation.pk).update(handled_by_ai=bool(before['handled_by_ai']))
 
@@ -787,7 +791,16 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
     import qurtoba.switches as _sw
     flag_override: Dict[str, Any] = {}
     _orig_flags = _sw.account_flags
-    _sw.account_flags = lambda conv: {**_orig_flags(conv), **flag_override}
+    _sw.account_flags = lambda conv: {**_orig_flags(conv), **{k: v for k, v in flag_override.items() if not k.startswith('__')}}
+    import qurtoba.tools.transactions as _tx
+    _orig_type_check = _tx._check_type_allowed_for_account
+
+    def _type_check(conv, effective_type):
+        if effective_type in flag_override.get('__disabled_types__', ()):
+            return False, (f'الخدمة {effective_type} متوقفة حالياً، برجاء المحاولة في وقت لاحق '
+                           f'وسيتم إبلاغك عند توفرها.')
+        return _orig_type_check(conv, effective_type)
+    _tx._check_type_allowed_for_account = _type_check
     capture = Capture()
     report = {'id': scn['id'], 'title': scn['title'], 'turns': [], 'checks': [], 'error': None}
     rows_by_turn: Dict[int, Any] = {}
@@ -880,5 +893,6 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
     report['passed'] = sum(1 for c in report['checks'] if c['ok'])
     report['failed'] = sum(1 for c in report['checks'] if not c['ok'])
     _sw.account_flags = _orig_flags
+    _tx._check_type_allowed_for_account = _orig_type_check
     _Conv._base_manager.filter(pk=conversation.pk).update(handled_by_ai=True)
     return report
