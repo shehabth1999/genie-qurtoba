@@ -246,8 +246,8 @@ class QurtobaConfig(AppConfig):
                 },
                 'qurtoba-daily-reminder': {
                     'task': 'qurtoba.tasks.send_qurtoba_daily_reminder',
-                    # Just after midnight Cairo time, every day of the year.
-                    'schedule': CairoCrontab(hour=0, minute=10),
+                    # Just after midnight Cairo time, every day of the year (00:05 — owner 2026-09-27; was 00:10).
+                    'schedule': CairoCrontab(hour=0, minute=5),
                 },
                 # Self-heal the ledger: their push is fire-and-forget, so anything it could
                 # not deliver (dead credential, deploy window, a payload we refused) is
