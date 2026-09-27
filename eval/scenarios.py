@@ -915,7 +915,7 @@ SCENARIOS += [
     # Closed shop (owner wording 2026-09-27): one line for transfer / payment / status; balance still works.
     {'id': 'OH1', 'channel': 'group', 'title': 'g: خارج مواعيد العمل + تحويل → رسالة المواعيد الجديدة، لا إنشاء',
      'turns': [{'text': f'{P1}\n500', 'before': {'off_hours': True}}],
-     'expect': {'final': {'no_records': True, 'contains': ['نحن الان خارج مواعيد العمل', '( من 9 صباحا الى 11.45 مساءا )']}}},
+     'expect': {'final': {'no_records': True, 'contains': ['نحن الان خارج مواعيد العمل', 'مواعيدنا ( من 9 صباحا الى 11.45 مساءا )']}}},
     {'id': 'OH2', 'channel': 'group', 'title': 'g: خارج مواعيد العمل + «دفعت 500» → نفس الرسالة',
      'turns': [{'text': 'دفعت 500', 'before': {'off_hours': True}}],
      'expect': {'final': {'no_records': True, 'contains': ['نحن الان خارج مواعيد العمل']}}},

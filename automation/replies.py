@@ -160,11 +160,9 @@ OFF_HOURS = 'خارج مواعيد العمل حالياً. ساعات العم�
 WORKING_HOURS = 'مواعيد العمل من 9 صباحاً حتى 11:50 مساءً طوال أيام الأسبوع'
 # Owner wording 2026-09-27: ONE closed-shop line for a transfer, a payment and a status/cancel request alike.
 OFF_HOURS_REFUSAL = (
-    'بنعتذر ل حضرتك\n\n'
-    'نحن الان خارج مواعيد العمل\n\n'
-    'نستاذنك تبعت طلباتك تانى\n'
-    'فى مواعيد العمل\n'
-    '( من 9 صباحا الى 11.45 مساءا )'
+    'بنعتذر ل حضرتك نحن الان خارج مواعيد العمل\n\n'
+    'مواعيدنا ( من 9 صباحا الى 11.45 مساءا )\n\n'
+    'نستاذنك تبعت طلباتك تانى فى مواعيد العمل'
 )
 OFF_HOURS_TRANSACTION = OFF_HOURS_REFUSAL
 OFF_HOURS_PAYMENT = OFF_HOURS_REFUSAL
