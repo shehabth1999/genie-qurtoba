@@ -162,7 +162,7 @@ WORKING_HOURS = 'مواعيد العمل من 9 صباحاً حتى 11:50 مسا
 OFF_HOURS_REFUSAL = (
     'بنعتذر ل حضرتك نحن الان خارج مواعيد العمل\n\n'
     'مواعيدنا ( من 9 صباحا الى 11.45 مساءا )\n\n'
-    'نستاذنك تبعت طلباتك تانى فى مواعيد العمل'
+    '*نستاذنك تبعت طلباتك تانى فى مواعيد العمل*'
 )
 OFF_HOURS_TRANSACTION = OFF_HOURS_REFUSAL
 OFF_HOURS_PAYMENT = OFF_HOURS_REFUSAL
