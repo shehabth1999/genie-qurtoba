@@ -321,3 +321,14 @@ class GroupStatementTests(SimpleTestCase):
     def test_private_closed_line(self):
         from qurtoba.automation.replies import PRIVATE_CLOSED
         self.assertIn('الجروبات بس', PRIVATE_CLOSED)
+
+
+class AmbiguousSplitNumberTests(SimpleTestCase):
+    """«2095 565 0112» reads as 01122095565 (last group first) AND 01125652095 (reversed): never guessed."""
+
+    def test_three_groups_with_two_readings_are_a_broken_number(self):
+        from qurtoba.tools.planning import _classify_message
+        c = _classify_message('رقم المستلم: 2095 565 0112\nالقيمة: 1')
+        self.assertEqual(c['phones'], [])
+        self.assertEqual(c['amounts'], [1.0])
+        self.assertIn('broken_phone', [i['reason'] for i in c['ignored']])

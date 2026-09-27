@@ -52,28 +52,26 @@ def _split_messages(conversation, source):
     )
     used = {str(x) for x in QurtobaRecord.objects.filter(origin_message_id__in=[r.id for r in rows])
             .values_list('origin_message_id', flat=True)}
+    answered = set(Message.objects_all.filter(conversation=conversation, direction='outbound',
+                                              reply_to_id__in=[r.id for r in rows])
+                   .values_list('reply_to_id', flat=True))
     out = []
     for r in rows:
         if str(r.id) in used:
             continue
         text = (r.content or {}).get('text', '') if isinstance(r.content, dict) else ''
         cls = _classify_message(text or '')
+        if r.id != source.id and r.id in answered:
+            continue           # its own business already: e.g. a held high value waiting for «مظبوط؟» (2026-09-26)
         if r.id == source.id or cls['phones'] or cls['amounts']:
             out.append((r, text or '', cls))
     return out
 
 
 def _like_request(conv, source) -> bool:
-    """👍 on the customer's split request: the reaction a created transfer gets, or — when the message
-    cannot be reacted to — a quoted «👍». True when the customer got it."""
-    from modules.chat.models import MessageReaction
-    from qurtoba.tools.transactions import _react_created_on_source, _send_quoted_text
-    try:
-        _react_created_on_source(conv, str(source.id))
-        if MessageReaction.objects.filter(message=source).exists():
-            return True
-    except Exception:
-        logger.warning('qurtoba_request_split: 👍 reaction failed', exc_info=True)
+    """«ابعت رسالة لايك» (owner 2026-09-27): the customer gets a 👍 MESSAGE quoted on the split request —
+    the same ack a transfer gets — not a reaction. True when it was sent."""
+    from qurtoba.tools.transactions import _send_quoted_text
     return _send_quoted_text(conv, getattr(conv, 'social_partner', None), str(source.id), '👍')
 
 

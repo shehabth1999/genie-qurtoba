@@ -212,9 +212,15 @@ def _split_phone(tokens: List[str]):
                 groups = [tokens[i] for i in part]
                 if not 10 <= sum(len(g) for g in groups) <= 11:
                     continue
-                for cand in (''.join(groups), ''.join(reversed(groups))):
-                    if re.fullmatch(r'01[0125]\d{8}', cand):
-                        return cand, set(part)
+                # as written, reversed (RTL flips every group), or the last group moved to the front (RTL moved
+                # only the leading «0112»: «2095 565 0112» is 0112 2095 565). More than one DIFFERENT valid
+                # mobile → never guess (2026-09-26: the reversal made 01125652095 out of 01122095565).
+                orders = {''.join(groups), ''.join(reversed(groups)), ''.join(groups[-1:] + groups[:-1])}
+                valid = {c for c in orders if re.fullmatch(r'01[0125]\d{8}', c)}
+                if len(valid) == 1:
+                    return valid.pop(), set(part)
+                if len(valid) > 1:
+                    return 'ambiguous', set(part)
     return None
 
 
@@ -332,7 +338,14 @@ def _classify_message(text: str) -> Dict[str, Any]:
         #    written, then reversed; the result is kept only if it is a valid mobile.
         if not line_phones:
             found = _split_phone(tokens)
-            if found:
+            if found and found[0] == 'ambiguous':
+                # a number in pieces that reads as two different mobiles: a broken number — the customer
+                # is asked for it, its pieces are never amounts
+                used = found[1]
+                has_name = True
+                _ignore(' '.join(tokens[i] for i in sorted(used)), 'broken_phone')
+                rest = [t for i, t in enumerate(tokens) if i not in used]
+            elif found:
                 ph, used = found
                 line_phones = [ph]
                 rest = [t for i, t in enumerate(tokens) if i not in used]
