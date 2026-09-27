@@ -174,9 +174,9 @@ class QurtobaConfig(AppConfig):
         """
         try:
             from qurtoba import ai_guard
-            from qurtoba.tasks import _CANCEL_NOTICE_MESSAGES
+            from qurtoba.tasks import _CANCEL_NOTICE_FALLBACK, _CANCEL_NOTICE_MESSAGES
 
-            ai_guard.register_system_templates(*_CANCEL_NOTICE_MESSAGES.values())
+            ai_guard.register_system_templates(*_CANCEL_NOTICE_MESSAGES.values(), _CANCEL_NOTICE_FALLBACK)
             ai_guard.register_system_templates('👍', '👍🏿')
             # The create tool's own repeat question — the model must never echo its tail as a
             # second message (scenario L1: «تحب تتكرر تاني؟» went out twice, 2026-09-20).

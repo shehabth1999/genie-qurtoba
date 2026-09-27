@@ -819,9 +819,11 @@ def _send_reroute_ask(record, fulfilled, reroute_amount):
 _CANCEL_NOTICE_MESSAGES = {
     'cancel_request': "تم الغاء التحويل\n\nو لم يتم تسجيل العمليه عليك",
     'no_wallet': "*محتاجين رقم تانى نبعت عليه الرصيد*\n\n*الرقم مش عليه محفظة*",
-    'agent': "تم إلغاء التحويل من إدارة قرطبة\n\nو لم يتم تسجيل العمليه عليك",
+    # an operator cancelled the order inside Cash-SYS (owner wording 2026-09-27)
+    'agent': "تم إلغاء التحويل ( قرطبة )\n\nو لم يتم تسجيل العمليه عليك",
 }
-_CANCEL_NOTICE_FALLBACK = _CANCEL_NOTICE_MESSAGES['agent']
+# A reason Cash-SYS has no wording for here keeps the previous neutral line.
+_CANCEL_NOTICE_FALLBACK = "تم إلغاء التحويل من إدارة قرطبة\n\nو لم يتم تسجيل العمليه عليك"
 
 
 def _send_cancel_notice(record, reason):
