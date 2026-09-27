@@ -158,22 +158,17 @@ OFF_HOURS = 'خارج مواعيد العمل حالياً. ساعات العم�
 # the reply tool, quoted on the refused message; the workflow builder bakes them into its prompt from
 # here, so the prompt and the fixed fallback above can never disagree about the hours.
 WORKING_HOURS = 'مواعيد العمل من 9 صباحاً حتى 11:50 مساءً طوال أيام الأسبوع'
-OFF_HOURS_TRANSACTION = (
-    'بنعتذر لحضرتك\n\n'
-    '*لا يمكن تنفيذ أي معاملات خارج مواعيد العمل*\n\n'
-    f'{WORKING_HOURS}\n\n'
-    'برجاء إعادة إرسال طلبك خلال مواعيد العمل وسيتم تنفيذه فوراً'
+# Owner wording 2026-09-27: ONE closed-shop line for a transfer, a payment and a status/cancel request alike.
+OFF_HOURS_REFUSAL = (
+    'بنعتذر ل حضرتك\n\n'
+    'نحن الان خارج مواعيد العمل\n\n'
+    'نستاذنك تبعت طلباتك تانى\n'
+    'فى مواعيد العمل\n'
+    '( من 9 صباحا الى 11.45 مساءا )'
 )
-OFF_HOURS_PAYMENT = (
-    'عذراً، لا يمكن تسجيل السداد الآن خارج مواعيد العمل.\n'
-    f'{WORKING_HOURS}.\n'
-    'برجاء إعادة إرسال صورة الإيصال خلال مواعيد العمل ليتم تسجيلها.'
-)
-OFF_HOURS_STATUS = (
-    'عذراً، لا يمكن مراجعة حالة التحويلات أو إلغاؤها الآن خارج مواعيد العمل.\n'
-    f'{WORKING_HOURS}.\n'
-    'تقدر تطلب «كشف حساب» دلوقتي لعرض عمليات اليوم.'
-)
+OFF_HOURS_TRANSACTION = OFF_HOURS_REFUSAL
+OFF_HOURS_PAYMENT = OFF_HOURS_REFUSAL
+OFF_HOURS_STATUS = OFF_HOURS_REFUSAL
 OFF_HOURS_WHEN_OPEN = f'احنا دلوقتي خارج مواعيد العمل. {WORKING_HOURS}.'
 NOT_LINKED = ('بنعتذر ل حضرتك\n\nحسابك غير مربوط بعميل قرطبة\n\n'
               'برجاء التواصل مع إدارة قرطبة لربط حسابك أو إضافة حساب لك')
