@@ -753,6 +753,23 @@ def score_turn(turn: Dict[str, Any], expect: Dict[str, Any],
 
 # ── driver ───────────────────────────────────────────────────────────────────
 
+def _apply_before(before, conversation, customer, members, flag_override) -> None:
+    """Turn-level state changes between batches: `link` (the sandbox group linked or not), `off_hours` /
+    `ai_enabled` (sandbox-only switch overrides) and `handled_by_ai` (a human took the chat over)."""
+    if not before:
+        return
+    from modules.chat.models import Conversation
+    if 'link' in before and members:
+        gp = conversation.social_partner
+        type(gp)._base_manager.filter(pk=gp.pk).update(qurtoba_customer=customer if before['link'] else None)
+        gp.qurtoba_customer_id = customer.pk if before['link'] else None
+    for key in ('off_hours', 'ai_enabled'):
+        if key in before:
+            flag_override[key] = bool(before[key])
+    if 'handled_by_ai' in before:
+        Conversation._base_manager.filter(pk=conversation.pk).update(handled_by_ai=bool(before['handled_by_ai']))
+
+
 def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, Any]:
     members = None
     if scn.get('channel') == 'group':
@@ -764,6 +781,13 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
                         present=tuple(gsetup.get('members') or ('customer', 'employee', 'staff')))
     partner, customer, conversation, account, ai_partner, admin_partner = sandbox
     reset_sandbox(conversation, customer)
+    from modules.chat.models import Conversation as _Conv
+    _Conv._base_manager.filter(pk=conversation.pk).update(handled_by_ai=True)
+    # per-scenario switch overrides (`before: {off_hours: …}`) — the sandbox never touches the live switches
+    import qurtoba.switches as _sw
+    flag_override: Dict[str, Any] = {}
+    _orig_flags = _sw.account_flags
+    _sw.account_flags = lambda conv: {**_orig_flags(conv), **flag_override}
     capture = Capture()
     report = {'id': scn['id'], 'title': scn['title'], 'turns': [], 'checks': [], 'error': None}
     rows_by_turn: Dict[int, Any] = {}
@@ -797,15 +821,26 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
         # not in the same second — the planner treats a same-second split as a
         # deliberate ≤3 burst and executes it. A scenario can override with `offset`.
         batch_clock = None
+        skip_batch = False
         for i, t in enumerate(turns):
             gap = t.get('gap', 0 if i else 0)
             if i and gap and gap > 0:
                 # flush the previous batch as its own run, then move time forward
-                res = run_turn(scn['id'], len(report['turns']), batch, sandbox, capture)
-                report['turns'].append(res)
+                if skip_batch:
+                    # `no_run`: the bridge never ran the AI for it (AI in groups off, a human took over)
+                    report['turns'].append({'turn': len(report['turns']), 'skipped': True,
+                                            'inbound': [{'id': str(r.id), 'text': (r.content or {}).get('text')} for r in batch],
+                                            'sends': [], 'reactions': [], 'alerts': [], 'pushes': [], 'tool_calls': [],
+                                            'records': [], 'pendings': [], 'agent_paragraphs': [], 'workflow': {}})
+                else:
+                    res = run_turn(scn['id'], len(report['turns']), batch, sandbox, capture)
+                    report['turns'].append(res)
                 batch = []
                 batch_clock = None
+                skip_batch = False
                 backdate(conversation, customer, gap)
+            _apply_before(t.get('before'), conversation, customer, members, flag_override)
+            skip_batch = skip_batch or bool(t.get('no_run'))
             if t.get('reply_to') == 'notice':
                 reply_to = notice_msg                       # the customer quotes our rejection notice
             else:
@@ -824,7 +859,7 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
             row = insert_inbound(conversation, sender, t['text'], reply_to=reply_to, sent_at=batch_clock, msg_type=t.get('type', 'text'))
             rows_by_turn[i] = row
             batch.append(row)
-        if batch:
+        if batch and not skip_batch:
             res = run_turn(scn['id'], len(report['turns']), batch, sandbox, capture)
             report['turns'].append(res)
 
@@ -844,4 +879,6 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
             reset_sandbox(conversation, customer)
     report['passed'] = sum(1 for c in report['checks'] if c['ok'])
     report['failed'] = sum(1 for c in report['checks'] if not c['ok'])
+    _sw.account_flags = _orig_flags
+    _Conv._base_manager.filter(pk=conversation.pk).update(handled_by_ai=True)
     return report

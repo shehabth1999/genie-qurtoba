@@ -329,6 +329,23 @@ class PartnerQurtobaExtension(ModelExtension):
 # Added via the model-extension mechanism (no edit to the chat module's source).
 # ---------------------------------------------------------------------------
 
+def _ai_cannot_act(conversation):
+    """'ai_off' when the channel bridge will not run the AI for a new message in this chat, else None."""
+    if conversation is None or getattr(conversation, 'type', None) not in ('whatsapp', 'wa_web'):
+        return None
+    # read from the database: the instance the message carries may predate a human taking the chat over
+    fresh = type(conversation)._base_manager.filter(pk=conversation.pk).values_list('handled_by_ai', flat=True).first()
+    if fresh is False or (fresh is None and not getattr(conversation, 'handled_by_ai', True)):
+        return 'ai_off'
+    if conversation.type == 'wa_web':
+        account = getattr(conversation, 'social_account', None)
+        if account is not None:
+            gate = 'ai_in_groups' if getattr(conversation, 'is_group', False) else 'ai_in_private'
+            if not getattr(account, gate, True):
+                return 'ai_off'
+    return None
+
+
 class MessageQurtobaExtension(ModelExtension):
     """Marks chat.Message rows the AI consumed into a Qurtoba transaction."""
 
@@ -382,6 +399,23 @@ class MessageQurtobaExtension(ModelExtension):
                 from qurtoba.groups import is_group, suppress_escalation
                 if is_group(getattr(self, 'conversation', None)):
                     suppress_escalation(True)
+        except Exception:
+            pass
+        # Cancelled on arrival (the 2026-09-14 rule, 2026-09-27 for the bridge's own gates): a request that
+        # arrives while the AI cannot act on this chat — a human took it over (handled_by_ai off), or the
+        # office number's «AI in groups» / «AI in private» is off — never runs, so no workflow node stamps
+        # it; without this stamp a NEW request within the batch window would carry it into a transfer
+        # (eval GH1: the old 500 was created two minutes later with the new 300).
+        try:
+            if getattr(self, 'direction', None) == 'inbound' and not getattr(self, 'qurtoba_offline_cancelled_at', None):
+                reason = _ai_cannot_act(getattr(self, 'conversation', None))
+                if reason:
+                    from django.utils import timezone
+                    self.qurtoba_offline_cancelled_at = timezone.now()
+                    self.qurtoba_offline_reason = reason
+                    # and handled, exactly like ai_off_node does: it never joins a later batch either
+                    if not getattr(self, 'ai_consumed_at', None):
+                        self.ai_consumed_at = timezone.now()
         except Exception:
             pass
 
