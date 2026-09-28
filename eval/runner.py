@@ -778,9 +778,14 @@ def _apply_before(before, conversation, customer, members, flag_override) -> Non
     for sr in before.get('staff_record') or []:
         # a member of staff registered it by hand (the chat's «عملية جديدة»): no source message
         from qurtoba.models import QurtobaRecord
-        QurtobaRecord.objects.create(customer=customer, type=sr.get('type', 'كاش'), account_number=sr['account'],
-                                     value=float(sr['value']), partner=conversation.social_partner,
-                                     date=timezone.localdate(), time=timezone.localtime().time())
+        # `via: 'qurtoba'` = done in the Qurtoba app: it reaches Genie with no chat partner; `minutes_ago` ages it
+        rec = QurtobaRecord.objects.create(customer=customer, type=sr.get('type', 'كاش'), account_number=sr['account'],
+                                           value=float(sr['value']),
+                                           partner=None if sr.get('via') == 'qurtoba' else conversation.social_partner,
+                                           date=timezone.localdate(), time=timezone.localtime().time())
+        if sr.get('minutes_ago'):
+            QurtobaRecord.objects.filter(pk=rec.pk).update(
+                created_at=timezone.now() - timedelta(minutes=int(sr['minutes_ago'])))
 
 
 def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, Any]:
