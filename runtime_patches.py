@@ -28,6 +28,7 @@ def install() -> None:
         ('WhatsApp status retry on a missing row', _retry_missed_statuses),
         ('voice notes: a failed transcription never switches the AI off; no hold without a transcriber',
          _voice_notes_never_stop_the_ai),
+        ('AI switched off in bulk: open requests are closed', _bulk_ai_off_closes_requests),
     ):
         try:
             fn()
@@ -355,4 +356,33 @@ def _voice_notes_never_stop_the_ai() -> None:
         return orig_enabled() and _transcriber_available()
     gate._enabled = _enabled
     chat_tasks._qurtoba_voice_patched = True
+
+
+# ── 10. The AI switched off in bulk ────────────────────────────────────────────
+# The chat's own toggle saves the conversation (ConversationQurtobaExtension.post_save closes its open
+# requests); the bulk toggle writes handled_by_ai with .update() — no hooks — so it is wrapped here.
+
+def _bulk_ai_off_closes_requests() -> None:
+    import modules.chat.services.bulk_ai_toggle as bulk
+    orig = bulk._bulk_set_flag
+    if getattr(orig, '_qurtoba_closes', False):
+        return
+
+    def _bulk_set_flag(conversation_ids, field, enabled):
+        turned_off = []
+        if field == 'handled_by_ai' and not enabled:
+            try:
+                from modules.chat.models import Conversation
+                turned_off = list(Conversation._base_manager.filter(id__in=conversation_ids, handled_by_ai=True))
+            except Exception:
+                turned_off = []
+        result = orig(conversation_ids, field, enabled)
+        if turned_off:
+            from qurtoba.switches import close_open_requests
+            for conv in turned_off:
+                close_open_requests(conv)
+        return result
+
+    _bulk_set_flag._qurtoba_closes = True
+    bulk._bulk_set_flag = _bulk_set_flag
 

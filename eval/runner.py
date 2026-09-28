@@ -771,7 +771,16 @@ def _apply_before(before, conversation, customer, members, flag_override) -> Non
     disabled.update(before.get('disable') or [])
     disabled.difference_update(before.get('enable') or [])
     if 'handled_by_ai' in before:
-        Conversation._base_manager.filter(pk=conversation.pk).update(handled_by_ai=bool(before['handled_by_ai']))
+        # through a normal save, like the chat's AI toggle (ToggleAiBotConversation) — save hooks run
+        conv = Conversation._base_manager.get(pk=conversation.pk)
+        conv.handled_by_ai = bool(before['handled_by_ai'])
+        conv.save(update_fields=['handled_by_ai'])
+    for sr in before.get('staff_record') or []:
+        # a member of staff registered it by hand (the chat's «عملية جديدة»): no source message
+        from qurtoba.models import QurtobaRecord
+        QurtobaRecord.objects.create(customer=customer, type=sr.get('type', 'كاش'), account_number=sr['account'],
+                                     value=float(sr['value']), partner=conversation.social_partner,
+                                     date=timezone.localdate(), time=timezone.localtime().time())
 
 
 def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, Any]:
@@ -789,7 +798,8 @@ def run_scenario(scn: Dict[str, Any], sandbox, keep: bool = False) -> Dict[str, 
     _Conv._base_manager.filter(pk=conversation.pk).update(handled_by_ai=True)
     # per-scenario switch overrides (`before: {off_hours: …}`) — the sandbox never touches the live switches
     import qurtoba.switches as _sw
-    flag_override: Dict[str, Any] = {}
+    # the sandbox runs OPEN with the AI on unless a scenario says otherwise — never the live switches' state
+    flag_override: Dict[str, Any] = {'off_hours': False, 'ai_enabled': True}
     _orig_flags = _sw.account_flags
     _sw.account_flags = lambda conv: {**_orig_flags(conv), **{k: v for k, v in flag_override.items() if not k.startswith('__')}}
     import qurtoba.tools.transactions as _tx

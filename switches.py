@@ -165,6 +165,33 @@ def mark_offline_cancelled(conversation, message_ids, reason: str) -> int:
         return 0
 
 
+def close_open_requests(conversation, reason: str = 'ai_off') -> int:
+    """The chat's AI was just switched OFF (staff take over, owner 2026-09-28): every inbound request it had
+    not handled yet is cancelled on arrival and handled, and every open question («مظبوط ؟؟», «تحب
+    أكررها؟», a list/correction question) is closed — staff do these by hand now, and switching the AI back
+    on must never replay one of them (eval MH2/MH3). Returns how many messages were closed. Never raises."""
+    if conversation is None:
+        return 0
+    try:
+        from datetime import timedelta
+        from django.utils import timezone
+        from modules.chat.models import Message
+        now = timezone.now()
+        n = (Message.objects_all
+             .filter(conversation=conversation, direction='inbound', ai_consumed_at__isnull=True,
+                     created_at__gte=now - timedelta(hours=24))
+             .update(ai_consumed_at=now, qurtoba_offline_cancelled_at=now, qurtoba_offline_reason=reason))
+        from qurtoba.automation.pending import clear_pending
+        from qurtoba.tools.transactions import _clear_repeat_pending
+        clear_pending(conversation)
+        _clear_repeat_pending(conversation)
+        logger.info('qurtoba.switches: AI switched off in %s — %d open request(s) closed', conversation.pk, n)
+        return n
+    except Exception:
+        logger.warning('qurtoba.switches: closing open requests failed', exc_info=True)
+        return 0
+
+
 def offline_cancellation(message_id) -> Optional[Dict[str, str]]:
     """When `message_id` was cancelled on arrival while offline: {'reason', 'reply', 'reply_payment'} with the
     customer-facing lines. Otherwise None. A failed read returns None: the watermark and the switches still

@@ -665,6 +665,21 @@ class ConversationQurtobaExtension(ModelExtension):
     """
 
     _inherit = 'chat.conversation'
+
+    def pre_save(self):
+        # the AI being switched OFF on this chat (the chat's toggle, an escalation): remember it for post_save
+        try:
+            if self.pk and not getattr(self, 'handled_by_ai', True):
+                was = type(self)._base_manager.filter(pk=self.pk).values_list('handled_by_ai', flat=True).first()
+                self._qurtoba_ai_turned_off = bool(was)
+        except Exception:
+            self._qurtoba_ai_turned_off = False
+
+    def post_save(self):
+        if getattr(self, '_qurtoba_ai_turned_off', False):
+            self._qurtoba_ai_turned_off = False
+            from qurtoba.switches import close_open_requests
+            close_open_requests(self)
     _depends = ['base']
 
     def template_context_extras(self):
