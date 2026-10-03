@@ -971,6 +971,13 @@ SCENARIOS += [
                 'before': {'staff_record': [{'account': P2, 'value': 350, 'via': 'qurtoba', 'minutes_ago': 1}],
                            'handled_by_ai': True}}],
      'expect': {'final': {'creates': [{'account': P3, 'value': 700}], 'no_creates': [{'account': P2, 'value': 300}]}}},
+    # A form message (2026-09-30, «تيست»): the amount is in the bracket of «القيمة بالمصري».
+    {'id': 'FM1', 'channel': 'group', 'title': 'g: فورم «القيمة بالمصري🇪🇬( 4500 )» → يتنفذ 4500 على الرقم مباشرة',
+     'turns': [{'text': 'فودافون\n\nالقيمة بالليبى🇱🇾(    )\n\nرقم الهاتف(01091876774\n\nالقيمة بالمصري🇪🇬(     4500 )'}],
+     'expect': {'final': {'creates': [{'account': '01091876774', 'value': 4500}], 'forbid': SAFE}}},
+    {'id': 'FM2', 'channel': 'group', 'title': 'g: فورم فيه القيمة بالليبي بس → مايتنفذش (مش جنيه)',
+     'turns': [{'text': 'فودافون\n\nالقيمة بالليبى🇱🇾( 300 )\n\nرقم الهاتف(01091876774\n\nالقيمة بالمصري🇪🇬(  )'}],
+     'expect': {'final': {'no_records': True, 'no_creates': [{'account': '01091876774', 'value': 300}], 'forbid': ['300']}}},
     {'id': 'G6', 'channel': 'group',
      'title': 'g: عضوين في نفس اللحظة: رقم من واحد ومبلغ من التاني → ميتجمعوش',
      'turns': [{'text': P1, 'sender': 'employee'}, {'text': '800', 'sender': 'customer'}],

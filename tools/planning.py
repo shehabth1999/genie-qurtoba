@@ -266,6 +266,19 @@ def _merge_multiplier_lines(text: str) -> str:
     return '\n'.join(out)
 
 
+_AMOUNT_FIELD_RE = re.compile(r'(?:القيم[ةه]|المبلغ|مبلغ)[^\n()]{0,30}\(\s*([\d٠-٩][\d٠-٩.,،\s]*)\s*\)')
+
+
+def _unwrap_amount_fields(text: str) -> str:
+    """«القيمة …( 4500 )» → «القيمة … 4500»: the bracket of an amount-labelled form field keeps its number."""
+    def _sub(m):
+        if re.search(r'ليب', m.group(0)):
+            # Libyan dinars — not ours to read, and not even a hint: removed, never offered as an amount
+            return m.group(0)[:m.start(1) - m.start(0)].rstrip(' (') + ' '
+        return m.group(0)[:m.start(1) - m.start(0)].rstrip(' (') + ' ' + m.group(1).strip()
+    return _AMOUNT_FIELD_RE.sub(_sub, text or '')
+
+
 def _classify_message(text: str) -> Dict[str, Any]:
     """Split one message into its phones, whole-number amounts, and name/other.
 
@@ -299,6 +312,10 @@ def _classify_message(text: str) -> Dict[str, Any]:
     # its digits from being read as an amount. Balanced brackets only (repeat to peel nesting);
     # an amount is never written inside brackets, so this is safe.
     _BRACKET_RE = re.compile(r'\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}')
+    # EXCEPT a form field: «القيمة بالمصري🇪🇬( 4500 )», «المبلغ (3000)» — a bracket right after an amount label on
+    # its line IS the amount (2026-09-30: the bracket rule dropped it and the customer was asked «المبلغ لـ …
+    # هو 4,500؟»). «القيمة بالليبى( … )» is in Libyan dinars: never an Egyptian amount, so it stays dropped.
+    text = _unwrap_amount_fields(text)
     for _ in range(3):
         for _br in _BRACKET_RE.findall(text):
             _ignore(_br, 'bracketed')

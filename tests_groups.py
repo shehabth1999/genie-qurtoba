@@ -332,3 +332,24 @@ class AmbiguousSplitNumberTests(SimpleTestCase):
         self.assertEqual(c['phones'], [])
         self.assertEqual(c['amounts'], [1.0])
         self.assertIn('broken_phone', [i['reason'] for i in c['ignored']])
+
+
+class FormAmountFieldTests(SimpleTestCase):
+    """«القيمة بالمصري🇪🇬( 4500 )» is the amount; «القيمة بالليبى( … )» never is; other brackets stay comments."""
+
+    FORM = 'فودافون\n\nالقيمة بالليبى🇱🇾({ly})\n\nرقم الهاتف(01091876774\n\nالقيمة بالمصري🇪🇬({eg})'
+
+    def test_egyptian_field_is_the_amount(self):
+        from qurtoba.tools.planning import _classify_message
+        c = _classify_message(self.FORM.format(ly='    ', eg='     4500 '))
+        self.assertEqual((c['phones'], c['amounts']), (['01091876774'], [4500.0]))
+
+    def test_libyan_field_is_never_an_amount(self):
+        from qurtoba.tools.planning import _classify_message
+        c = _classify_message(self.FORM.format(ly=' 300 ', eg='  '))
+        self.assertEqual((c['phones'], c['amounts']), (['01091876774'], []))
+
+    def test_other_brackets_stay_comments(self):
+        from qurtoba.tools.planning import _classify_message
+        self.assertEqual(_classify_message('01012345678 500 (vivo - shehab - 652)')['amounts'], [500.0])
+        self.assertEqual(_classify_message('محمد (124)\n01012345678\n700')['amounts'], [700.0])
