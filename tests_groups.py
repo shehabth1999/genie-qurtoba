@@ -353,3 +353,15 @@ class FormAmountFieldTests(SimpleTestCase):
         from qurtoba.tools.planning import _classify_message
         self.assertEqual(_classify_message('01012345678 500 (vivo - shehab - 652)')['amounts'], [500.0])
         self.assertEqual(_classify_message('محمد (124)\n01012345678\n700')['amounts'], [700.0])
+
+
+class FormIsNotASentenceTests(SimpleTestCase):
+    """«رقم الهاتف(01…» is a form field, not a number inside prose (2026-10-03: sent to the model)."""
+
+    def test_form_phone_label(self):
+        from qurtoba.automation.transfers import _number_inside_prose
+        from qurtoba.tools.planning import _classify_message
+        t = 'فودافون\n\nالقيمة بالليبى🇱🇾(    )\n\nرقم الهاتف(01091876774\n\nالقيمة بالمصري🇪🇬(     4500 )'
+        self.assertFalse(_number_inside_prose(t, _classify_message(t)))
+        s = 'انا بعت لـ 01012345678 امبارح 500 وصلت'
+        self.assertTrue(_number_inside_prose(s, _classify_message(s)))
