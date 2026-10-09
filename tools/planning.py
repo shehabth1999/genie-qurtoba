@@ -269,6 +269,9 @@ def _merge_multiplier_lines(text: str) -> str:
 _AMOUNT_FIELD_RE = re.compile(r'(?:القيم[ةه]|المبلغ|مبلغ)[^\n()]{0,30}\(\s*([\d٠-٩][\d٠-٩.,،\s]*)\s*\)')
 
 
+_AMOUNT_LABEL_RE = re.compile(r'جني[هة]|الجنيه|\bEGP\b|\begp\b|(?:^|\s)ج\.?(?:\s|$)|القيم[ةه]|المبلغ|مبلغ')
+
+
 def _unwrap_amount_fields(text: str) -> str:
     """«القيمة …( 4500 )» → «القيمة … 4500»: the bracket of an amount-labelled form field keeps its number."""
     def _sub(m):
@@ -323,8 +326,23 @@ def _classify_message(text: str) -> Dict[str, Any]:
         if _new == text:
             break
         text = _new
+    # Transfer-app copy-paste (2026-10-09 examples): «*#1556 3109731*», «#116950», «*.31,005 جنيه مصري EGP*».
+    # WhatsApp bold markers go; a line starting with «#» is the order's reference, never an amount; leading
+    # bullet dots / dashes go (they made «.31,005» read as the fraction .31 and dropped the real amount).
+    _ref_lines = False
+    _clean = []
+    for _ln in text.replace('*', ' ').splitlines():
+        _st = _ln.strip()
+        if _st.startswith('#'):
+            _ignore(_st, 'reference_note')
+            _ref_lines = True
+            continue
+        _st = re.sub(r'#\d+', ' ', _st)            # «القيمة: 11,000  #116949» — the NEXT order's reference
+        _clean.append(re.sub(r'^[\s.\-–—•·]+', '', _st))
+    text = '\n'.join(_clean)
     phones: List[str] = []
     amounts: List[float] = []
+    amount_meta: List[tuple] = []  # (value, labelled) — a currency/amount label on the amount's line
     ambiguous: List[float] = []
     name_led: List[tuple] = []     # (value, line) — a name then a small number: tally or orphan amount?
     reassembled: List[Dict[str, str]] = []     # phones rebuilt from digit groups — the customer is shown them
@@ -412,6 +430,7 @@ def _classify_message(text: str) -> Dict[str, Any]:
                 name_led.append((r['value'], rest_text))   # «عاصم كاش اشرف 18» — decided after the loop
                 continue
             amounts.append(r['value'])
+            amount_meta.append((r['value'], bool(_AMOUNT_LABEL_RE.search(line))))
             if r.get('ambiguous'):
                 ambiguous.append(r['value'])
         elif r['ok']:
@@ -433,6 +452,7 @@ def _classify_message(text: str) -> Dict[str, Any]:
                     continue
                 if rr['ok'] and float(rr['value']).is_integer():
                     amounts.append(rr['value'])
+                    amount_meta.append((rr['value'], bool(_AMOUNT_LABEL_RE.search(line))))
         elif re.sub(r'[\d\s.,+\-]', '', rest_text):
             has_name = True
             _ignore(rest_text, 'words')
@@ -450,6 +470,19 @@ def _classify_message(text: str) -> Dict[str, Any]:
     # The same number written twice in one message is ONE number («01… ⏎ 01… ⏎ 800»);
     # otherwise it becomes two phones and one amount → a bogus «لكل رقم ولا تقسيم؟».
     phones = list(dict.fromkeys(phones))
+    if _ref_lines:
+        has_name = True
+    # ONE phone and several numbers, exactly one of them on a line with a currency / amount label
+    # («7,000 الجنيه المصري», «القيمة: 11,000», «٤٢٣٠ جنيه»): that one is the amount; the rest are labels and
+    # counters of the sender's app («001 فودافون كاش», «٢٣», «.3») — never a second transfer (2026-10-09).
+    labelled = [v for v, lab in amount_meta if lab]
+    if len(phones) == 1 and len(amounts) > 1 and len(labelled) == 1:
+        for v in amounts:
+            if v != labelled[0]:
+                _ignore(f'{v:g}', 'not_amount')
+        amounts = [labelled[0]]
+        ambiguous = [v for v in ambiguous if v == labelled[0]]
+        has_name = True
     return {
         'phones': phones,
         'amounts': amounts,

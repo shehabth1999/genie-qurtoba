@@ -365,3 +365,32 @@ class FormIsNotASentenceTests(SimpleTestCase):
         self.assertFalse(_number_inside_prose(t, _classify_message(t)))
         s = 'انا بعت لـ 01012345678 امبارح 500 وصلت'
         self.assertTrue(_number_inside_prose(s, _classify_message(s)))
+
+
+
+class TransferAppFormatTests(SimpleTestCase):
+    """Customers paste transfer-app messages (owner 2026-10-09): «#…» references, «001 فودافون كاش», «.3», «٢٣» are
+    labels; the amount is the number on the line with جنيه / القيمة / EGP."""
+
+    def test_each_format_reads_one_phone_and_its_amount(self):
+        from qurtoba.tools.planning import _classify_message
+        for text, phone, amount in [
+            ('#116950\nرقم المستلم: 01097246807\nالقيمة: 11,000', '01097246807', 11000.0),
+            ('*#1556 3109731*\n01044868511\n.\n001 فودافون كاش\n\n7,000 الجنيه المصري', '01044868511', 7000.0),
+            ('*#1098 3109755*\nG\n01061737188\n001 فودافون كاش\n\n9,000 الجنيه المصري', '01061737188', 9000.0),
+            ('*#1019 // .UG8103234240612*\n\n*01091460684*\n\n*.3*\n\n*. - فودافون كاش*\n\n*.31,005  جنيه مصري EGP*', '01091460684', 31005.0),
+            ('01007977612\n\n٤٢٣٠ جنيه\n\nفودا فون\n\n٢٣', '01007977612', 4230.0),
+            ('#285 6493191\nت\n01032593940\n0 ا مصر - فودفون كاش جنيه مصر\n12,745 جنيه مصري', '01032593940', 12745.0),
+            ('#518 6493169\n01107880807\n01107880807\n0 ا مصر - فودفون كاش جنيه فودافون كاش\n3,130 جنيه مصري', '01107880807', 3130.0),
+            ('#91 3109901\n01029314107\n01029314107\n001 فودافون كاش\nمصر\n41,700 الجنيه المصري', '01029314107', 41700.0),
+            ('#285 6493193\nي\n01063075616\n0 ا مصر - فودفون كاش جنيه مصر\n6,372 جنيه مصري', '01063075616', 6372.0)
+        ]:
+            c = _classify_message(text)
+            self.assertEqual((c['phones'], c['amounts']), ([phone], [amount]), text)
+
+    def test_three_orders_in_one_message(self):
+        from qurtoba.tools.planning import _classify_message
+        c = _classify_message('#116950\nرقم المستلم: 01097246807\nالقيمة: 11,000  #116949\nرقم المستلم: 01018589975\n'
+                              'القيمة: 10,599 #116945\nرقم المستلم: 01062582457\nالقيمة: 10,039')
+        self.assertEqual(c['phones'], ['01097246807', '01018589975', '01062582457'])
+        self.assertEqual(c['amounts'], [11000.0, 10599.0, 10039.0])
