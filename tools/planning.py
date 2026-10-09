@@ -338,7 +338,8 @@ def _classify_message(text: str) -> Dict[str, Any]:
             _ref_lines = True
             continue
         _st = re.sub(r'#\d+', ' ', _st)            # «القيمة: 11,000  #116949» — the NEXT order's reference
-        _clean.append(re.sub(r'^[\s.\-–—•·]+', '', _st))
+        # leading bullets go — but a dash right before a digit is a minus sign («-500»), never a bullet (eval X4)
+        _clean.append(re.sub(r'^(?:[\s.•·]|[\-–—](?!\d))+', '', _st))
     text = '\n'.join(_clean)
     phones: List[str] = []
     amounts: List[float] = []
