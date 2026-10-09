@@ -324,3 +324,27 @@ def _render(*, value, account, fee, sim, done_at, sim_code=None, device=None,
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     return buf.getvalue()
+
+
+def merge_receipt_pngs(pngs, *, gap: int = 28) -> bytes:
+    """Several receipts of ONE order stacked into one image (owner 2026-10-09: one message per order instead of
+    one per transfer). Each receipt is drawn exactly as on its own, centred, with a thin divider between them."""
+    images = [Image.open(io.BytesIO(p)).convert('RGB') for p in pngs]
+    if len(images) == 1:
+        return pngs[0]
+    width = max(im.width for im in images)
+    height = sum(im.height for im in images) + gap * (len(images) - 1)
+    canvas = Image.new('RGB', (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    y = 0
+    for i, im in enumerate(images):
+        canvas.paste(im, ((width - im.width) // 2, y))
+        y += im.height
+        if i < len(images) - 1:
+            mid = y + gap // 2
+            draw.line([(width * 0.08, mid), (width * 0.92, mid)], fill=(205, 205, 205), width=2)
+            y += gap
+    out = io.BytesIO()
+    canvas.save(out, format='PNG', optimize=True)
+    return out.getvalue()
+

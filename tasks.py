@@ -573,6 +573,38 @@ def _build_and_save_receipt_for_txn(record, brief: dict):
         return None, None
 
 
+RECEIPTS_PER_IMAGE = 4      # receipts stacked into one image; a longer order gets a second image
+
+
+def _build_and_save_merged_receipt(record, briefs):
+    """ONE image for several transfer briefs of the order (each drawn as on its own, stacked). Returns
+    (attachment, url, drawn_briefs); briefs that could not be drawn are left out (they go as text)."""
+    try:
+        from django.core.files.base import ContentFile
+        from modules.base.models.attachment import Attachment
+        from modules.chat.utils.file_utils import get_media_url_for_attachment
+        from qurtoba.services.receipt_image import merge_receipt_pngs, render_receipt_png_for_txn
+        drawn, pngs = [], []
+        for b in briefs:
+            try:
+                pngs.append(render_receipt_png_for_txn(b))
+                drawn.append(b)
+            except Exception as exc:
+                logger.warning('[CashSys Notify] receipt render failed for record %d txn %s: %s',
+                               record.pk, b.get('id'), exc)
+        if not pngs:
+            return None, None, []
+        png = merge_receipt_pngs(pngs)
+        suffix = '_'.join(str(b.get('id') or 'x') for b in drawn)[:60]
+        filename = f'qurtoba_receipt_{record.pk}_{suffix}.png'
+        attachment = Attachment(name=filename, mime_type='image/png', type='image', size=len(png))
+        attachment.file.save(filename, ContentFile(png), save=True)
+        return attachment, get_media_url_for_attachment(attachment), drawn
+    except Exception as exc:
+        logger.warning('[CashSys Notify] merged receipt failed for record %d: %s', record.pk, exc)
+        return None, None, []
+
+
 def _txn_text_fallback(record, brief: dict) -> str:
     return (
         f"✅ تم تنفيذ التحويل بنجاح\n"
@@ -641,49 +673,49 @@ def _send_done_receipts(record):
 
         first_attachment = None
         images_sent = 0
-        for brief in pending:
-            attachment, url = _build_and_save_receipt_for_txn(record, brief)
-            try:
-                if url and getattr(ctx['conv'], 'type', None) == 'wa_web':
-                    result = _send_wa_web_media(ctx, attachment, url, 'image')
-                elif url:
-                    result = ctx['svc'].send_and_broadcast(
-                        partner=ctx['conv'].social_partner,
-                        content={'url': url, 'filename': attachment.name},
-                        message_type='image',
-                        conversation=ctx['conv'],
-                        system_partner=ctx['system_partner'],
-                        reply_to_message_id=ctx['reply_wamid'],
-                        reply_to_id=ctx['reply_local_id'],
-                        websocket=True,
-                    )
-                else:
-                    result = ctx['svc'].send_and_broadcast(
-                        partner=ctx['conv'].social_partner,
-                        content={'text': _txn_text_fallback(record, brief)},
-                        message_type='text',
-                        conversation=ctx['conv'],
-                        system_partner=ctx['system_partner'],
-                        reply_to_message_id=ctx['reply_wamid'],
-                        reply_to_id=ctx['reply_local_id'],
-                        websocket=True,
-                    )
-            except Exception as exc:
-                logger.exception('[CashSys Notify] send failed for record %d txn %s: %s',
-                                 record.pk, brief.get('id'), exc)
-                continue
+        # Owner 2026-10-09: the order's receipts go as ONE image (up to RECEIPTS_PER_IMAGE stacked), not one message
+        # per transfer; a receipt that cannot be drawn still goes as its own text line.
+        def _send(content, message_type, filename=None, attachment=None):
+            if getattr(ctx['conv'], 'type', None) == 'wa_web' and message_type == 'image':
+                return _send_wa_web_media(ctx, attachment, content['url'], 'image')
+            return ctx['svc'].send_and_broadcast(
+                partner=ctx['conv'].social_partner, content=content, message_type=message_type,
+                conversation=ctx['conv'], system_partner=ctx['system_partner'],
+                reply_to_message_id=ctx['reply_wamid'], reply_to_id=ctx['reply_local_id'], websocket=True,
+            )
 
-            if result.get('success'):
-                brief['sent'] = True
-                if attachment is not None:
-                    brief['attachment_id'] = attachment.id
+        for start in range(0, len(pending), RECEIPTS_PER_IMAGE):
+            chunk = pending[start:start + RECEIPTS_PER_IMAGE]
+            attachment, url, drawn = _build_and_save_merged_receipt(record, chunk)
+            drawn_ids = {id(b) for b in drawn}
+            if url:
+                try:
+                    result = _send({'url': url, 'filename': attachment.name}, 'image', attachment=attachment)
+                except Exception as exc:
+                    logger.exception('[CashSys Notify] merged receipt send failed for record %d: %s', record.pk, exc)
+                    result = {}
+                if result.get('success'):
+                    for b in drawn:
+                        b['sent'] = True
+                        b['attachment_id'] = attachment.id
                     first_attachment = first_attachment or attachment
-                    images_sent += 1   # only a real image counts (not the text fallback)
-                logger.info('[CashSys Notify] receipt sent record=%d txn=%s msg=%s',
-                            record.pk, brief.get('id'), result.get('message_id'))
-            else:
-                logger.warning('[CashSys Notify] receipt delivery FAILED record=%d txn=%s err=%s',
-                               record.pk, brief.get('id'), result.get('error'))
+                    images_sent += 1
+                    logger.info('[CashSys Notify] receipt image sent record=%d txns=%s msg=%s', record.pk,
+                                [b.get('id') for b in drawn], result.get('message_id'))
+                else:
+                    logger.warning('[CashSys Notify] receipt delivery FAILED record=%d txns=%s err=%s', record.pk,
+                                   [b.get('id') for b in drawn], result.get('error'))
+            for brief in chunk:
+                if id(brief) in drawn_ids and url:
+                    continue
+                try:
+                    result = _send({'text': _txn_text_fallback(record, brief)}, 'text')
+                except Exception as exc:
+                    logger.exception('[CashSys Notify] send failed for record %d txn %s: %s',
+                                     record.pk, brief.get('id'), exc)
+                    continue
+                if result.get('success'):
+                    brief['sent'] = True
 
         # Persist the updated sent/attachment flags WITHOUT clobbering briefs that a
         # concurrent partial event may have appended while we were sending: re-read
