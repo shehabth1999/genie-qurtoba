@@ -1190,6 +1190,8 @@ def handle_cash_sys_order_done(self, data: dict):
             # receipt now contradicts it, and the ledger says 0 while money moved. Settle at what really
             # went out, send nothing to the customer, and hand it to the office.
             _done_after_cancel(record, data, fulfilled, done_at, last)
+            if (fulfilled or 0) > 0:
+                _set_status_reaction(record, 'done')   # the money did move: ✅ replaces the cancel mark
             _commit_event(record, commit_key)
             return
         # Don't clobber a reroute that already settled this record.
@@ -1208,6 +1210,8 @@ def handle_cash_sys_order_done(self, data: dict):
         record.refresh_from_db()
 
         images_sent = _send_done_receipts(record)   # images first …
+        if not (record.cash_sys_reroute_amount or 0):
+            _set_status_reaction(record, 'done')     # ✅ — a rerouted order keeps its 🔄 (not fully done)
         _pause_after_receipts(images_sent)           # … let the image land …
         _create_service_fees(record)                 # … then the auto service-fee note(s)
         _commit_event(record, commit_key)
@@ -1367,6 +1371,7 @@ def _apply_reroute(record, data: dict):
     # cash_sys_service_fee_done flag keeps a later order_done from charging twice.
     _create_service_fees(record)
     _send_reroute_ask(record, fulfilled, reroute_amount)
+    _set_status_reaction(record, 'reroute')          # 🔄 — part sent, a new number is needed
 
 
 def _apply_zero_cancel(record, reason):
@@ -1509,6 +1514,9 @@ def _apply_zero_cancel(record, reason):
     # sentence is false when part of the money did go out.
     if not partial:
         _send_cancel_notice(record, reason)
+        _set_status_reaction(record, reason)         # ❌ / ✖️ / 🚫 by reason (unknown → ❌)
+    else:
+        _set_status_reaction(record, 'done')         # what was really sent is done
 
 
 _RETRY_COUNTDOWNS = [5, 15, 30]  # seconds before retry attempt 2, 3, 4
@@ -1561,6 +1569,26 @@ def react_posted_to_qurtoba(self, record_pk: int):
         return 'no_origin'
     _react_created_on_source(rec.origin_message.conversation, str(rec.origin_message_id), '👍')
     return 'reacted'
+
+
+# Status reaction on the customer's request (owner Option A, 2026-10-09). One at a time: each replaces the last.
+_STATUS_REACTIONS = {'done': '✅', 'reroute': '🔄', 'agent': '❌', 'cancel_request': '✖️', 'no_wallet': '🚫'}
+
+
+def _set_status_reaction(record, status: str) -> None:
+    """Best-effort; never raises into the Cash-SYS webhook flow. An unknown cancel reason shows ❌."""
+    try:
+        if not getattr(record, 'origin_message_id', None):
+            return
+        from modules.chat.models import Message
+        msg = Message.objects_all.select_related('conversation').filter(pk=record.origin_message_id).first()
+        if msg is None:
+            return
+        from qurtoba.tools.transactions import _react_created_on_source
+        _react_created_on_source(msg.conversation, str(msg.pk), _STATUS_REACTIONS.get(status, '❌'))
+    except Exception:
+        logger.warning('[CashSys] status reaction %s on record %s failed', status, getattr(record, 'pk', None),
+                       exc_info=True)
 
 
 def _push_exhausted(record_pk: int, error: str) -> None:

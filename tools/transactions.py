@@ -139,7 +139,8 @@ def _high_value_threshold() -> float:
 
 
 def _react_created_on_source(conversation, source_message_id, emoji='👍') -> None:
-    """React (👍) on the customer's PHONE-NUMBER message once its transfer is really CREATED.
+    """Set OUR reaction on the customer's request message — the order's status at a glance (👍 posted to
+    Qurtoba, 👍🏿 under review, ✅ done, 🔄 new number needed, ❌ / ✖️ / 🚫 cancelled), one at a time.
 
     This is IN ADDITION to the batch 👍 text ack — a per-transaction confirmation reacting
     directly on the number the customer sent, fired only on a genuine create (never on
@@ -165,13 +166,22 @@ def _react_created_on_source(conversation, source_message_id, emoji='👍') -> N
             return
         from qurtoba.extensions import _get_system_partner
         sysp = _get_system_partner(conversation)
-        # 1) Persist the reaction row (so a later refresh keeps showing it).
+        # 1) ONE reaction of ours per message, as on WhatsApp (owner 2026-10-09): every outbound reaction
+        #    comes from the same office number, so a new one REPLACES the old there. Mirror that here:
+        #    the old rows go with a raw delete — their pre_delete would send an EMPTY reaction («remove»),
+        #    and that task racing the new emoji's could leave the customer's message with no reaction —
+        #    then the new row is saved; its post_save delivers it and WhatsApp swaps it in.
+        old_rows = list(MessageReaction.objects.filter(message=msg, direction='outbound'))
+        if len(old_rows) == 1 and old_rows[0].emoji == emoji:
+            return                                   # already showing exactly this one
+        removed = [r.emoji for r in old_rows]
+        if old_rows:
+            MessageReaction.objects.filter(pk__in=[r.pk for r in old_rows])._raw_delete(MessageReaction.objects.db)
         reaction = None
         try:
-            reaction, _ = MessageReaction.objects.get_or_create(
-                message=msg, user=sysp, emoji=emoji, direction='outbound')
+            reaction = MessageReaction.objects.create(message=msg, user=sysp, emoji=emoji, direction='outbound')
         except Exception:
-            pass
+            logger.warning('qurtoba: reaction row %s on %s could not be saved', emoji, msg.pk, exc_info=True)
         # 2) REAL-TIME push. The chat frontend handles the 'message_reaction' event, but only
         #    react_to_message's conversation-group broadcast — which a browser reliably receives
         #    ONLY if it has joined that group, so the reaction wouldn't show without a refresh.
@@ -195,11 +205,14 @@ def _react_created_on_source(conversation, source_message_id, emoji='👍') -> N
             # Same reliable per-user path the live status/message broadcasts use: each company
             # participant's `user_{django_user_id}` group (they're subscribed to it on connect).
             seen = set()
+            gone = [{**payload, 'emoji': e, 'added': False} for e in removed if e != emoji]
             for prt in conversation.get_company_participants().select_related('user'):
                 if getattr(prt, 'has_user', False):
                     _uid = prt.user.id
                     if _uid not in seen:
                         seen.add(_uid)
+                        for g in gone:                       # the replaced emoji leaves the chat screen
+                            bridge._send_to_user(_uid, 'user_message', g)
                         bridge._send_to_user(_uid, 'user_message', payload)
         except Exception:
             logger.warning('qurtoba: reaction realtime broadcast failed', exc_info=True)
