@@ -70,6 +70,13 @@ def push_record_to_qurtoba(record_pk: int) -> str | None:
                         f'{body.get("message", "")}'
                     )
                 _mark_success(record_pk, qurtoba_id)
+                # 👍 on the customer's request = «really posted to Qurtoba» (owner 2026-10-09). A moment later:
+                # the origin message is linked just after the record is created, and a fast push can win that race.
+                try:
+                    from qurtoba.tasks import react_posted_to_qurtoba
+                    react_posted_to_qurtoba.apply_async(args=[record_pk], countdown=2)
+                except Exception:
+                    pass
                 # Pull authoritative balance from Qurtoba (recalculated synchronously).
                 _sync_customer_balance(base, token, customer)
                 # Cash-SYS execution is handled entirely by Qurtoba now: its

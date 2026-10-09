@@ -1546,6 +1546,23 @@ def push_record_to_qurtoba_task(self, record_pk: int):
     raise self.retry(exc=Exception(error), countdown=countdown)
 
 
+@shared_task(bind=True, max_retries=2, name='qurtoba.tasks.react_posted_to_qurtoba')
+def react_posted_to_qurtoba(self, record_pk: int):
+    """👍 on the customer's request once Qurtoba has really accepted the order (owner 2026-10-09; it used to be
+    sent when the record was created in Genie, before the push). Orders only — not a payment, not a fee."""
+    from qurtoba.models import QurtobaRecord
+    from qurtoba.tools.transactions import DEBT_TYPES, _react_created_on_source
+    rec = QurtobaRecord.objects.select_related('origin_message__conversation').filter(pk=record_pk).first()
+    if rec is None or rec.is_down or rec.type not in DEBT_TYPES or rec.type == 'مصاريف خدمه' or not (rec.value or 0) > 0:
+        return 'skipped'
+    if not rec.origin_message_id:
+        if self.request.retries < self.max_retries:
+            raise self.retry(countdown=5)      # the origin message is linked a moment after the create
+        return 'no_origin'
+    _react_created_on_source(rec.origin_message.conversation, str(rec.origin_message_id), '👍')
+    return 'reacted'
+
+
 def _push_exhausted(record_pk: int, error: str) -> None:
     """Every push attempt failed: mark it, surface it, tell the customer and the office.
 

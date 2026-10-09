@@ -1258,7 +1258,8 @@ def _create_one_debt(
     # CONFIRMED it (confirm_high_value=true) or an admin approved it — at which point it IS
     # created and DOES get the 👍, exactly like any normal transaction. The unconfirmed hold
     # returned at the high-value gate above and never reaches here, so it stays reaction-less.
-    _react_created_on_source(conversation, src, '👍')
+    # (the 👍 REACTION now waits for Qurtoba: tasks.react_posted_to_qurtoba, after a successful push — owner
+    #  2026-10-09: «👍 = really posted to Qurtoba». The instant 👍 text ack above is unchanged.)
 
     # Number correction is confirmed by the TOOL itself (never the LLM): when
     # normalization changed the destination number, reply the corrected number —
