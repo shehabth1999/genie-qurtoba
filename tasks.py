@@ -573,7 +573,7 @@ def _build_and_save_receipt_for_txn(record, brief: dict):
         return None, None
 
 
-RECEIPTS_PER_IMAGE = 4      # receipts stacked into one image; a longer order gets a second image
+RECEIPTS_PER_IMAGE = 10     # receipts stacked into one image (owner 2026-10-09: 5 in one); only a rare longer order gets a second
 
 
 def _build_and_save_merged_receipt(record, briefs):
